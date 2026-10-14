@@ -1,0 +1,316 @@
+---
+name: camusdb-local-dev
+description: Sets up CamusDB for local development and testing, and drives its developer tools. Covers installing CamusDB.Server (dotnet tool, camusdb, camusdb init, ~/.camusdb/config.yml), the camusdb/camusdb Docker image, the 3-node docker compose cluster (docker/local.yml), ports 5095/5096/7070/7141, camus-cli (-c, -e, -f, --format json, --tui, use, source), the Web Console, the operator dashboard, the browser playground, config.yml keys (data_dir, memory_profile, key_range_sharding), SHOW VARIABLES, SET CLUSTER SETTING, authentication (CAMUSDB_AUTH_ENABLED, CREATE USER, GRANT, bearer tokens, CADB0516, CADB0517, CADB0519), the CamusDB MCP server (CAMUS_MCP_ENDPOINT, .mcp.json) for Claude Code, Codex, or Cursor, load tests with camus-cli workload or CamusDB.Workload, and per-PR databases with CREATE DATABASE ... BRANCH FROM. Use it when a developer installs, starts, configures, connects to, secures, or load-tests a local CamusDB node or cluster.
+---
+
+# CamusDB local development
+
+This skill takes a developer from nothing to a working CamusDB for development and testing.
+It covers the server, the local cluster, `camus-cli`, configuration, authentication, the MCP
+server, load tests, and throwaway databases for each pull request. CamusDB is a distributed
+SQL database on .NET. It runs as one standalone node by default.
+
+## Safety rules
+
+- Confirm with the user before any destructive or irreversible command. This includes
+  `DROP DATABASE`, `DROP TABLE`, `TRUNCATE`, `docker compose down -v`, deleting a data
+  directory, `camusdb init --force`, and the workload `cleanup` verb.
+- A `DROP DATABASE` of a branch is immediate. `RELINK TO` cannot recover it.
+- Prefer a branch for any experiment on real data: `CREATE DATABASE x BRANCH FROM y`.
+- Never write passwords, `CAMUSDB_AUTH_TOKEN_KEY`, or tokens into a committed file.
+- Never assume a database exists. CamusDB has no implicit database creation.
+
+## Workflow
+
+Follow these steps in order. Skip the optional ones the user does not need.
+
+1. Pick the target. Use the decision table below.
+2. Start the server. Confirm it answers (step 4 works).
+3. Install `camus-cli`: `dotnet tool install --global CamusDB.SqlSh`.
+4. Connect and create a database: `CREATE DATABASE IF NOT EXISTS app;`.
+5. Apply the schema with `camus-cli app -f schema.sql`.
+6. Optional: tune configuration. Check the result with `SHOW VARIABLES`.
+7. Optional: enable authentication for a realistic environment.
+8. Optional: connect an AI coding agent through the MCP server.
+9. Optional: create a branch per pull request for tests.
+10. Optional: run a load test with `camus-cli workload`.
+
+| Need | Use |
+| --- | --- |
+| Try SQL with nothing installed | Browser playground: https://camusdb.github.io/playground/ |
+| Daily development, one node | `dotnet tool install --global CamusDB.Server`, then `camusdb` |
+| One node without .NET installed | Docker image `camusdb/camusdb:latest` |
+| Raft, failover, multi-node behavior | `docker compose -f docker/local.yml up --build` in the engine repo |
+| Fault injection and chaos evidence | Caraxes (see `references/local-cluster.md`) |
+
+## Install and start a node
+
+The server needs the .NET 10 runtime.
+
+```bash
+dotnet tool install --global CamusDB.Server
+camusdb
+```
+
+- With no configuration file, `camusdb` uses built-in defaults.
+- It serves the HTTP (REST) API on port `5095` and gRPC on port `5096`.
+- Update with `dotnet tool update --global CamusDB.Server`.
+
+Write a user-owned starter configuration, then edit it and restart:
+
+```bash
+camusdb init    # writes ~/.camusdb/config.yml and creates the default data directory
+```
+
+On Windows the file is `%APPDATA%\camusdb\config.yml`. `CAMUS_HOME` relocates both the
+configuration and the default data directory. `camusdb init` refuses to overwrite an existing
+file. Do not edit `CamusDB/Config/config.yml` in a source checkout; a pull can replace it.
+
+Run one node with Docker:
+
+```bash
+docker run --rm \
+  -p 5095:5095 \
+  -p 5096:5096 \
+  -v camus-data:/data \
+  --name camusdb camusdb/camusdb:latest
+```
+
+## Ports
+
+| Port | Use | Key / flag |
+| --- | --- | --- |
+| `5095` | HTTP REST API, operator dashboard | `http_port` / `--http-port` |
+| `5096` | Client gRPC API | `grpc_port` (YAML only) |
+| `7141` | HTTPS, only when `https_certificate` is set | `https_port` / `--https-port` |
+| `7070` | Raft, cluster mode | `raft_port` / `--raft-port` |
+
+The local compose cluster remaps host ports. Read `references/local-cluster.md` before you
+connect to it.
+
+## Connect with camus-cli
+
+```bash
+camus-cli                     # tries gRPC on localhost:5096, then REST on localhost:5095
+camus-cli app                 # same, with database "app" selected
+camus-cli -c "Endpoint=http://localhost:5095;Database=app;Protocol=rest"
+camus-cli app -e "SELECT COUNT(*) FROM users" --format json
+camus-cli app -f schema.sql   # stops at the first error, exit status 1
+camus-cli app --tui           # full-screen catalog, editor, and results
+```
+
+Key rules:
+
+- `use <db>` and `source <file>` are shell commands, not server SQL. `use` never creates a database.
+- End a query with `\G` for vertical output.
+- `-f` and `-e` together run the file first, then the `-e` SQL.
+- With `--format json` or `yaml`, only rows go to stdout. Messages go to stderr.
+- `exit` and `use` are blocked while a transaction is open. `commit` or `rollback` first.
+- Server-level statements work with no database selected: `CREATE DATABASE`, `SHOW DATABASES`,
+  `CREATE USER`, `GRANT`, `SHOW BRANCHES FROM`, `SHOW ANCESTORS FROM`.
+
+Read `references/camus-cli.md` for every flag, meta command, and environment variable.
+
+## Configure the node
+
+Discovery order, first match wins: `--config <path>`, `CAMUS_CONFIG_PATH`, `./camusdb.yml`,
+`./Config/config.yml`, `~/.camusdb/config.yml`, built-in defaults. A missing file named by
+`--config` or `CAMUS_CONFIG_PATH` fails startup.
+
+Precedence, highest first: cluster setting overlay (runtime keys only), CLI flag, environment
+variable, `config.yml`, built-in default.
+
+Essential keys for development:
+
+```yaml
+data_dir: /Users/me/.local/share/camusdb   # give each node its own directory
+mode: standalone                            # or cluster
+memory_profile: dev                         # ~96 MiB of caches; default is prod
+http_port: 5095
+grpc_port: 5096
+initial_partitions: 1
+slow_query_log_enabled: true
+key_range_sharding: false                   # restart-scoped; env CAMUS_KEY_RANGE_SHARDING overrides
+```
+
+- Use `memory_profile: dev` when the node shares a laptop with the app. It is not a server setting.
+- `key_range_sharding` has no CLI flag. Set it in YAML or with `CAMUS_KEY_RANGE_SHARDING=true`.
+- Check what the node resolved. Do not reconstruct the merge by hand:
+
+```sql
+SHOW VARIABLES LIKE 'memory_%';
+```
+
+The `source` column shows `default`, `config`, `env`, `cli`, or `cluster`. Read
+`references/configuration.md` for defaults, flags, and validation errors.
+
+## Change settings at runtime
+
+`SET CLUSTER SETTING` changes a `runtime` key on every node, with no restart. It also works in
+standalone mode.
+
+```sql
+SHOW VARIABLES LIKE 'max_mutations_%';      -- check mutability = runtime first
+SET CLUSTER SETTING max_mutations_per_transaction = 40000;
+SHOW CLUSTER SETTINGS;
+RESET CLUSTER SETTING max_mutations_per_transaction;
+```
+
+- A `restart` key, such as `data_dir` or any `kahuna.*` key, fails with `CADB0400`. Edit the file and restart.
+- An invariant break across two fields fails with `CADB0600` `InvalidConfig`.
+- `RESET` removes the overlay. Each node falls back to its own local value.
+- `SHOW VARIABLES` is node-local. Run it on every node to confirm a fleet change.
+
+## Enable authentication
+
+Authentication is off by default. Turn it on for a realistic environment. Set it only through
+environment variables, never in `config.yml`.
+
+```bash
+export CAMUSDB_AUTH_ENABLED=true
+export CAMUSDB_AUTH_TOKEN_KEY="$(openssl rand -hex 32)"     # at least 32 bytes; same on every node
+export CAMUSDB_BOOTSTRAP_USER=admin                          # used only while no user exists
+export CAMUSDB_BOOTSTRAP_PASSWORD="$(openssl rand -base64 24)"
+export CAMUSDB_NODE_SECRET="$(openssl rand -hex 32)"         # cluster only
+camusdb
+```
+
+Then, as the bootstrap superuser:
+
+```bash
+camus-cli -u admin            # prompts for the password without echo
+```
+
+```sql
+CREATE DATABASE IF NOT EXISTS app;
+CREATE USER app IDENTIFIED BY 'app-secret';
+GRANT SELECT, INSERT, UPDATE, DELETE ON app.* TO app;
+GRANT ALTER, INDEX, CREATE TABLE ON app.* TO app;   -- only if the app runs migrations
+SHOW GRANTS FOR app;
+```
+
+- Startup fails with an empty user catalog and no bootstrap values.
+- Credentials over plaintext are refused (`CADB0519`), except from loopback.
+- A token lives 15 minutes by default. Clients renew from `expiresAtUnixMs`.
+- Prefer `CAMUS_PASSWORD` or the prompt to `-p secret` on a shared host.
+
+| Code | Meaning | Fix |
+| --- | --- | --- |
+| `CADB0516` | Not authenticated: missing, wrong, expired, or revoked credentials | Log in again or fix the credentials |
+| `CADB0517` | Authenticated, but a privilege is missing on a touched table | `GRANT` the privilege, including joined tables |
+| `CADB0518` | Too many login attempts | Wait for the rate-limit window |
+| `CADB0519` | Credentials over plaintext while TLS is required | Use `https://`, or connect from loopback |
+
+Read `references/configuration.md` for the Docker and TLS details of auth.
+
+## Connect an AI coding agent (MCP server)
+
+The CamusDB MCP server speaks MCP over stdio. The agent client starts it. Build it once:
+
+```bash
+git clone https://github.com/camusdb/camusdb-mcp
+cd camusdb-mcp
+dotnet build camusdb-mcp.sln   # binary: CamusDB.Mcp/bin/Debug/net10.0/CamusDB.Mcp
+```
+
+Register it in the client. This block is the generic form (Claude Code reads it from `.mcp.json`):
+
+```json
+{
+  "mcpServers": {
+    "camusdb": {
+      "command": "/path/to/camusdb-mcp/CamusDB.Mcp/bin/Debug/net10.0/CamusDB.Mcp",
+      "env": {
+        "CAMUS_MCP_ENDPOINT": "http://localhost:5095",
+        "CAMUS_MCP_DEFAULT_DATABASE": "app_agent"
+      }
+    }
+  }
+}
+```
+
+- Always set `CAMUS_MCP_ENDPOINT`. Its default is `http://localhost:7141`, the HTTPS port, which a
+  default node does not serve.
+- Point the agent at a branch, not at the source database: `CREATE DATABASE app_agent BRANCH FROM app;`.
+- With auth on, add `CAMUS_MCP_USER` and `CAMUS_MCP_PASSWORD`, and grant only `SELECT` for a read-only agent.
+- `select_query` accepts only `SELECT`, `SHOW`, and `DESCRIBE`. `create_database`, `create_table`,
+  and `insert_rows` can write.
+
+Read `references/mcp-server.md` for Codex and Cursor setup, all variables, and the tool list.
+
+## Per-PR ephemeral databases
+
+A branch is a copy-on-write clone. It copies no rows at creation. Use one per pull request:
+
+```bash
+DB="pr_${PR_NUMBER}"
+camus-cli -e "CREATE DATABASE IF NOT EXISTS ${DB} BRANCH FROM staging"
+camus-cli "${DB}" -f migrations/latest.sql
+# ... run the test suite against Database=${DB} ...
+camus-cli -e "DROP DATABASE ${DB}"          # CI teardown; ask first when run by hand
+```
+
+- The source must have no schema change in flight. Otherwise `CADB0400`.
+- Drop leaf branches first. A parent with live branches fails with `CADB0508`.
+- A live branch holds back storage reclamation on its source. Drop branches when done.
+- A transaction cannot span two databases, so it cannot span a branch and its parent.
+
+## Load-test a node
+
+Quick load from the shell (defaults: database `demo`, 64 workers, 60 seconds):
+
+```bash
+camus-cli workload init bank --database demo --rows 5000
+camus-cli workload run bank --database demo --concurrency 8 --duration 120
+```
+
+Workloads are `bank`, `northwind`, `factory`, `tpcc`, and `tpcb`. For repeatable measurement with
+artifacts, compare, and baselines, use `CamusDB.Workload` from the engine source tree. Read
+`references/tools.md` for its verbs and flags.
+
+## Other tools
+
+- Web Console: `docker run --rm -p 8080:8080 -e CamusDB__Endpoint=http://host.docker.internal:5095 -e CamusDB__Database=demo camusdb/camusdb-webconsole:latest`, then open `http://localhost:8080`.
+- Operator dashboard: open `http://localhost:5095/` in a browser. It is read-only.
+- Browser playground: real engine in WebAssembly, in memory. It has no `USE`; use the database selector.
+
+Read `references/tools.md` for details and limits.
+
+## Common mistakes
+
+- Using a database before `CREATE DATABASE`. `camus-cli app` and `use app` do not create it.
+- Running a standalone node and the compose cluster together. Both want host port `5095`, and
+  the cluster puts node `camus2` HTTP on host port `5096`, the standalone gRPC port.
+- Pointing a `Protocol=grpc` connection at port `5095`. gRPC is `5096` on a standalone node.
+- Leaving `CAMUS_MCP_ENDPOINT` unset. The default `7141` is HTTPS-only.
+- Putting `CAMUSDB_AUTH_*` values in `config.yml`. Auth reads them from the environment only.
+- Changing `CAMUSDB_AUTH_TOKEN_KEY` between nodes. Every node needs the same value.
+- Expecting the dashboard or `backup` commands to work remotely with auth off. Both are
+  loopback-only then. A Docker-published port usually does not count as loopback.
+- Trying `SET CLUSTER SETTING` on a `restart` key. Check `mutability` in `SHOW VARIABLES` first.
+- Using `memory_profile: dev` for a benchmark. It caps caches at about 96 MiB.
+- Forgetting to drop per-PR branches. Each one pins history on its source.
+- Using an uppercase `LIKE` pattern with `SHOW VARIABLES`. Variable names are lowercase and the match is case-sensitive.
+
+## References
+
+- `references/camus-cli.md`: all camus-cli flags, meta commands, history, output formats. Read before scripting the CLI.
+- `references/configuration.md`: discovery, precedence, key defaults, flags, auth environment, Docker auth, validation errors. Read before editing `config.yml`.
+- `references/mcp-server.md`: MCP build, environment variables, Claude Code / Codex / Cursor config, tools. Read before wiring an agent.
+- `references/local-cluster.md`: compose cluster ports, manual cluster flags, leadership transfer, Caraxes. Read before running more than one node.
+- `references/tools.md`: Web Console, operator dashboard, browser playground, workload utility. Read before using any of them.
+
+Public docs:
+
+- https://camusdb.github.io/docs/intro
+- https://camusdb.github.io/docs/camus-cli
+- https://camusdb.github.io/docs/configuration
+- https://camusdb.github.io/docs/cluster
+- https://camusdb.github.io/docs/runtime-cluster-settings
+- https://camusdb.github.io/docs/sql-authentication
+- https://camusdb.github.io/docs/mcp-server
+- https://camusdb.github.io/docs/database-branching
+- https://camusdb.github.io/docs/workload-utility
+- https://camusdb.github.io/docs/web-console
+- https://camusdb.github.io/docs/operator-dashboard
+- https://camusdb.github.io/docs/browser-playground

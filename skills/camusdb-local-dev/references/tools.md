@@ -1,0 +1,138 @@
+# Developer tools reference
+
+Sources: https://camusdb.github.io/docs/web-console,
+https://camusdb.github.io/docs/operator-dashboard,
+https://camusdb.github.io/docs/browser-playground,
+https://camusdb.github.io/docs/workload-utility
+
+## Web Console
+
+A browser workspace: schema browser, Monaco SQL editor, result grid, row editing, CSV/JSON
+export, `EXPLAIN` flow view, engine stats, variables, and backup controls.
+
+```bash
+docker run --rm -p 8080:8080 \
+  -e CamusDB__Endpoint=http://host.docker.internal:5095 \
+  -e CamusDB__Database=demo \
+  camusdb/camusdb-webconsole:latest
+```
+
+Open `http://localhost:8080`. On Linux, add `--add-host=host.docker.internal:host-gateway`,
+or use the host LAN IP.
+
+| Setting | Env var | Notes |
+| --- | --- | --- |
+| `Endpoint` | `CamusDB__Endpoint` | REST port for `rest`, gRPC port for `grpc` |
+| `Database` | `CamusDB__Database` | Session database |
+| `Protocol` | `CamusDB__Protocol` | `rest` (default) or `grpc` |
+| `TimeoutSeconds` | `CamusDB__TimeoutSeconds` | Request timeout |
+| `MaxRows` | `CamusDB__MaxRows` | Grid and export row cap |
+| `User` / `Password` | `CamusDB__User` / `CamusDB__Password` | Empty user means no auth |
+| `AccessToken` | `CamusDB__AccessToken` | Token from elsewhere |
+| `AllowInsecureCredentials` | `CamusDB__AllowInsecureCredentials` | Credentials to non-loopback `http://` |
+| `LockEndpoint` | `CamusDB__LockEndpoint` | Stop sessions from repointing the endpoint |
+| `BackupEndpoint` | `CamusDB__BackupEndpoint` | REST endpoint for backups when using gRPC or a pool |
+
+- The Configure control in the app bar changes these for the current browser session.
+- Exports are capped by `MaxRows`. Use `camus-dump` for a full logical dump.
+- Right-click actions include drop table and drop database. The console asks for confirmation;
+  confirm with the user too.
+- Row edit and delete need a primary key.
+- With auth on, Administration needs a superuser.
+
+## Operator dashboard
+
+Open the node HTTP port in a browser: `http://localhost:5095/`. It is read-only. It runs no DML
+or DDL.
+
+- It shows node health, load, engine metrics, databases, relations, backups, slow queries,
+  configuration, and the cluster settings overlay.
+- `dashboard_enabled: false` removes it (404). `dashboard_refresh_seconds` defaults to `2`.
+- With auth off, it is loopback-only. The engine refuses others with
+  "The dashboard over the network requires authentication_enabled to be turned on".
+- With auth on, `/` redirects to `/SignIn`. The session cookie is `Secure`, so use HTTPS or loopback.
+- Engine, Configuration, Slow queries, and Cluster panels need a superuser.
+- Values are node-local. Turn on `slow_query_log_enabled` to fill the slow query panel.
+
+## Browser playground
+
+URL: https://camusdb.github.io/playground/. The tutorial page also embeds a single-node editor.
+
+- The real engine, compiled to WebAssembly, runs inside the browser tab. No data leaves the tab.
+- Modes: Single node, or **Start 3-node cluster** with stop, restart, and isolate controls.
+- Data lives in memory. Reload or **Reset cluster** starts over.
+- The sample `playground` database has `books` and `authors`.
+- Each statement autocommits. A script stops at the first error.
+- There is no `USE` statement. Use the database selector.
+- No backups and no features that need external files.
+
+```sql
+CREATE DATABASE lab;
+CREATE DATABASE lab_copy BRANCH FROM lab;
+SHOW BRANCHES FROM lab;
+```
+
+## Workload utility (CamusDB.Workload)
+
+A measurement tool in the engine source tree. It seeds a deterministic dataset, drives reads
+and writes, reconciles correctness, and writes artifacts. Run it from the engine repository.
+Use `camus-cli workload` instead for a quick demo load.
+
+```bash
+dotnet run -c Release --project CamusDB.Workload -- init \
+  --endpoint http://127.0.0.1:5096 --database workload --protocol grpc \
+  --rows 100000 --payload-bytes 256 --batch 500
+
+dotnet run -c Release --project CamusDB.Workload -- run \
+  --endpoint http://127.0.0.1:5096 --database workload --protocol grpc \
+  --output /tmp/camus-workload-run --mode open --target-ops 800 \
+  --workers 64 --connections 8 --duration 5m --warmup 30s --drain 10s
+```
+
+Common options:
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `--endpoint` | required | gRPC port for `--protocol grpc`; comma-separated pool allowed |
+| `--database` | required | Workload database |
+| `--protocol` | `grpc` | `grpc` or `rest` |
+| `--seed` | `1847` | Deterministic seed |
+| `--rows` | `100000` | Rows in `workload_accounts` |
+| `--tables` | `1` | Spread over `workload_accounts_00`, `_01`, ...; same for `init` and `run` |
+| `--payload-bytes` | `256` | Payload size per row |
+| `--no-auto-prepare` | `false` | Adds `MaxAutoPrepare=0` |
+
+Run options (selection):
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `--output` | required | Must not exist yet |
+| `--mode` | `open` | `open` (target rate) or `closed` (saturation) |
+| `--target-ops` | `800` | Open-loop ops per second |
+| `--workers` | `64` | Concurrent workers |
+| `--concurrency-sweep` | none | Closed-loop list, e.g. `1,8,16,32,64` |
+| `--read-percent` / `--write-percent` | `60` / `40` | Must sum to 100 |
+| `--duration` / `--warmup` / `--drain` | `5m` / `30s` / `10s` | Windows |
+| `--locking` | `optimistic` | or `pessimistic` |
+| `--isolation` | `read_committed` | or `serializable` |
+| `--workload` | `accounts` | `accounts`, `bank`, `fanout`, `append` |
+| `--init-if-missing` | `false` | Seed before the run if absent |
+
+Other verbs:
+
+```bash
+dotnet run -c Release --project CamusDB.Workload -- compare \
+  --baseline /tmp/base --candidate /tmp/cand --allow workers \
+  --require-ratio 1.10 --p99-budget-ms 250 --output /tmp/cmp
+dotnet run -c Release --project CamusDB.Workload -- baseline --runs /tmp/r1,/tmp/r2,/tmp/r3 --output /tmp/base
+dotnet run -c Release --project CamusDB.Workload -- report --output /tmp/run --metrics /tmp/server-metrics.txt
+dotnet run -c Release --project CamusDB.Workload -- cleanup \
+  --endpoint http://127.0.0.1:5096 --database workload --protocol grpc --confirm workload
+```
+
+- `compare` exits `0` pass, `1` gate missed, `3` not comparable.
+- `cleanup` drops the workload database. Confirm with the user first.
+- Artifacts: `manifest.json`, `summary.json`, `summary.md`, `intervals.csv`, `errors.json`,
+  `reconciliation.json`, `run-meta.json`, `client-resources.json`.
+- The process exits above zero when the run is invalid or reconciliation fails.
+- Do not benchmark with `memory_profile: dev`. Compare only runs with matching settings.

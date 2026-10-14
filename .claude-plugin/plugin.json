@@ -1,0 +1,13 @@
+{
+  "name": "camusdb",
+  "version": "0.1.0",
+  "description": "Skills that help coding agents design schemas, write SQL, tune queries, handle transactions, and operate CamusDB.",
+  "author": {
+    "name": "Andres Gutierrez",
+    "url": "https://github.com/camusdb"
+  },
+  "homepage": "https://camusdb.github.io/docs/intro",
+  "repository": "https://github.com/camusdb/camusdb-skills",
+  "license": "MIT",
+  "keywords": ["camusdb", "sql", "database", "newsql", "distributed-database"]
+}

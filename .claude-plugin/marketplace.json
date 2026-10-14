@@ -1,0 +1,14 @@
+{
+  "name": "camusdb",
+  "owner": {
+    "name": "CamusDB",
+    "url": "https://github.com/camusdb"
+  },
+  "plugins": [
+    {
+      "name": "camusdb",
+      "source": "./",
+      "description": "Skills that help coding agents design schemas, write SQL, tune queries, handle transactions, and operate CamusDB."
+    }
+  ]
+}

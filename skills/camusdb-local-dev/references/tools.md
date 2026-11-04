@@ -56,15 +56,18 @@ or DDL.
 
 ## Browser playground
 
-URL: https://camusdb.github.io/playground/. The tutorial page also embeds a single-node editor.
+URL: https://camusdb.github.io/playground/. The tutorial page also embeds a SQL editor.
 
-- The real engine, compiled to WebAssembly, runs inside the browser tab. No data leaves the tab.
-- Modes: Single node, or **Start 3-node cluster** with stop, restart, and isolate controls.
-- Data lives in memory. Reload or **Reset cluster** starts over.
-- The sample `playground` database has `books` and `authors`.
+- The real engine, compiled to WebAssembly, runs inside the browser tab. No SQL or data leaves the tab.
+- It starts four engines, with eight partitions and replication factor three.
+- **+** adds a node and **−** removes one gracefully. It supports four to nine nodes.
+- **Simulate node failure** stops an engine. **Restart node** brings back an empty engine that
+  catches up. You cannot stop a node if that would lose the majority.
+- Data lives in memory. Reload or **Reset data center** starts over.
+- Queries use the `playground` database, with a sample library of books and authors.
 - Each statement autocommits. A script stops at the first error.
-- There is no `USE` statement. Use the database selector.
-- No backups and no features that need external files.
+- There is no `USE` statement.
+- No backups, no C# extensions, and no features that need external files.
 
 ```sql
 CREATE DATABASE lab;
@@ -115,8 +118,25 @@ Run options (selection):
 | `--duration` / `--warmup` / `--drain` | `5m` / `30s` / `10s` | Windows |
 | `--locking` | `optimistic` | or `pessimistic` |
 | `--isolation` | `read_committed` | or `serializable` |
-| `--workload` | `accounts` | `accounts`, `bank`, `fanout`, `append` |
+| `--workload` | `accounts` | `accounts`, `bank`, `fanout`, `append`, `rw`, `predicate`, `tokens` |
+| `--txn-mode` | `explicit` | For `append`, `rw`, and `predicate`: `explicit`, `autocommit`, or `pipeline` |
 | `--init-if-missing` | `false` | Seed before the run if absent |
+
+Choose a write shape by what you want to check:
+
+- `bank` and `fanout` check a conserved `SUM(balance)`. `fanout` needs `--tables` of 2 or more.
+- `tokens` deletes a row and inserts its successor in one transaction, with `--tokens` rows
+  (default `2000`). It checks each slot after the run.
+- `append`, `rw`, and `predicate` record `history.edn` and `elle.json`. Run the Elle checker separately.
+  They also read the final state and judge it against the ledger of attempted writes.
+- `rw` and `predicate` use Elle's `rw-register` checker. `append` uses `list-append`.
+
+```bash
+dotnet run -c Release --project CamusDB.Workload -- run \
+  --endpoint http://localhost:5096 --protocol grpc --database workload \
+  --workload rw --rw-access join --isolation serializable --duration 60s \
+  --mode closed --workers 8 --output runs/rw-join
+```
 
 Other verbs:
 

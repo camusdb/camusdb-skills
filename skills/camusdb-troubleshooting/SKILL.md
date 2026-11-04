@@ -1,6 +1,6 @@
 ---
 name: camusdb-troubleshooting
-description: Diagnoses CamusDB errors and runtime problems. Explains the cause, the fix, and the retry rule for any CADBxxxx error code, such as CADB0502 TransactionConflict, CADB0504 TransactionMustRetry, CADB0509 TransactionFinalizeUnresolved, CADB0506, CADB0503 SchemaCatchingUp, CADB0536 InsufficientDiskSpace, CADB0549, or CADB0517. Guides diagnosis of slow, stuck, or overloaded workloads with SHOW QUERIES, SHOW CLUSTER QUERIES, SHOW CONNECTIONS, CANCEL QUERY, SHOW SLOW QUERIES, SHOW ENGINE STATS, SHOW VARIABLES, Prometheus and OpenTelemetry diagnostics, and the operator dashboard. Use when a user pastes a CamusDB error, an HTTP "status":"failed" body, a gRPC camus-error-code trailer, or a Kommander "Slow dispatch" warning, or reports latency spikes, hung queries, conflict storms, refused writes, or nodes that disagree.
+description: Diagnoses CamusDB errors and runtime problems. Explains the cause, the fix, and the retry rule for any CADBxxxx error code, such as CADB0502 TransactionConflict, CADB0504, CADB0509, CADB0506, CADB0503, CADB0536, CADB0549, CADB0555, CADB0556, CADB0558, CADB0824 TransactionRollbackOnly, CADB0420, CADB0600, or CADB0517. Guides diagnosis of slow, stuck, or overloaded workloads with SHOW QUERIES, SHOW CLUSTER QUERIES, SHOW CONNECTIONS, CANCEL QUERY, SHOW SLOW QUERIES, SHOW STATEMENT STATS, SHOW INDEX USAGE, SHOW ENGINE STATS, SHOW VARIABLES, Prometheus and OpenTelemetry diagnostics, and the operator dashboard. Use when a user pastes a CamusDB error, an HTTP "status":"failed" body, a gRPC camus-error-code trailer, or a Kommander "Slow dispatch" warning, or reports latency spikes, hung queries, conflict storms, refused writes, or nodes that disagree.
 ---
 
 # CamusDB troubleshooting
@@ -48,9 +48,10 @@ skill. For writing retry code, use the `camusdb-transactions` skill.
 | `CADB00xx` | Catalog, metadata, storage state. Many are corruption signals. |
 | `CADB03xx` | Integrity constraints: unique, not null, check, foreign key. |
 | `CADB04xx` | Invalid SQL, input, or expression shape. |
-| `CADB05xx` | Transactions, schema catch-up, prepared statements, auth, views, sequences, query cancel. |
+| `CADB05xx` | Transactions, schema catch-up, prepared statements, auth, views, sequences, query cancel, row locks, node limits. |
 | `CADB06xx` | Configuration validation. |
 | `CADB07xx` | Backup and point-in-time recovery. |
+| `CADB08xx` | C# extensions and triggers. Also `CADB0824`, an aborted transaction. |
 
 ## Retry classes
 
@@ -58,10 +59,10 @@ skill. For writing retry code, use the `camusdb-transactions` skill.
 | --- | --- | --- |
 | Replay | `CADB0502`, `CADB0504`, `CADB0505` | Roll back. Replay the whole transaction from `BEGIN`, with backoff. |
 | Finalize | `CADB0509` | Resend the same `COMMIT` or `ROLLBACK` for the same transaction id. Never replay. |
-| Retry | `CADB0503`, `CADB0520` (after re-prepare), `CADB0532`, `CADB0534`, `CADB0535`, `CADB070A`, `CADB070D` | Retry after the condition clears. |
-| After fix | `CADB0516`, `CADB0518`, `CADB0536` | Fresh credentials, wait out the rate limit, or free disk. Then retry. |
-| Fix first | `CADB0506` and most `03xx`, `04xx`, `05xx` codes | Change the request, data, or schema. A retry fails again. |
-| Operator | `CADB0014`, `CADB0099`, `CADB0701`, `CADB0704`, `CADB0706`, `CADB070F` | Investigate. Collect logs. |
+| Retry | `CADB0503`, `CADB0520` (after re-prepare), `CADB0532`, `CADB0534`, `CADB0535`, `CADB0558`, `CADB070A`, `CADB070D` | Retry after the condition clears. |
+| After fix | `CADB0516`, `CADB0518`, `CADB0536`, `CADB0817`, `CADB0834` | Fresh credentials, wait out the rate limit, free disk, or deploy the extension file. Then retry. |
+| Fix first | `CADB0506`, `CADB0555`, `CADB0556`, `CADB0824`, and most `03xx`, `04xx`, `05xx` codes | Change the request, data, or schema. A retry fails again. |
+| Operator | `CADB0014`, `CADB0099`, `CADB0559`, `CADB0701`, `CADB0704`, `CADB0706`, `CADB070F` | Investigate. Collect logs. |
 
 ## The most common errors
 
@@ -94,14 +95,31 @@ up. Retry later or on another node.
 `min_free_disk_bytes`. Writes are refused; reads and DDL still work. Free disk,
 then retry.
 
+**`CADB0824 TransactionRollbackOnly`.** An earlier statement failed, so the
+explicit transaction is aborted. CamusDB has no savepoints. Roll back, and stop
+catching the error and continuing. Over HTTP and gRPC, the same mistake shows as
+`CADB0400` "Unknown transaction".
+
+**`CADB0555 LockNotAvailable`.** `SELECT ... FOR UPDATE NOWAIT` met a held row. The
+transaction ended. Do not replay automatically. The application decides.
+
+**`CADB0556 ResultSetTooLarge`.** A buffered result passed its row or byte cap. The
+statement rolled back. Use a streaming transport, or page it.
+
+**`CADB0558 ConcurrencyLimitExceeded`.** The node has too many open explicit
+transactions or cluster fan-outs. Retry after a back-off. Look for leaked
+transactions.
+
 **`CADB0517 InsufficientPrivilege`.** With auth on, `SHOW ENGINE STATS`,
-`SHOW VARIABLES`, and `SHOW SLOW QUERIES` need a superuser.
+`SHOW VARIABLES`, `SHOW SLOW QUERIES`, `SHOW STATEMENT STATS`, and
+`SHOW INDEX USAGE` need a superuser.
 
 **`CADB0010 DatabaseDoesntExist`.** The database was never created, or the
 caller has no grant on it. Both cases return the same code on purpose.
 
-**`CADB0538 StatementNotAllowedInTransaction`.** `TRUNCATE` ran inside
-`BEGIN`. Run it in autocommit.
+**`CADB0538 StatementNotAllowedInTransaction`.** `TRUNCATE`, `ALTER TABLE ...
+REWRITE STORAGE`, or `ALTER SEQUENCE ... RESTART` ran inside `BEGIN`. The refusal
+aborts the transaction. Roll back, then run it in autocommit.
 
 ## Triage by symptom
 
@@ -120,6 +138,12 @@ caller has no grant on it. Both cases return the same code on purpose.
 | Errors after restart or failover | Logs, `CADB0504`, `CADB0509`, `CADB0535` | 11 |
 | Nodes behave differently | `SHOW VARIABLES` on each node | 12 |
 | Wrong results, no error | Quoting, TTL, isolation | 13 |
+| `CADB0824`, or "Unknown transaction" after an error | The earlier failed statement | 14 |
+| `UPDATE` or `DELETE` now fails with `CADB0400` on types | The operator and types in the message | 15 |
+| `SUM` or arithmetic fails with `CADB0420` | Operands and totals | 16 |
+| Result too large, `CADB0556` | Transport, `LIMIT` | 17 |
+| Too many open transactions, `CADB0558` | `SHOW CONNECTIONS`, `idle_ms` | 18 |
+| Node refuses to start, `CADB0600` routing mode | `key_range_sharding` setting | 19 |
 
 ## Observability tools
 
@@ -133,6 +157,12 @@ CANCEL QUERY 'b71a90e314-45';        -- reads only
 -- What was slow (enable slow_query_log_enabled first)
 SHOW SLOW QUERIES LIKE '%orders%';
 
+-- Totals per statement shape (enable statement_stats_enabled first)
+SHOW STATEMENT STATS LIKE '%orders%';
+
+-- Which indexes statements read
+SHOW INDEX USAGE FROM orders;
+
 -- Engine metrics since process start (take two readings, subtract)
 SHOW ENGINE STATS LIKE 'raft.wal%';
 
@@ -142,11 +172,14 @@ SHOW VARIABLES LIKE 'slow_query%';
 
 Rules for reading them:
 
-- `SHOW ENGINE STATS`, `SHOW SLOW QUERIES`, `SHOW VARIABLES`, and the
-  dashboard are node-local. Query every node.
-- Engine counters and histograms never reset. One reading tells you nothing
-  about a rate.
-- The slow query log is off by default, in memory only, and lost on restart.
+- `SHOW ENGINE STATS`, `SHOW SLOW QUERIES`, `SHOW STATEMENT STATS`,
+  `SHOW INDEX USAGE`, `SHOW VARIABLES`, and the dashboard are node-local. Query
+  every node.
+- Engine counters, statement totals, and histograms never reset. One reading tells
+  you nothing about a rate.
+- The slow query log and statement statistics are off by default. Turn either on
+  with `SET CLUSTER SETTING`, with no restart. Both live in memory only and are
+  lost on restart.
 - An idle explicit transaction is not in `SHOW QUERIES`. Find its connection in
   `SHOW CONNECTIONS` by a large `idle_ms`.
 - Only reads are cancellable. There is no `KILL CONNECTION`.
@@ -176,6 +209,10 @@ skill.
   the primary-key entry, each secondary index entry, and each out-of-line value.
 - **Looking for `pg_stat_activity` or `SHOW PROCESSLIST`.** Use `SHOW QUERIES`
   and `SHOW CONNECTIONS`.
+- **Looking for `pg_stat_statements` or `pg_stat_user_indexes`.** Use
+  `SHOW STATEMENT STATS` and `SHOW INDEX USAGE`.
+- **Catching an error and continuing in the same transaction** (MySQL and Oracle
+  habit). Any failed statement aborts it. Roll back and start again.
 - **`pg_cancel_backend`, `KILL QUERY`, or `KILL CONNECTION`.** Use
   `CANCEL QUERY '<query_id>'`. It stops reads only.
 - **`SHOW GLOBAL STATUS` or `SET GLOBAL`.** Use `SHOW ENGINE STATS` for metrics.
@@ -190,7 +227,7 @@ skill.
   no per-connection process. Use the admission gate to bound work.
 - **Expecting long lock waits or a lock-timeout error.** One lock wait is
   capped by `lock_wait_deadline_ms` (default 500 ms). CamusDB then reports a
-  conflict, usually `CADB0502`.
+  retryable error, `CADB0502` or `CADB0504`.
 - **Double-quoted identifiers.** In CamusDB, double quotes make a string
   literal. Use backticks for identifiers. A wrong quote can give wrong results
   with no error.
@@ -205,7 +242,7 @@ Read these files when the task needs the detail:
 - [references/error-codes.md](references/error-codes.md): every code with name,
   meaning, fix, and retry class. Read it for any `CADBxxxx` code.
 - [references/symptom-playbooks.md](references/symptom-playbooks.md): ordered
-  checks and fixes for 13 symptoms.
+  checks and fixes for 19 symptoms.
 - [references/observability.md](references/observability.md): columns,
   metrics, settings, and permissions of each tool.
 
@@ -216,9 +253,12 @@ Public docs:
 - https://camusdb.github.io/docs/engine-stats
 - https://camusdb.github.io/docs/query-activity
 - https://camusdb.github.io/docs/slow-query-log
+- https://camusdb.github.io/docs/statement-stats
+- https://camusdb.github.io/docs/index-usage
 - https://camusdb.github.io/docs/show-variables
 - https://camusdb.github.io/docs/operator-dashboard
 - https://camusdb.github.io/docs/connection-model
 - https://camusdb.github.io/docs/wal-recovery
 - https://camusdb.github.io/docs/serializable-retries
+- https://camusdb.github.io/docs/sql-transactions#failed-statements
 - https://camusdb.github.io/docs/transaction-limits

@@ -1,9 +1,10 @@
 # Local cluster reference
 
-Sources: https://camusdb.github.io/docs/cluster, https://camusdb.github.io/docs/caraxes,
+Sources: https://camusdb.github.io/docs/cluster,
+https://camusdb.github.io/docs/growing-a-one-node-cluster, https://camusdb.github.io/docs/caraxes,
 and the engine repository `docker/` folder and `README.md`.
 
-Cluster mode is an alpha feature. APIs and storage formats can change between versions.
+Cluster mode is still evolving. APIs and storage formats can change between versions.
 
 ## Three nodes with Docker Compose
 
@@ -21,8 +22,8 @@ Host port mapping in `docker/local.yml`:
 | `camus2` | `localhost:5096` | `localhost:6096` | `localhost:7142` | `7072` |
 | `camus3` | `localhost:5097` | `localhost:6097` | `localhost:7143` | `7074` |
 
-Inside each container, HTTP is `5095` and gRPC is `5096`. The docs table names only the
-HTTP and Raft ports; the gRPC column comes from the engine README and the compose file.
+Inside each container, HTTP is `5095` and gRPC is `5096`. These ports come from the compose file
+and the engine README. The site cluster page describes a three-terminal layout instead (see below).
 
 Connect over REST with an explicit protocol. Host port `5096` is `camus2` HTTP here, not gRPC:
 
@@ -39,7 +40,8 @@ Each node mounts its own volume (`camus1-data`, `camus2-data`, `camus3-data`). S
 `docker compose -f docker/local.yml down`. Adding `-v` deletes all cluster data; confirm first.
 
 The cluster image reads `CAMUS_EXTRA_ARGS` and appends it to the server command line. Example
-from the Dockerfile: `CAMUS_EXTRA_ARGS="--join-existing true"`.
+from the Dockerfile: `CAMUS_EXTRA_ARGS="--join-existing true"`. An empty `CAMUS_INITIAL_CLUSTER` omits
+`--initial-cluster`, so the image can start a one-node cluster.
 
 ## The standalone Docker image
 
@@ -54,10 +56,52 @@ from the Dockerfile: `CAMUS_EXTRA_ARGS="--join-existing true"`.
 
 The image uses 4 partitions. The dotnet tool and `camusdb init` use 1 for standalone.
 
+## Three nodes on one machine, without Docker
+
+Run three `CamusDB.Server` nodes, each in its own terminal. Nodes connect over TLS, so the Raft port
+needs a certificate they trust. Without one, no partition elects a leader. Export the .NET
+development certificate as a PFX with no password:
+
+```bash
+mkdir -p ~/camus-cluster && cd ~/camus-cluster
+dotnet dev-certs https --trust
+dotnet dev-certs https -ep localhost.pem --format PEM --no-password
+openssl pkcs12 -export -in localhost.pem -inkey localhost.key -out localhost.pfx -passout pass:
+```
+
+Node 1. For nodes 2 and 3, change the name, ID, ports, data directory, and peer lists:
+
+```bash
+camusdb \
+  --mode=cluster \
+  --raft-nodename=camus1 --raft-nodeid=1 \
+  --raft-host=localhost --raft-port=7070 \
+  --raft-certificate=$HOME/camus-cluster/localhost.pfx \
+  --http-port=5095 --grpc-port=6095 \
+  --https-port=7141 --https-certificate=$HOME/camus-cluster/localhost.pfx \
+  --data-dir=$HOME/camus-cluster/node1-data \
+  --initial-cluster-partitions=3 \
+  --initial-cluster localhost:7072 localhost:7074 \
+  --http-peers localhost:5096 localhost:5097
+```
+
+| Node | HTTP | HTTPS | gRPC | Raft |
+| --- | --- | --- | --- | --- |
+| `camus1` | `5095` | `7141` | `6095` | `7070` |
+| `camus2` | `5096` | `7142` | `6096` | `7072` |
+| `camus3` | `5097` | `7143` | `6097` | `7074` |
+
+- `--grpc-port` keeps each node's gRPC port apart from the others' HTTP ports.
+- The gRPC port reuses the Raft certificate, so connect with `https://`:
+  `Endpoint=https://localhost:6096;Database=shop;Protocol=grpc`.
+- Use this layout for local testing only. Peer HTTP traffic is plaintext, and the nodes do not
+  authenticate each other.
+
 ## A cluster node by hand
 
-Each node needs `--mode=cluster`, a unique name, its Raft host and port, the partition count,
-and the static peer list:
+Each node needs `--mode=cluster`, a unique name, its Raft host and port, a Raft certificate, the
+partition count, and the Raft address of every other node. List only the other nodes, never the
+node itself. This is the first of three nodes, one per machine:
 
 ```bash
 camusdb \
@@ -65,10 +109,11 @@ camusdb \
   --raft-nodename=camus-1 \
   --raft-host=192.168.1.10 \
   --raft-port=7070 \
+  --raft-certificate=/etc/camusdb/node.pfx \
   --http-port=5095 \
   --initial-cluster-partitions=3 \
-  --initial-cluster 192.168.1.10:7070 192.168.1.11:7072 192.168.1.12:7074 \
-  --http-peers 192.168.1.10:5095 192.168.1.11:5096 192.168.1.12:5097
+  --initial-cluster 192.168.1.11:7070 192.168.1.12:7070 \
+  --http-peers 192.168.1.11:5095 192.168.1.12:5095
 ```
 
 The same in YAML:
@@ -79,21 +124,65 @@ mode: cluster
 node_name: camus-1
 raft_host: 192.168.1.10
 raft_port: 7070
+raft_certificate: /etc/camusdb/node.pfx
 initial_partitions: 3
 http_port: 5095
 peers:
-  - 192.168.1.10:7070
-  - 192.168.1.11:7072
-  - 192.168.1.12:7074
+  - 192.168.1.11:7070
+  - 192.168.1.12:7070
 http_peers:
-  - 192.168.1.10:5095
-  - 192.168.1.11:5096
-  - 192.168.1.12:5097
+  - 192.168.1.11:5095
+  - 192.168.1.12:5095
 ```
 
 - Give each node its own persistent `data_dir`.
+- A `peers` entry equal to the node's own `raft_host:raft_port` fails startup with `InvalidConfig`.
 - `http_peers` must have the same count and order as `peers`, or startup fails with `InvalidConfig`.
-- With auth on, every node needs the same `CAMUSDB_AUTH_TOKEN_KEY` and `CAMUSDB_NODE_SECRET`.
+- The Raft certificate must name the node's Raft host, and every other node must trust it.
+- With auth on, every node needs the same `CAMUSDB_AUTH_TOKEN_KEY` and `CAMUSDB_NODE_SECRET`. It
+  also needs `raft_mutual_tls_enabled: true` and `raft_peer_ca`, or it refuses to start.
+
+## Grow a one-node cluster
+
+A standalone node refuses joins. To grow later, start the first node in cluster mode. To move
+standalone data into a cluster, dump it and reimport it.
+
+Choose these before the first boot. A later change has no effect or refuses the start:
+
+- `initial_partitions`: fixed at the first boot. It defaults to `3` in cluster mode, but the sample
+  `CamusDB/Config/config.yml` sets `1`. Check a copied file.
+- `key_range_sharding`: the routing mode of the cluster.
+
+```yaml
+# First node. Do not set join_existing here.
+mode: cluster
+node_name: camus-node-1
+raft_node_id: 1
+raft_host: 10.0.0.1
+raft_port: 7070
+http_port: 5095
+initial_partitions: 3
+peers: []
+```
+
+```yaml
+# Second node. peers is the seed list: one or more members of the running cluster.
+mode: cluster
+node_name: camus-node-2
+raft_node_id: 2
+raft_host: 10.0.0.2
+raft_port: 7070
+http_port: 5095
+peers: [10.0.0.1:7070]
+join_existing: true
+```
+
+- Add one node at a time. The node joins as a learner. Wait until it is a voter before you add the next.
+- Do not stay on two voters. If one of them stops, the cluster cannot commit.
+- Give every node the same `http_port`, so you do not need `http_peers`.
+- These YAML files omit TLS. Add `raft_certificate` as in "A cluster node by hand".
+
+Read https://camusdb.github.io/docs/growing-a-one-node-cluster for the full steps.
 
 ## Behavior to expect
 
@@ -101,6 +190,8 @@ http_peers:
 - A partition with no majority stops commits. It does not accept split-brain writes.
 - `SET CLUSTER SETTING` commits through Raft. A node that was down catches up on replay.
 - `SHOW VARIABLES` and the dashboard are node-local. Check each node.
+- A starting node keeps waiting for partition leaders. A stop signal during that wait exits `0`. Any
+  other startup failure logs the cause and exits `1`.
 
 Graceful leadership handoff (send it to the current leader):
 
@@ -131,6 +222,10 @@ dotnet run --project Caraxes -- run --scenario scenarios/smoke-optimistic.yml
 
 - Node `i` publishes REST on host port `15095 + i - 1` and gRPC on `16095 + i - 1`. A Caraxes
   cluster can therefore run beside a local node on `5095` and `5096`.
-- `run` exits `0` on PASS, `1` on FAIL, and `2` for an invalid spec. CI can gate on it.
+- `run` exits `0` on PASS, `1` on FAIL or a harness failure, `2` for an invalid spec, and `130` on
+  Ctrl-C. CI can gate on it.
 - Faults include `kill`, `stop`, `pause`, `partition`, `slow`, `loss`, `fill-disk`, `slow-disk`,
-  and `remove-node`.
+  `clock-skew`, `leader-transfer`, `remove-node`, `backup`, `add-node`, and `sql`.
+- Workload kinds are `accounts`, `bank`, `fanout`, `tokens`, and the Elle kinds `append`, `rw`, and
+  `predicate`. Pick the kind by the failure you want to catch.
+- The Elle kinds need the checker jar. Build it once with `tools/elle/build.sh`.

@@ -1,6 +1,6 @@
 ---
 name: camusdb-migrations-and-recovery
-description: Plans and runs safe CamusDB schema changes and recovers lost data. Covers online DDL (ALTER TABLE, CREATE INDEX, DeleteOnly/WriteOnly/Public states, backfill), migration rehearsal on a branch (CREATE DATABASE ... BRANCH FROM, SHOW BRANCHES, SHOW ANCESTORS), batched backfills under the 20,000-mutation limit, AS OF SYSTEM TIME recovery, SHOW ORPHAN TABLES, SHOW ORPHAN DATABASES and RELINK TO, TRUNCATE recovery, physical backups and PITR (/v1/backups, /v1/restore, camus-cli backup), camus-dump, logical dump and reimport across storage revisions, and WAL crash recovery. Use when writing or applying a migration, after an accidental DROP, DELETE, UPDATE or TRUNCATE, when setting up backups or retention, or when you see CADB0506, CADB0530, CADB0534, CADB0537, CADB0539, CADB0510, CADB0503 or a CADB07xx backup error.
+description: Plans and runs safe CamusDB schema changes and recovers lost data. Covers online DDL (ALTER TABLE, CREATE INDEX, DROP INDEX, DeleteOnly/WriteOnly/Public states, backfill), migration rehearsal on a branch (CREATE DATABASE ... BRANCH FROM, SHOW BRANCHES, SHOW ANCESTORS), batched backfills under the 20,000-mutation limit, AS OF SYSTEM TIME recovery, SHOW ORPHAN TABLES, SHOW ORPHAN DATABASES and RELINK TO, TRUNCATE recovery, physical backups and PITR (/v1/backups, /v1/restore, camus-cli backup, pitr_bootstrap_from), camus-dump, logical dump and reimport across storage revisions, Solarium and key_range_sharding, and WAL crash recovery. Use when writing or applying a migration, after an accidental DROP, DELETE, UPDATE or TRUNCATE, when setting up backups or retention, or when you see CADB0506, CADB0530, CADB0534, CADB0537, CADB0539, CADB0510, CADB0503, CADB0600 or a CADB07xx backup error.
 ---
 
 # CamusDB migrations and recovery
@@ -17,7 +17,7 @@ Public docs: https://camusdb.github.io/docs/intro
 
 - Confirm with the user before any destructive or irreversible command. This
   includes `DROP DATABASE`, `DROP TABLE`, `TRUNCATE`, `DELETE`, a wide `UPDATE`,
-  `ALTER TABLE ... DROP COLUMN`, `ALTER TABLE ... DROP INDEX`, `RESET CLUSTER
+  `ALTER TABLE ... DROP COLUMN`, `DROP INDEX` in any form, `RESET CLUSTER
   SETTING`, backup `gc`, and any restore step.
 - Never add `FORCE` to a `DROP` unless the user asks for a permanent delete.
   A forced drop creates no orphan and cannot be recovered.
@@ -35,7 +35,8 @@ Public docs: https://camusdb.github.io/docs/intro
 | `DROP TABLE` or `DROP DATABASE` (root database) | `SHOW ORPHAN ...` + `RELINK TO` | `orphan_retention_ms`, 7 days by default |
 | `TRUNCATE TABLE` | `SHOW ORPHAN TABLES` (`retired contents`) + `RELINK TO` | `orphan_retention_ms` |
 | Node or cluster data loss, or a point before the MVCC window | Physical backup + offline restore | The chain's recoverable range |
-| Move data to another machine or storage revision | `camus-dump` + `camus-cli -f` | Not a recovery tool for large data |
+| Move data to another machine, storage revision, storage engine, or routing mode | `camus-dump` + `camus-cli -f` | Not a recovery tool for large data |
+| Add a node to a running cluster without a full snapshot | Restored backup + `pitr_bootstrap_from` | The chain's range, inside the leader's retention |
 | Process crash or restart | WAL replay, automatic | Nothing to do |
 
 Not recoverable by any in-engine tool: a dropped column, a dropped branch, a
@@ -58,7 +59,8 @@ Follow this checklist for any schema change on a database with data.
    ```
 2. **Check the preconditions for a branch.** The source must have no schema
    change in flight. It must have no foreign key still being added. Otherwise
-   branch creation fails with `CADB0400`.
+   branch creation fails with `CADB0400`. A branch create on the node that runs
+   a staged change waits for that change first.
 3. **Create a rehearsal branch.** It copies no rows. It reads the source
    snapshot and writes into its own overlay.
    ```sql
@@ -106,9 +108,13 @@ CamusDB stages a new column or index through `DeleteOnly`, `WriteOnly`, then
 `Public`. It backfills existing rows before the element becomes `Public`. The
 backfill is checkpointed and resumes after a restart or a leader change. In a
 cluster, every DDL statement goes through the schema leader and waits for live
-nodes to converge before the next stage.
+nodes that hold the database open before the next stage.
 
-Supported `ALTER TABLE` forms (from the docs):
+A batch that loses a row lock to a writer is retried without limit. The batch
+halves on each loss. A table under sustained writes is still indexed or filled,
+only more slowly. The caller of the statement waits for the whole backfill.
+
+Supported `ALTER TABLE` and index forms (from the docs):
 
 ```sql
 ALTER TABLE robots ADD COLUMN model STRING NULL;
@@ -120,6 +126,9 @@ ALTER TABLE machines RENAME COLUMN name TO display_name;
 ALTER TABLE robots ADD INDEX robots_kind_idx (kind) INCLUDE (name, year);
 ALTER TABLE robots ADD UNIQUE INDEX robots_code_year_uq (code, year);
 ALTER TABLE robots DROP INDEX robots_kind_idx;
+DROP INDEX robots_kind_idx ON robots;
+DROP INDEX IF EXISTS robots.robots_kind_idx;
+CREATE INDEX events_payload_gin ON events USING GIN (payload);
 ALTER TABLE robots RENAME INDEX robots_name_idx TO robots_display_name_idx;
 ALTER TABLE products ADD CONSTRAINT positive_price CHECK (price > 0);
 ALTER TABLE weather ADD CONSTRAINT weather_city_fk FOREIGN KEY (city) REFERENCES cities (name);
@@ -153,8 +162,19 @@ Rules the agent must respect:
 - **To change an index's `INCLUDE` list,** drop the index and create it again.
 - **A dropped column is gone for good.** Time travel reads through the current
   schema, so it cannot project a dropped column. Copy the column out first.
-- **A transaction pins its schema.** A concurrent DDL can make its commit fail.
-  Retry it from `BEGIN`.
+- **A transaction pins its schema.** A concurrent DDL can make a later statement
+  or the commit fail with the retryable `CADB0502`. Retry it from `BEGIN`.
+- **DDL on another table does not wait.** A staged change holds only its own
+  table during a backfill. DDL on that table waits. `DROP DATABASE` and a branch
+  create wait for every staged change.
+- **A failed `ADD COLUMN` or `ADD CONSTRAINT` leaves nothing behind.** You can run
+  the same statement again.
+- **Check the schema before you rerun after a handover.** If the schema leader
+  moves, the statement answers from what the new leader did. If that is still
+  running after ten minutes, the statement fails and the change finishes in the
+  background.
+- **`CADB0099` on DDL is not safe to replay.** The entry may still commit. Read
+  the schema first. `CADB0504` means nothing was committed, so rerun it.
 - **`TRUNCATE` cannot run inside `BEGIN ... COMMIT`** (`CADB0538`).
 - **Quiesce writers before adding a foreign key.** A long transaction that
   wrote an orphan row before the constraint existed can still commit it.
@@ -190,6 +210,17 @@ whole table, use `TRUNCATE` instead of `DELETE`. It costs no mutations.
 `INSERT ... SELECT` and the row load of `CREATE TABLE ... AS SELECT` are user
 writes. They also obey the limit. For a large copy, run CTAS `WITH NO DATA`,
 then `INSERT ... SELECT` in `WHERE` or `LIMIT` slices.
+
+A copy out of a busy table depends on the isolation level and locking mode:
+
+- Serializable holds an exclusive range lock on the scanned range until commit.
+  Under key-range sharding, this lock applies at every isolation level.
+- Read Committed with pessimistic locking takes no lock.
+- Optimistic locking makes every visited row a commit dependency. A bulk copy
+  from a table under sustained writes then does not commit (`CADB0502`).
+
+A source with `AS OF SYSTEM TIME` takes no lock and no dependency. Otherwise run
+the copy pessimistically, or copy small slices.
 
 Raise the cap only with the user's consent, and only temporarily:
 
@@ -230,6 +261,9 @@ CREATE TABLE orders_recovered RELINK TO 'A0';
   operation except restore as `backup ...`. A restore is offline into a fresh
   directory, followed by a restart against it. See
   [references/backup-and-restore.md](references/backup-and-restore.md).
+- **Add a node to a running cluster from a backup** with a seeded join
+  (`pitr_bootstrap_from`). A restored data root started alone loses its data to
+  the leader's snapshot.
 - **`camus-dump`** writes replayable SQL. Use it for small databases, single
   tables, moving data between machines, and crossing storage revisions. Do not
   use it for disaster recovery of large data. See
@@ -237,6 +271,20 @@ CREATE TABLE orders_recovered RELINK TO 'A0';
 - **WAL recovery is automatic.** At startup, each partition replays its
   committed Raft log before it serves work. Uncommitted entries are dropped.
   Never delete or edit the `kv` or `wal` directories under `data_dir`.
+
+## Choices you cannot change in place
+
+Each of these needs a logical dump and reimport. See
+[references/dump-and-reimport.md](references/dump-and-reimport.md).
+
+- **Routing mode.** A cluster records `key_range_sharding` once, when it is
+  created. A node set to the other mode refuses to start (`CADB0600`). Reimport
+  into a new cluster.
+- **Storage engine.** Solarium does not read RocksDB files, and RocksDB does not
+  read Solarium files.
+- **Storage revision.** A newer revision does not read older files.
+- **Standalone to cluster.** A standalone node refuses every join. Reimport into
+  a cluster. To grow later, start one node in cluster mode.
 
 ## Common mistakes
 
@@ -256,9 +304,14 @@ CREATE TABLE orders_recovered RELINK TO 'A0';
 - Pointing a restore at the live `data_dir`, or its `kv` or `wal` subdirectory
   (`CADB0707`).
 - Using the backup API from a remote host with authentication off. The server
-  accepts only loopback callers in that case.
+  accepts only loopback callers then. Others get `CADB0517`.
 - Restoring a physical backup with a different CamusDB storage revision. Use a
   logical dump to cross revisions.
+- Changing `key_range_sharding` or `kahuna.storage` on a node with data. Use a
+  logical dump.
+- Starting a restored data root as a new cluster member without a seeded join.
+- Dropping an index first when you replace it on a live table. Create the new
+  one, verify the plan, then drop the old one.
 - Forgetting that `camus-dump` does not export passwords or superuser status.
 
 ## References
@@ -276,6 +329,7 @@ CREATE TABLE orders_recovered RELINK TO 'A0';
 
 Public docs:
 https://camusdb.github.io/docs/sql-schema,
+https://camusdb.github.io/docs/sql-indexes,
 https://camusdb.github.io/docs/distributed-schema,
 https://camusdb.github.io/docs/database-branching,
 https://camusdb.github.io/docs/transaction-limits,
@@ -286,5 +340,8 @@ https://camusdb.github.io/docs/truncate-table,
 https://camusdb.github.io/docs/backup-and-restore,
 https://camusdb.github.io/docs/camus-dump,
 https://camusdb.github.io/docs/logical-dump-and-reimport,
+https://camusdb.github.io/docs/key-range-sharding,
+https://camusdb.github.io/docs/growing-a-one-node-cluster,
+https://camusdb.github.io/docs/configuration,
 https://camusdb.github.io/docs/wal-recovery,
 https://camusdb.github.io/docs/databases.

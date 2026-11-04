@@ -12,11 +12,11 @@ Spanner. Each row says what you might write, and what to write in CamusDB.
 | `'O\'Brien'` (MySQL) | `'O''Brien'`, or `E'O\'Brien'`. A plain string keeps `\` as typed. |
 | `'line1\nline2'` expecting a newline | `E'line1\nline2'`. |
 | `'^\\d+$'` (regex with doubled backslashes) | `'^\d+$'`. Single backslashes in a plain string. |
-| `$1`, `?`, `:name` placeholders | `@name`. A prepared statement binds by position in first-occurrence order. |
+| `$1`, `?`, `:name` placeholders | `@name`. A prepared statement binds by position in first-occurrence order. `?` is a `jsonb` operator. |
 | SQL `PREPARE p AS ...` / `EXECUTE p` | Not a SQL statement. Prepare through gRPC `BatchExecute`, REST `/prepare-sql-statement`, or a driver. |
 | `x - -5` written as `x --5` | `--` starts a comment. Put a space: `x - -5`. |
 | `0xFF_FF` | `0xFF` takes no digit separators. `65_535` is fine. |
-| `'{a,b}'` array text | `ARRAY['a', 'b']`. |
+| `'{a,b}'` array text | `ARRAY['a', 'b']`. A `jsonb` path or key list does accept `'{a,b}'`. |
 | `ARRAY[1, 2.5]` | Cast to one type: `ARRAY[1.0, 2.5]` or `ARRAY[CAST(1 AS FLOAT64), 2.5]`. |
 
 ## Queries
@@ -37,13 +37,31 @@ Spanner. Each row says what you might write, and what to write in CamusDB.
 | Correlated `x IN (SELECT ... WHERE u.k = t.k)` | Not supported. Use a correlated `EXISTS`. |
 | Correlated subquery inside `= ANY (...)` | Not supported. Use `EXISTS`. |
 | `x NOT IN (SELECT nullable_col ...)` | Legal, but one `NULL` drops every non-match. Prefer `NOT EXISTS`. |
-| `WITH cte AS (...) SELECT ...` | Not documented. Use a derived table or a view. |
+| `x IN (y + 1, CAST(z AS INT64))` | An expression item is a syntax error. Write `x = y + 1 OR x = CAST(z AS INT64)`. A column name alone is fine. |
+| `WHERE int_col = '5'` (MySQL implicit conversion) | Fails with `CADB0400`. Write `int_col = 5` or `CAST(s AS INT64) = int_col`. |
+| `WHERE text_col = 5`, `bool_col = 1` | Fails with `CADB0400`. Cast one side. |
+| `CASE WHEN c THEN 1 ELSE '2' END` (PostgreSQL) | Fails with `CADB0400`. A quoted literal does not become a number. Cast it. |
+| Correlated subquery in the select list, `HAVING`, or `ON` | Refused. A correlated `EXISTS` works in the `WHERE` of a `SELECT` only. |
+| `ORDER BY (SELECT ...)`, `GROUP BY (SELECT ...)` | Refused (`CADB0400`). |
+| `ORDER BY x NULLS FIRST`, `NULLS LAST` | Not supported. `NULL` sorts first ascending and last descending. PostgreSQL does the opposite by default. |
+| `WITH cte AS (...) SELECT ...` | Not supported. Use a derived table or a view. |
 | `WITH RECURSIVE` | Not supported. |
-| `UNION`, `UNION ALL`, `INTERSECT`, `EXCEPT` | Not documented. Run separate queries, or redesign with joins. |
-| `ROW_NUMBER() OVER (...)`, other window functions | Not documented. Use `ORDER BY ... LIMIT`, or a derived table with `GROUP BY`. |
+| `UNION`, `UNION ALL`, `INTERSECT`, `EXCEPT` | Supported, with `ALL`. See [set-and-window.md](set-and-window.md). |
+| `(q1 UNION q2) ORDER BY a + 1` | An expression fails. Use `SELECT * FROM (q1 UNION q2) AS s ORDER BY s.a + 1`. |
+| `UNION CORRESPONDING BY` | Not supported. |
+| `ROW_NUMBER() OVER (...)`, other window functions | Supported. See [set-and-window.md](set-and-window.md). |
+| `SUM(x) FILTER (WHERE ...)` | Syntax error. Write `SUM(CASE WHEN ... THEN x END)`. |
+| `OVER w ... WINDOW w AS (...)` | Not supported. Write the specification in each `OVER`. |
+| `GROUPS` frames, `EXCLUDE`, `RANGE n PRECEDING` | Not supported. Use `ROWS`. |
+| `FROM t, generate_series(1, t.n)`, `LATERAL` | Not supported (`CADB0533`). |
+| `SELECT generate_series(1, 3)` | `CADB0533`. Write `SELECT * FROM generate_series(1, 3)`. |
+| `generate_series` over dates or timestamps | Not supported. Arguments are integers. Use `date_add(d, i, 'day')` with an integer series. |
+| `unnest(a)`, `WITH ORDINALITY` | Not supported. |
+| `FOR SHARE`, `FOR KEY SHARE` | `CADB0533`. |
+| `FOR UPDATE` with a join, `DISTINCT`, `GROUP BY`, or a view | `CADB0400`. See `camusdb-transactions`. |
 | `SIMILAR TO`, `[[:alpha:]]` | Use `~` with .NET syntax, such as `\p{L}`. |
 | `tags[1:2]` slice | Not supported. `tags[n]` reads one element (1-based). |
-| `tags @> ARRAY['x']`, `<@` | Not supported. `'x' = ANY (tags)` or `array_contains(tags, 'x')`. |
+| `tags @> ARRAY['x']`, `<@` on an array | Not supported. `'x' = ANY (tags)` or `array_contains(tags, 'x')`. These operators work on `jsonb`. |
 | `ANY (tags) = x` (quantifier on the left) | `x = ANY (tags)`. |
 | `table AS OF SYSTEM TIME` inside `BEGIN` (CockroachDB) | A plain historical read runs in autocommit only. It works as the source of `INSERT ... SELECT` or CTAS. |
 | `FROM t@{FORCE_INDEX=idx}` (Spanner) | Same form: `FROM t@{FORCE_INDEX=idx}`. See `camusdb-query-performance`. |
@@ -56,8 +74,17 @@ Spanner. Each row says what you might write, and what to write in CamusDB.
 | `DELETE FROM t` to empty a table | Rejected. `TRUNCATE TABLE t`. |
 | `UPDATE t SET ... FROM other`, `UPDATE a JOIN b` | Not documented. Use a subquery in `WHERE`, or several statements in a transaction. |
 | `UPDATE ... ORDER BY ... LIMIT` (MySQL) | `LIMIT n` is accepted. `ORDER BY` in `UPDATE`/`DELETE` is not documented. |
-| `INSERT ... ON CONFLICT DO UPDATE` | Not documented. Read and write in one transaction; see `camusdb-transactions`. |
-| `INSERT ... ON DUPLICATE KEY UPDATE`, `REPLACE INTO`, `UPSERT`, `INSERT OR IGNORE` | Not documented. Same as above. |
+| `UPDATE t SET v = 1, v = 2` | Fails with `CADB0403`. |
+| `INSERT ... ON CONFLICT DO UPDATE` | Supported. It must name a target. See [statements.md](statements.md). |
+| `UPSERT INTO` (CockroachDB) | Supported, on the primary key. |
+| `INSERT ... ON DUPLICATE KEY UPDATE c = VALUES(c)` (MySQL) | Not supported. `ON CONFLICT (key) DO UPDATE SET c = excluded.c`. |
+| `INSERT OR IGNORE`, `INSERT IGNORE` | `ON CONFLICT DO NOTHING`. |
+| `REPLACE INTO` | Not documented. `UPSERT INTO` is close, but an unlisted column keeps its stored value. |
+| `MERGE` | Not supported. |
+| `INSERT INTO t AS x ... ON CONFLICT` | No alias on the target. Use the table name and `excluded`. |
+| `ON CONFLICT ON CONSTRAINT my_pk` | Name the primary key `<table>_pkey`, or give its columns. |
+| `SAVEPOINT` around a failed insert | Not available. Any failed statement ends an explicit transaction. Use `ON CONFLICT`. |
+| `RETURNING old.x`, `RETURNING new.x` | Not supported. `UPDATE` returns the new row only. |
 | `INSERT INTO t2 SELECT * FROM t1` with different column order | Columns match by position. List columns on both sides. |
 | `RETURNING COUNT(*)` | Rejected (`CADB0400`). `RETURNING` takes per-row expressions only. |
 | `RETURNING nextval('s')` | Rejected (`CADB0547`). |
@@ -106,6 +133,17 @@ Spanner. Each row says what you might write, and what to write in CamusDB.
 | --- | --- |
 | `NUMERIC(10, 2)`, `DECIMAL(10, 2)` | `NUMERIC` (fixed precision 38, scale 9). |
 | `x::text`, `x::int`, `x::double` | Supported. `CAST(x AS double)` too. |
+| `CAST(2.5 AS INT64)` expecting `2` (PostgreSQL float) | Gives `3`. A float rounds half away from zero. |
+| `CAST('2.5' AS INT64)` (MySQL) | Fails with `CADB0400`. A string must spell an integer. |
+| `9223372036854775807 + 1` expecting a wrap | Fails with `CADB0420`. Write a wider number as `NUMERIC '...'`. |
+| `1e308 * 10` expecting `Infinity` | Fails with `CADB0421`. `CAST('Infinity' AS float64)` is a value. |
+| `NaN <> NaN` (IEEE) | `NaN = NaN` is true, as in PostgreSQL. `NaN` sorts above every number. |
+| `x #-1` meaning XOR | `#-` is the `jsonb` path delete. Write `x # -1`. |
+| `a ^ b` | Not an operator. `a # b` for XOR, `power(a, b)` for a power. |
+| `doc['key']`, `jsonpath`, `jsonb_path_query`, `@?`, `@@` | Not supported. Write `doc -> 'key'`. See [jsonb.md](jsonb.md). |
+| `jsonb_agg(x ORDER BY y)` | Not supported. |
+| `row_to_json`, `jsonb_to_record`, `jsonb_populate_record` | Not supported. |
+| A `json` column that keeps its input text | `json` is an alias of `jsonb`. The text is canonical. |
 | `a + b::int` meaning `(a + b)::int` | `::` binds tighter. Write `(a + b)::int`. |
 | `'2024-06-15 10:30:00'` in a date function | Add an offset: `'2024-06-15T10:30:00Z'`. |
 | `ObjectId('...')` | `str_id('...')` or `to_id('...')`, 24 lowercase hex characters. |
@@ -117,20 +155,28 @@ Spanner. Each row says what you might write, and what to write in CamusDB.
 
 | You might write | In CamusDB |
 | --- | --- |
-| `a \|\| b` for text | Not documented. `concat(a, b)`. Note that `concat` skips `NULL` arguments. |
-| `NULLIF(a, b)` | Not in the function catalog. `CASE WHEN a = b THEN NULL ELSE a END`. |
-| `IFNULL`, `NVL`, `COALESCE` | All supported. |
+| `a \|\| b` for text (PostgreSQL) | Supported. A `NULL` operand gives `NULL`. `concat(a, b)` skips `NULL`. Two non-strings such as `1 \|\| 2` fail. |
+| `a \|\| b` as logical OR (MySQL) | `\|\|` is concatenation. Write `a OR b`. |
+| `NULLIF(a, b)` | Supported. The result has the type of `a`. |
+| `IF(c, a, b)` (MySQL) | Supported. It evaluates only the selected result. |
+| `IFNULL`, `NVL`, `COALESCE` | All supported. All arguments need a common type. `COALESCE(1, 'a')` fails. |
 | `GREATEST`, `LEAST`, `LPAD`, `SPLIT_PART`, `STRING_AGG`, `GROUP_CONCAT`, `ARRAY_AGG` | Not documented. |
 | `char_length(x)` | `length(x)`. |
 | `POSITION(a IN b)`, `STRPOS(b, a)` | Supported. |
 | `btrim(x, chars)` | `trim(x, chars)`. |
-| `EXTRACT(YEAR FROM d)`, `YEAR(d)` | `date_part('year', d)`. |
+| `EXTRACT(YEAR FROM d)`, `YEAR(d)` | Supported. Both are `INT64`. PostgreSQL returns `numeric`, so `epoch` and `millisecond` differ. |
+| `EXTRACT(dow FROM d)`, `DAYOFWEEK(d)`, `WEEK(d, 3)` | Supported. See [functions.md](functions.md) for units and modes. |
+| `DATE(x)` | `CAST(x AS date)`. `date` is a reserved word. |
+| `CURRENT_TIMESTAMP`, `CURRENT_DATE` with no parentheses | Write `current_timestamp()`, `current_date()`. |
+| `CURDATE()` (MySQL) | `current_date()`. It reads the start of the transaction. |
+| `now()` expecting the time of each row (MySQL `SYSDATE()`) | `now()` is the start of the transaction. Use `clock_timestamp()` or `sysdate()`. |
+| `make_date`, `make_timestamp`, `makedate`, `last_day` | Supported. A negative year (PostgreSQL BC) fails. |
 | `d + INTERVAL '1 day'`, `DATE_ADD(d, INTERVAL 1 DAY)` | `date_add(d, 1, 'day')`. Returns `DATETIME`. |
 | `DATEDIFF(a, b)` (MySQL) | `date_diff(start, end, 'day')`. Mind the argument order. |
 | `date_trunc('month', x)` | Same order. Returns `DATETIME` in UTC. |
 | `UNIX_TIMESTAMP(x)`, `FROM_UNIXTIME(s)`, `to_timestamp(s)` | Supported. |
 | `to_char(123, '999')` | Not supported. Only dates format with patterns. |
-| `str_to_date(...)` compared with a `DATE` column | Returns `DATETIME`. Wrap it in `CAST(... AS date)`, or use `to_date(text, pattern)`. |
+| `str_to_date(...)` compared with a `DATE` column | Returns `DATETIME`. The date compares as midnight UTC. To get a `DATE`, wrap it in `CAST(... AS date)`, or use `to_date(text, pattern)`. |
 | Unknown MySQL `%` specifier | Error, not printed text. |
 | `sha256(x)` expecting `bytea` | Returns hex text. Use `digest(x, 'sha256')` for bytes. |
 | `digest(x, 'sha224')` | Not supported. |

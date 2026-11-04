@@ -19,9 +19,12 @@ limits, the mutation math, batching patterns, hot rows, and the priority gate.
 | --- | --- | --- | --- |
 | Serializable read-write lifetime | 1 hour (`3600000` ms) | `max_serializable_transaction_lifetime_ms` | `CADB0505`, replay from `BEGIN` |
 | Mutations per user DML transaction | 20,000 | `max_mutations_per_transaction` | `CADB0506`, split the work |
-| Idle time inside an explicit transaction | 5 minutes (`300000` ms) | `transaction_idle_timeout_ms` | CamusDB rolls the transaction back |
+| Idle time inside an explicit transaction | 5 minutes (`300000` ms) | `transaction_idle_timeout_ms` | CamusDB rolls it back. The next statement gets `CADB0400` "Unknown transaction". |
 | Reaper interval | 30 seconds (`30000` ms) | `transaction_reaper_interval_ms` | How often CamusDB looks for idle transactions |
 | Concurrent coordinator sessions per node | `0`, no gate | `kahuna.max_concurrent_sessions` | Queued, then `CADB0504` |
+| Open explicit transactions per node | `10000` | `max_open_explicit_transactions` | `CADB0558` on `BEGIN`, retry after a back-off. Autocommit is not counted. |
+| Rows in one buffered response | `1000000` | `max_buffered_result_rows` | `CADB0556`, the statement rolls back |
+| Estimated bytes in one buffered response | `268435456` (256 MiB) | `max_buffered_result_bytes` | `CADB0556`, the statement rolls back |
 
 Notes:
 
@@ -31,6 +34,8 @@ Notes:
   DML. Do this only on purpose.
 - Schema DDL and internal backfill run without the mutation cap. User DML is
   always counted.
+- A `CADB0556` also rolls back a write with `RETURNING`. Use a streaming transport,
+  or page the result. Inside an explicit transaction it aborts the transaction.
 
 ## What counts as a mutation
 
@@ -46,6 +51,9 @@ secondary index entry. An out-of-line large value (`STRING`, `BYTES`/`BLOB`, or
 
 An update that does not change a large value costs nothing extra for that value.
 The counter only rises. Two updates of the same row count twice.
+
+Each row that `INSERT ... ON CONFLICT` inserts or updates counts. A skipped row
+counts nothing, and the locks are not mutations.
 
 Worked examples with the default cap of 20,000:
 
@@ -147,14 +155,18 @@ Alternatives:
 - Compute the total later from the source rows.
 - Refresh a materialized view on a schedule.
 
+For a counter with few writers, an upsert creates the row and adds in one
+statement. Writers of the same new key can still get a retryable conflict. See
+`locking-reads-and-upserts.md`.
+
 Other contention sources:
 
 - A sequence is one logical counter. Every insert that needs a value coordinates
   through it.
 - A parent row that many children reference, and that also changes often. Each
   child write takes a shared lock on the parent key.
-- A wide serializable scan before a write. Its range lock blocks writers into
-  the range.
+- A wide serializable scan or join before a write. Its range lock blocks writers
+  into the range. A Read Committed scan takes no range lock.
 
 ## Priority and the admission gate
 
@@ -214,6 +226,7 @@ To make background work cheaper, use a rate limit, not priority. Examples are
 Docs:
 
 - https://camusdb.github.io/docs/transaction-limits
+- https://camusdb.github.io/docs/settings-reference
 - https://camusdb.github.io/docs/transaction-priority
 - https://camusdb.github.io/docs/best-practices
 - https://camusdb.github.io/docs/row-level-ttl

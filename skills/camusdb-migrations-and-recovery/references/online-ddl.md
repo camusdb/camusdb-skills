@@ -18,8 +18,8 @@ Kommander (Raft) is the source of truth. A DDL statement follows this path:
 3. The leader validates it against the current schema version.
 4. The change is written as a replicated log entry and committed by Raft.
 5. Each node applies the change locally.
-6. The leader waits for live nodes to acknowledge the version before the next
-   stage.
+6. The leader waits for live nodes that hold the database open to acknowledge
+   the version before the next stage.
 
 Versions only increase. A database has a schema version counter. Each table has
 its own version. Each stored row keeps the schema version of its write.
@@ -43,10 +43,56 @@ its own version. Each stored row keeps the schema version of its write.
 - A new index is backfilled before the planner can use it.
 - The backfill coordinator checkpoints progress. A new schema leader resumes
   from the checkpoint after a restart or leader change.
+- Each batch locks its rows, reads them again, writes, and commits. The locks
+  apply under any configured locking mode. A concurrent update is not
+  overwritten, and a concurrent delete is not undone.
+- A batch that loses a lock is retried with no attempt limit. It halves on each
+  loss and doubles on each win. Only a non-retryable error, such as a duplicate
+  key or a cancellation, ends the build.
+- Column fills use batches of 256 rows. Index builds scan 500 rows per batch.
+- During a fill, an `UPDATE` that does not name the new column is accepted. The
+  `NOT NULL` rule applies only to a value a statement assigns, until `Public`.
+- A column fill also fills a `NULL` in a column with a default. No statement can
+  name the column before it is readable, so that `NULL` is not a user's value.
 - Internal DDL and backfill transactions are exempt from
   `max_mutations_per_transaction`. User DML is always counted.
 - A column fill gives each existing row the value an `INSERT` would give it.
   A function default such as `gen_uuid_v7()` runs once per row.
+- Plan for load. One measured 20,000-row index build took 40 s under a bank
+  workload. The workload ran at 52 percent of its throughput during the build.
+- A read through an index checks the fetched row against the entry and skips a
+  stale entry. It counts in `camus.index_read.stale_entries`. A covering read has
+  no row to check, so it trusts the entry.
+
+### The DDL gate
+
+- Each database serializes its schema proposals. Each proposal is short.
+- A staged change holds its table for the whole job: a cluster `CREATE INDEX`,
+  `ADD COLUMN`, a foreign key validation, and a cluster `CHECK` or `SET NOT NULL`
+  validation. The gate is released during the row pass.
+- DDL on another table, `CREATE TABLE` included, runs at once.
+- DDL on the same table waits, then runs.
+- `DROP DATABASE` and a branch create wait for every staged change.
+- On a standalone node, `CREATE INDEX` and `ADD CHECK` or `SET NOT NULL` hold the
+  gate for their full run. Other DDL in that database waits.
+
+### Failure and handover
+
+- A failed `ADD COLUMN` or `ADD CONSTRAINT` leaves no element and no constraint.
+  The same statement can run again.
+- A job is resumed by the first of three triggers: the node becomes schema
+  leader, the database opens on a node that leads, or the leader's sweep finds
+  it. A failed attempt backs off, doubling from 5 s up to 2 minutes.
+- After 8 failed attempts the job is abandoned and logged. The element stays in
+  its current state. Drop it by hand before you create it again.
+- If the schema leader moves, the old leader stops at its next batch. The
+  statement answers from what the new leader did:
+
+  | New leader's result | Statement result |
+  | --- | --- |
+  | Published the element | Success. Do not rerun it. |
+  | Took the element back | Fails with the recorded error. It can run again. |
+  | Still driving after ten minutes | Fails with an error that says so. Check the schema before you rerun. |
 
 ### Convergence and slow nodes
 
@@ -63,11 +109,13 @@ Related settings (YAML, see https://camusdb.github.io/docs/configuration):
 | `schema_ack_wait_timeout_ms` | `30000` | How long a DDL proposer waits for all acks. |
 | `schema_ack_live_node_lease_ms` | `30000` | How long since last contact before a member is presumed down. |
 | `schema_freshness_check_interval_ms` | `10000` | Cluster sweep that reloads a stale in-memory schema. `0` or below disables it. |
+| `coordinator_job_sweep_interval_ms` | `10000` | Leader sweep that resumes interrupted schema jobs. `0` or below disables it. |
 
 ### Transactions and DDL
 
-- A transaction pins the schema versions it uses. A later DDL can make its
-  commit fail. CamusDB does not mix two layouts. Retry from `BEGIN`.
+- A transaction pins the schema versions it uses. A later DDL makes a later
+  statement or the commit fail with the retryable `CADB0502`. The transaction is
+  rolled back. CamusDB does not mix two layouts. Retry from `BEGIN`.
 - `TRUNCATE` is refused inside an explicit transaction (`CADB0538`).
 - `CREATE TABLE ... AS SELECT` commits the table first, then loads rows in the
   caller's transaction. A failed load drops the table again, but an empty
@@ -132,6 +180,9 @@ CREATE INDEX robots_kind_idx ON robots (kind) INCLUDE (name, year);
 ALTER TABLE robots ADD INDEX robots_kind_year_idx (kind, year DESC);
 ALTER TABLE robots ADD UNIQUE INDEX robots_code_year_uq (code, year);
 ALTER TABLE robots DROP INDEX robots_kind_year_idx;
+DROP INDEX robots_kind_idx ON robots;
+DROP INDEX IF EXISTS robots.robots_year_idx;
+CREATE INDEX events_payload_gin ON events USING GIN (payload);
 ALTER TABLE robots RENAME INDEX robots_name_idx TO robots_display_name_idx;
 ```
 
@@ -139,6 +190,13 @@ ALTER TABLE robots RENAME INDEX robots_name_idx TO robots_display_name_idx;
   `FLOAT64`, `FLOAT32`, `BOOL`, `DATE`, `DATETIME`. A descending `STRING` or
   `BYTES` column fails with `InvalidInput`.
 - An `ARRAY(T)` column cannot be indexed.
+- A bare `DROP INDEX name` fails with `InvalidInput`. Use `DROP INDEX name ON t`,
+  `DROP INDEX t.name`, or `ALTER TABLE t DROP INDEX name`.
+- `IF EXISTS` hides a missing table or index only. It does not hide a refusal
+  from a foreign key (`CADB0530`). A no-op changes no schema version.
+- `DROP INDEX` needs the `INDEX` privilege. Its work grows with the entry count.
+- A `JSONB` column takes a GIN index only. It has one column, no `INCLUDE`, and
+  no `DESC`. An ordered index on `JSONB` fails with `InvalidInput`.
 - One index spans at most 32 columns (key plus `INCLUDE`). The `INCLUDE` payload
   is limited to 4 KiB per entry. Settings: `max_index_columns`,
   `max_index_include_tuple_bytes`.
@@ -236,21 +294,30 @@ There is no documented `ALTER COLUMN ... TYPE`. Use expand and contract:
 Create the new index first, verify the plan with `EXPLAIN`, then drop the old
 index. Never drop first on a live table.
 
+### Rebuild a float index after an upgrade
+
+An index built before the current float rules holds old keys for `-0` and `NaN`.
+If the float column holds either value, rebuild the index with `DROP INDEX` and
+`CREATE INDEX`. An index on a column that holds neither needs no rebuild.
+
 ## Error codes for DDL
 
 | Code | Name | Meaning and action |
 | --- | --- | --- |
 | `CADB0011` | `TableDoesntExist` | Table missing. In a cluster CamusDB reloads a stale schema before returning it. |
 | `CADB0013` | `TableAlreadyExists` | Name taken by a table. |
+| `CADB0099` | `InvalidInternalOperation` | A schema proposal timed out or failed. The entry may still commit. Read the schema before you rerun. |
 | `CADB0301` | `NotNullViolation` | `NULL` in a `NOT NULL` column, including `ADD COLUMN ... NOT NULL` without default and `SET NOT NULL` over existing `NULL`s. |
 | `CADB0303` | `CheckConstraintViolation` | A row violates a `CHECK`, including during `ADD CONSTRAINT`. |
-| `CADB0400` | `InvalidInput` | Invalid DDL shape, invalid index rename, invalid CTAS projection, branch precondition failure. |
+| `CADB0400` | `InvalidInput` | Invalid DDL shape, invalid index rename, bare `DROP INDEX name`, invalid CTAS projection, branch precondition failure. |
 | `CADB0403` | `DuplicateColumn` | Column name used twice, or a rename to an existing name. |
 | `CADB0404` | `UnknownColumn` | Column not present or not visible yet. |
 | `CADB0408` | `SchemaLimitExceeded` | Name too long, or too many columns, indexes, or tables. |
 | `CADB0415` | `InvalidForeignKeyDefinition` | Bad foreign-key target. |
 | `CADB0416` | `ForeignKeyCycle` | Foreign keys would form a cycle across tables. |
+| `CADB0502` | `TransactionConflict` | A transaction's pinned schema version changed. Retry from `BEGIN`. |
 | `CADB0503` | `SchemaCatchingUp` | This node lags the schema head. Retry later or elsewhere. |
+| `CADB0504` | `TransactionMustRetry` | The schema leader moved during the proposal. Nothing was committed. Rerun the statement. |
 | `CADB0530` | `DependentObjectsExist` | A view or foreign key depends on the target. |
 | `CADB0534` | `ConcurrentSchemaChange` | The definition changed underneath. Nothing applied. Retry against the current definition. |
 | `CADB0538` | `StatementNotAllowedInTransaction` | `TRUNCATE` inside `BEGIN`. |

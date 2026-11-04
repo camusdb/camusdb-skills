@@ -1,6 +1,6 @@
 # CamusDB type mapping for .NET
 
-Read this file before you bind or read OID, UUID, NUMERIC, DATE, DATETIME, BYTES, or ARRAY values.
+Read this file before you bind or read OID, UUID, NUMERIC, JSONB, FLOAT, DATE, DATETIME, BYTES, or ARRAY values.
 Source docs: https://camusdb.github.io/docs/dotnet-driver#data-types and https://camusdb.github.io/docs/ef-core#type-mapping
 
 ## SQL type to driver type
@@ -19,6 +19,7 @@ Source docs: https://camusdb.github.io/docs/dotnet-driver#data-types and https:/
 | `DATE` | `Date` (8) | `DateOnly`, `DateTime`, `DateTimeOffset`, ISO `string` | `GetFieldValue<DateOnly>`, `GetDateTime` |
 | `DATETIME`, `TIMESTAMP` | `DateTime` (9) | `DateTime`, `DateTimeOffset`, ISO `string` | `GetDateTime`, `GetFieldValue<DateTimeOffset>` |
 | `ARRAY(T)` | `Array` (10) | `IEnumerable` of a scalar type | `object?[]` |
+| `JSONB`, `JSON` | `Jsonb` (13) | `JsonDocument`, `JsonElement`, `JsonNode`, `string` typed `Jsonb` | `GetString`, `GetValue`, `GetFieldValue<JsonElement>` |
 | `NULL` | `Null` (0) | `null`, `DBNull.Value` | `IsDBNull` |
 
 ## Rules per type
@@ -47,6 +48,26 @@ Source docs: https://camusdb.github.io/docs/dotnet-driver#data-types and https:/
 - The server rounds past nine fraction digits. A value out of range fails with `CADB0417`.
 - EF Core `HasPrecision(...)` does not change the column type.
 
+### JSONB
+
+- A `JsonDocument`, `JsonElement`, or `JsonNode` parameter binds as `JSONB` with no `ColumnType` set.
+- A `string` typed `ColumnType.Jsonb` binds its text. A plain `string` binds as `STRING`, which a `jsonb` column parses on write.
+- `GetString` and `GetValue` return the PostgreSQL text form. `GetFieldType` is `string`.
+- `GetFieldValue<T>` parses into `JsonDocument`, `JsonElement`, `JsonNode`, `JsonObject`, or `JsonArray`. The wrong kind throws `InvalidCastException`.
+- `CamusJsonb.Format(json)` gives the PostgreSQL text form of any JSON text.
+- Invalid JSON fails with `CADB0418`. Nesting deeper than 512 levels fails with `CADB0419`.
+- A list of documents fails with `CADB0400`. Bind one JSON array instead.
+- JSON `null` reads as the text `null`. SQL `NULL` reads as `DBNull`.
+- Over REST, the driver sends `jsonbAsText` to keep those two apart. An older server ignores it and gives a top-level JSON `null` as SQL `NULL`.
+- A client before 0.17.0 reads every `jsonb` cell over gRPC as `NULL`, with no error.
+
+### Infinity and NaN
+
+- `Infinity`, `-Infinity`, and `NaN` are `FLOAT64` and `FLOAT32` values on both transports.
+- Since 0.17.2, the driver reads them over REST as float values, and sends non-finite parameters.
+- Any other string in a float cell stays a `String`.
+- A server older than the PostgreSQL float rule cannot return these values over REST, and refuses them as parameters.
+
 ### DATE and DATETIME
 
 - The driver converts to UTC before it sends a value.
@@ -63,7 +84,8 @@ Source docs: https://camusdb.github.io/docs/dotnet-driver#data-types and https:/
 
 - Bind with `Parameters.Add(name, elementType, values, isArray: true)`.
 - Always pass the element type for an empty array or an all-`NULL` array.
-- `ARRAY(NUMERIC)` is not supported.
+- `ARRAY(NUMERIC)` is not supported. An array of `decimal` binds as `ARRAY(FLOAT64)`.
+- `ARRAY(JSONB)` is not supported.
 - Arrays are whole values. They are not indexable.
 - Test membership with `= ANY(@values)` or `= ANY(column)`.
 
@@ -84,6 +106,9 @@ Source docs: https://camusdb.github.io/docs/dotnet-driver#data-types and https:/
 | `DateOnly` | `date` | `DATE` |
 | `DateTime`, `DateTimeOffset` | `datetime` or `timestamp` | `DATETIME` |
 | `long[]`, `string[]`, `double[]`, `bool[]` | `array(int64)`, `array(string)`, `array(float64)`, `array(bool)` | `ARRAY(T)` |
+| `JsonDocument`, `JsonElement`, `JsonNode`, `JsonObject`, `JsonArray` | `jsonb` or `json` | `JSONB` |
+| `string` with `HasColumnType("jsonb")` | `jsonb` or `json` | `JSONB` |
+| `float[]` or `byte[]` with `IsVector(n)` | set by `IsVector` | `BYTES(n x 4)` |
 
 - Key CLR types must be `string`, `Guid`, `short`, `int`, or `long`.
 - Never map a `Guid` with `HasColumnType("id")`.
@@ -93,11 +118,12 @@ Source docs: https://camusdb.github.io/docs/dotnet-driver#data-types and https:/
 
 - Common scalars bind by .NET type.
 - `decimal` binds as `NUMERIC`. A `string` property reads `NUMERIC` with every digit.
-- Use `CamusValue.Id`, `CamusValue.Uuid`, `CamusValue.Numeric`, `CamusValue.Array`, `CamusValue.Vector` for explicit types.
-- `CamusObjectIdValue` binds and reads directly after `CamusDapper.Register()`.
+- Use `CamusValue.Id`, `CamusValue.Uuid`, `CamusValue.Numeric`, `CamusValue.Jsonb`, `CamusValue.Array`, `CamusValue.Vector` for explicit types.
+- `CamusObjectIdValue` binds and reads directly after `CamusDapper.Register()`. So do the `System.Text.Json` document types.
 
 ## HTTP and gRPC wire values
 
 - REST `ColumnValue.type` uses the integer values in the first table.
-- gRPC uses the `Value` oneof: `id_value`, `int64_value`, `string_value`, `bool_value`, `float64_value`, `float32_value`, `bytes_value`, `date_value`, `datetime_value`, `array_value`, `uuid_value`, `null_value`.
+- REST writes a non-finite float as the string `"Infinity"`, `"-Infinity"`, or `"NaN"`.
+- gRPC uses the `Value` oneof: `id_value`, `int64_value`, `string_value`, `bool_value`, `float64_value`, `float32_value`, `bytes_value`, `date_value`, `datetime_value`, `array_value`, `uuid_value`, `numeric_value`, `json_value`, `null_value`.
 - gRPC sends a UUID as 16 big-endian bytes and dates as UTC ticks: `ticks = 621355968000000000 + unix_millis * 10000`.

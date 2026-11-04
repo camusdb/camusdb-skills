@@ -12,8 +12,19 @@ sharding is on, or when a client could route statements better.
   one range and can split.
 - Rows are stored under an internal ObjectId row id, not the primary key. The
   primary key is a unique index mapping keys to row ids.
-- `key_range_sharding` is restart-scoped and cluster-wide. Set
-  `initial_partitions: 2` or more to spread work.
+- A cluster records its routing mode when it is created. A node with
+  `key_range_sharding` unset follows the record. A node set to the other mode
+  refuses to start. To change the mode, dump the data and reimport it into a new
+  cluster.
+- Set `initial_partitions: 2` or more to spread work.
+- A table's first range starts on the partition that hash routing would use. A new
+  index or large-value space starts with the table's other spaces. A table stays on
+  one partition until its first split.
+- Every secondary index can split, whatever its key column types, `String` included.
+  Only an index whose key columns cannot be resolved stays hash-routed.
+- Under key-range sharding, only a Serializable read-write transaction locks its
+  scans. A Serializable read-only transaction, an autocommit `SELECT` and a scan in
+  an explicit Read Committed transaction take no range lock.
 - Automatic splits are off until you set `kahuna.range_split_threshold` or the
   load-branch settings.
 
@@ -110,7 +121,8 @@ physical  table-scan    table=orders
 - `transaction folds reads (optimistic read-set needs one session stream)`
 - `exclusive predicate locks (DML write path)`
 
-`EXPLAIN (ANALYZE)` adds one `gather-span` row per span:
+`EXPLAIN (ANALYZE)` adds one `gather-span` row per span. A broadcast join adds
+`broadcast-span` rows with the same columns:
 
 ```text
 analyze  gather-span  partition 1: mode=local, rows_delivered=25000
@@ -126,6 +138,9 @@ analyze  gather-span  partition 3: mode=remote-fallback, node=10.0.0.3:7070, row
 
 `actual_rows` carries `rows_delivered`. `rows_read` carries
 `remote_rows_scanned`.
+
+A window function runs on the node that runs the statement, over the gathered rows.
+The inner query ships its scans and partial aggregates as any query does.
 
 ### Counters
 
@@ -213,15 +228,20 @@ later executions there. This removes a forwarding hop.
   `routingAcceptVersion: 1`.
 - Server settings: `sql_routing_advice_enabled: true` (default),
   `sql_routing_advice_ttl_ms: 5000` (range 1 to 600000).
-- Eligible: simple single-table `SELECT`, `INSERT`, `UPDATE`, `DELETE` on a
-  hash-routed table.
+- Eligible: simple single-table `SELECT`, `INSERT`, `UPDATE`, `DELETE` on a table
+  whose every key space sits on one partition. Hash routing always meets this.
+- Key-range routing meets it while the row space, every index space and the
+  large-value space are each one range on one partition. The first split ends it.
 - Not eligible: joins, subqueries, derived tables, views, time-travel reads,
-  branches, materialized views, cache-hinted queries, DDL, `SHOW`, and
-  key-range-sharded deployments.
+  branches, materialized views, cache-hinted queries, DDL, `SHOW`, and a key-range
+  table with a divided space.
 - Advice never moves a live transaction. The .NET driver and TypeScript
   connector can defer `BEGIN` to the first statement when learned routing is on.
-- `clear` reasons: `singleTableHash`, `ineligible`, `placementUnknown`,
-  `cacheAffinity`.
+- Under key-range routing, a deferred `BEGIN` pins the session to the partition of
+  the table's one row range. A table with a divided row space gets an unpinned
+  session.
+- `prefer` reasons: `singleTableHash`, `singleRangeTable`.
+- `clear` reasons: `ineligible`, `placementUnknown`, `cacheAffinity`.
 
 Sources: https://camusdb.github.io/docs/distributed-queries,
 https://camusdb.github.io/docs/key-range-sharding,

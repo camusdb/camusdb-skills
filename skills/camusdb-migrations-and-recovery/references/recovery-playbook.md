@@ -73,8 +73,10 @@ table that was dropped and created again (new internal id).
    ```
 
    Repeat until it inserts 0 rows. Size the batch by the mutation cost of the
-   target table. A live source takes range locks until commit, so keep batches
-   small on a busy table. A `GENERATED ALWAYS AS IDENTITY` column refuses
+   target table. A live source holds an exclusive range lock until commit under
+   Serializable, and under key-range sharding at every isolation level. Under
+   optimistic locking, every visited row is a commit dependency. Keep batches
+   small on a busy source. A `GENERATED ALWAYS AS IDENTITY` column refuses
    supplied values unless the insert uses `OVERRIDING SYSTEM VALUE`.
 
 6. For a wrong `UPDATE`, rescue the old values the same way. Then write
@@ -90,8 +92,9 @@ table that was dropped and created again (new internal id).
 
 7. Verify counts and spot-check rows. Ask before dropping `orders_rescue`.
 
-A historical copy is cheap. It takes no range locks and blocks no writer. While
-it runs, the engine pins the revision floor at the requested snapshot.
+A historical copy is cheap. It takes no range locks, registers no commit
+dependency, and blocks no writer. While it runs, the engine pins the revision
+floor at the requested snapshot.
 
 ### Time-travel syntax
 

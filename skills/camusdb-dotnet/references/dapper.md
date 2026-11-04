@@ -19,6 +19,7 @@ await connection.OpenAsync();
 ```
 
 `Register()` adds the type handler for `CamusObjectIdValue`.
+It also adds handlers for `JsonDocument`, `JsonElement`, `JsonNode`, `JsonObject`, and `JsonArray`, which bind and read as `JSONB`.
 
 ## Queries and writes
 
@@ -39,9 +40,11 @@ long count = await connection.ExecuteScalarAsync<long>("SELECT COUNT(*) FROM rob
 | `CamusValue.Id(string?)` / `CamusValue.Id(CamusObjectIdValue?)` | Bind an `OID`. |
 | `CamusValue.Uuid(Guid?)` | Bind a native `UUID`. |
 | `CamusValue.Numeric(decimal?)` / `CamusValue.Numeric(string?)` | Bind `NUMERIC`, including text wider than `decimal`. |
+| `CamusValue.Jsonb(string?)`, or a `JsonDocument`, `JsonElement`, or `JsonNode` argument | Bind `JSONB` from JSON text or a document. |
 | `CamusValue.Array<T>(IEnumerable<T>?)` / `CamusValue.Array<T>(values, ColumnType elementType)` | Bind one native `ARRAY(T)`. Keeps the element type for empty arrays. |
 | `CamusValue.Vector(ReadOnlySpan<float>)` | Pack a vector for a `BYTES` column. |
 
+`new CamusValue(ColumnType.X, value)` binds any column type.
 `DynamicParameters` accepts `CamusValue` too: `parameters.Add("id", CamusValue.Id(robotId));`.
 
 ## Arrays
@@ -82,3 +85,10 @@ catch
 ```
 
 Wrap the whole block in `SerializableRetryHelper.ExecuteAutocommitAsync(...)` or your own loop. Replay from `BEGIN` on `CADB0502`, `CADB0504`, `CADB0505`.
+A failed statement aborts the transaction. Do not catch it inside the block and run more statements.
+
+## Limits
+
+- Dapper reads through `ExecuteReaderAsync`, which buffers the whole result.
+- For a very large result, use `CamusCommand.ExecuteStreamReaderAsync` and `reader.GetRowParser<T>()`.
+- `commandType: CommandType.StoredProcedure` sends `CALL name(@a, @b, ...)` in property order.

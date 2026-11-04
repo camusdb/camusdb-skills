@@ -1,6 +1,6 @@
 ---
 name: camusdb-vector-search
-description: Builds embedding and nearest-neighbour (KNN) search on CamusDB. Covers storing float32 vectors in BYTES columns with STORAGE PLAIN and CHECK (vector_dims(...) = N), packing vectors in .NET (CamusVector.ToBytes, ColumnType.Bytes) and TypeScript (camus.vector, Float32Array, CamusVector.toFloats), and ranking with l2_distance, cosine_distance and inner_product in ORDER BY ... LIMIT k queries. Use when a user mentions embeddings, semantic search, RAG retrieval, similarity search, pgvector or HNSW habits, vector_dims, octet_length, topk in EXPLAIN, or errors CADB0410, CADB0411, CADB0412 or CADB0302 on a vector column.
+description: Builds embedding and nearest-neighbour (KNN) search on CamusDB. Covers storing float32 vectors in BYTES columns with STORAGE PLAIN and CHECK (vector_dims(...) = N), packing vectors in .NET (CamusVector.ToBytes, ColumnType.Bytes), EF Core (IsVector, float[] properties, loadWithEntity, EF.Functions.L2Distance, CosineDistance, InnerProduct, VectorDims), Dapper (CamusValue.Vector) and TypeScript (camus.vector, Float32Array, CamusVector.toFloats), and ranking with l2_distance, cosine_distance and inner_product in ORDER BY ... LIMIT k queries. Use when a user mentions embeddings, semantic search, RAG retrieval, similarity search, pgvector or HNSW habits, vector_dims, octet_length, topk in EXPLAIN, or errors CADB0410, CADB0411, CADB0412 or CADB0302 on a vector column.
 ---
 
 # CamusDB vector search
@@ -24,7 +24,7 @@ Follow these steps in order.
 5. Pick one metric. Use the same metric the model was trained for.
 6. Encode vectors in the client as packed little-endian float32. Read
    [references/client-encoding.md](references/client-encoding.md) for .NET,
-   TypeScript, REST, gRPC and SQL hex.
+   EF Core, Dapper, TypeScript, REST, gRPC and SQL hex.
 7. Send the query vector as a bind parameter, never as a literal.
 8. Write `ORDER BY <metric>(col, @q) [DESC] LIMIT k`. Add a selective `WHERE`.
 9. Run `EXPLAIN` and confirm a `topk` node, not a `sort` node.
@@ -87,6 +87,28 @@ ALTER TABLE docs REWRITE STORAGE;
 
 `SET STORAGE` changes future writes only. `REWRITE STORAGE` converts existing
 rows in batches. It is resumable and idempotent.
+
+## EF Core
+
+`IsVector(dimensions)` sets the column type, `STORAGE PLAIN` and the dimension
+`CHECK` in one call. It needs `CamusDB.EntityFrameworkCore` 0.16.10 or later. The
+property can be `float[]` or `byte[]`:
+
+```csharp
+modelBuilder.Entity<DocumentChunk>(b =>
+{
+    b.Property(c => c.Embedding).IsRequired().IsVector(768, loadWithEntity: false);
+});
+
+var hits = await ctx.Chunks
+    .Where(c => c.TenantId == tenantId)
+    .OrderBy(c => EF.Functions.L2Distance(c.Embedding, question))
+    .Take(10)
+    .ToListAsync();
+```
+
+Read [references/client-encoding.md](references/client-encoding.md) for the helpers
+and for `loadWithEntity: false`.
 
 ## Distance functions
 
@@ -160,7 +182,8 @@ EXPLAIN SELECT id FROM docs ORDER BY l2_distance(embedding, @q) LIMIT 10;
 ```
 
 Look for a `topk` row with detail `k: 10, l2_distance(…) ASC`. A `topk` holds at
-most `offset + limit` rows and never spills.
+most `offset + limit` rows. With spill on, it moves to disk only when those rows
+pass `spill_threshold_bytes`.
 
 A `sort` row means the bound did not apply. CamusDB keeps the full sort when:
 
@@ -180,11 +203,13 @@ A `sort` row means the bound did not apply. CamusDB keeps the full sort when:
 2. Narrow candidates with an indexed `WHERE`, such as `tenant_id = @tenant`.
    The filter runs before the rank.
 3. Use `STORAGE PLAIN` on the embedding column.
-4. Do not project the embedding. Return ids and small columns.
+4. Do not project the embedding. Return ids and small columns. A buffered response
+   over `max_buffered_result_bytes` (256 MiB) fails with `CADB0556`.
 5. Expect linear cost in rows × dimensions. About 1.2 s per million rows at
    768 dimensions on an Apple M3.
 6. The value of `k` barely matters. `LIMIT 10` and `LIMIT 100` cost the same.
-7. Send the vector as a parameter. The statement text then stays constant.
+7. Send the vector as a parameter. The statement text then stays constant, and a
+   repeat skips the parse. The plan cache is off by default, so expect no shared plan.
 
 ## Errors
 
@@ -198,6 +223,7 @@ A `sort` row means the bound did not apply. CamusDB keeps the full sort when:
 | Value longer than `BYTES(N)` | `CADB0302` ValueTooLong |
 | Wrong dimension under the `CHECK` | `CADB0303` CheckConstraintViolation |
 | A non-`BYTES` argument to a vector function | `CADB0400` InvalidInput |
+| Buffered response over `max_buffered_result_rows` or `max_buffered_result_bytes` | `CADB0556` ResultSetTooLarge |
 
 CamusDB checks `NaN` and infinity when a vector function reads the value, not at
 write time. Validate embeddings in the client before the insert.
@@ -222,6 +248,7 @@ LIMIT 10;
 
 - No approximate index: no HNSW, no IVF, no quantization.
 - No vector index type. An ordinary index cannot serve a distance sort.
+- A GIN index does not help. It needs a `jsonb` column.
 - No native vector type. The dimension lives only in the `CHECK`.
 - No distributed top-k.
 
@@ -233,6 +260,10 @@ LIMIT 10;
   `cosine_distance` or `inner_product`.
 - Creating an HNSW or IVFFlat index, or setting a probes or `ef_search`
   parameter. None exists. Narrow with `WHERE` instead.
+- Creating a GIN index on the embedding. CamusDB refuses it on a non-`jsonb` column.
+- Declaring an EF Core embedding without `IsVector`. You then lose `STORAGE PLAIN`,
+  the dimension `CHECK` and the `float[]` conversion.
+- Ordering `EF.Functions.InnerProduct` with `OrderBy`. Use `OrderByDescending`.
 - Sorting `inner_product` `ASC`. pgvector's `<#>` returns the negative inner
   product. CamusDB returns the plain dot product. Sort `DESC`.
 - Storing the vector as `ARRAY(FLOAT32)` as in Spanner. Distance functions
@@ -254,7 +285,7 @@ LIMIT 10;
 ## References
 
 - [references/client-encoding.md](references/client-encoding.md): read when
-  writing client code in .NET, TypeScript, REST, gRPC, or SQL text.
+  writing client code in .NET, EF Core, Dapper, TypeScript, REST, gRPC, or SQL text.
 - [references/storage-and-cost.md](references/storage-and-cost.md): read when
   sizing a table, choosing a storage strategy, or predicting latency.
 - Public docs:
@@ -264,5 +295,7 @@ LIMIT 10;
   - https://camusdb.github.io/docs/storage-layout
   - https://camusdb.github.io/docs/check-constraints
   - https://camusdb.github.io/docs/dotnet-driver
+  - https://camusdb.github.io/docs/ef-core
+  - https://camusdb.github.io/docs/dapper
   - https://camusdb.github.io/docs/typescript-connector
   - https://camusdb.github.io/docs/explain

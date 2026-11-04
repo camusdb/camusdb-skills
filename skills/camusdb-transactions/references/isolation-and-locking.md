@@ -8,6 +8,7 @@ you explain why a transaction conflicted.
 - Guarantees
 - Isolation levels
 - Read-only and read-write modes
+- Reads at a statement snapshot
 - Locking strategy combinations
 - Lock types
 - Conflict resolution
@@ -24,30 +25,39 @@ CamusDB gives these guarantees at all times:
 - CamusDB detects write-write conflicts. It never merges two writes in silence.
 - Execution is serializable by default.
 - A write across partitions is atomic, through two-phase commit.
+- A failed statement aborts its explicit transaction. See `retry-patterns.md`.
 
 ## Isolation levels
 
 | Level | Reads | Protects against |
 | --- | --- | --- |
 | `SERIALIZABLE` | Snapshot, or locking scans in read-write mode | Read skew, phantoms, write skew, lost updates |
-| `READ COMMITTED` | Committed MVCC versions, skipping write intents | Dirty reads and write-write conflicts only |
+| `READ COMMITTED` | Pessimistic: one statement snapshot per `SELECT`, plus the transaction's own writes. Optimistic or read validation: the latest committed version of each key. | Dirty reads and write-write conflicts only |
 
 Read Committed keeps these properties:
 
-- A read returns committed versions only.
+- A read returns committed versions and the transaction's own writes only.
 - A write still uses locks, write intents, and atomic commit.
-- A reader blocks no reader and no writer.
+- A read takes no lock, so it blocks no writer. A scan takes no range lock in any
+  routing mode.
+- In a pessimistic transaction, one `SELECT` never sees half of another commit.
+  The locate scan of an `UPDATE` or `DELETE`, and the source of an `INSERT ...
+  SELECT`, also read one statement snapshot.
+- The write phase reads the latest value. It locks each located row, reads it
+  again, and checks `WHERE` again. Uniqueness and foreign-key checks also read
+  the latest value.
 
 Read Committed gives up these properties:
 
-- One snapshot shared by every sub-read of a query.
+- One snapshot across statements. The next statement gets a new snapshot.
 - Repeatable reads across statements.
 - Phantom protection on a range scan.
 - Write-skew protection.
 
-Under pessimistic Read Committed, a point read can record the row revision when
-the same transaction later writes that key. This is not a general
-repeatable-read guarantee.
+A `SELECT` does not pin what it read. A later statement is never refused because
+a key it read earlier changed. Nothing guards a value that you read in one
+statement and write in a later one. That pattern needs Serializable, `SELECT ...
+FOR UPDATE`, or a single `UPDATE ... SET v = f(v)`.
 
 ## Read-only and read-write modes
 
@@ -67,18 +77,47 @@ SELECT SUM(total) FROM orders WHERE status = 'open';
 COMMIT;
 ```
 
+## Reads at a statement snapshot
+
+These reads use a timestamp from the node's clock, taken when the statement
+starts: a pessimistic Read Committed statement, and an autocommit `SELECT` under
+either default level. An autocommit `SELECT` takes no lock and makes no Kahuna
+round trip, in every routing mode. Such a read has two costs:
+
+- **It can wait for a commit in progress.** It does not wait for a transaction that
+  is still open. It waits only for one that started its commit. The limit is about
+  5 s for a scan page and about 16 s for a point read. The statement then fails
+  with a retryable error. CamusDB does not resend a read after 15 s of attempts.
+- **It can miss a commit from another node.** A commit made at a later clock time
+  stays invisible, even when it finished first. Pass the causal token of your last
+  commit:
+
+| Transport | Commit returns | Pass it to |
+| --- | --- | --- |
+| HTTP | `causalToken` in `/commit-transaction` and in autocommit responses | `causalToken` on `/start-transaction` or `/execute-sql-query` |
+| gRPC | `causal_token_*` in `CommitReply` | `causal_token_*` on `StartTxnRequest`, a batch `START`, or an autocommit `SqlRequest` |
+
+The server does not read the token on `TxnHandle`, or on a statement inside an
+explicit transaction. Give the transaction its floor at the start.
+
 ## Locking strategy combinations
 
 | Combination | Behavior |
 | --- | --- |
 | `SERIALIZABLE` + pessimistic | Default. CamusDB takes the locks first. |
 | `SERIALIZABLE` + optimistic | Hybrid. Writes validate at commit. Reads and scans still take shared locks, so phantoms stay excluded. |
-| `READ COMMITTED` + pessimistic | Writes lock. Reads see the latest committed version. |
-| `READ COMMITTED` + optimistic | No locks at all. CamusDB validates observed rows only. No phantom protection. |
+| `READ COMMITTED` + pessimistic | Writes lock. Each `SELECT` reads one statement snapshot. |
+| `READ COMMITTED` + optimistic | No locks at all. Reads see the latest committed value. CamusDB validates observed rows only. No phantom protection. |
 
 An optimistic transaction aborts at commit in two cases. Another transaction
 wrote a key that this transaction wrote. Or a row that this transaction read
 changed. The application then replays from `BEGIN`.
+
+An optimistic transaction records a dependency on every key that a read touched.
+This includes rows that a scan visited and `WHERE` then rejected. A committed write
+to any column of such a row invalidates it. So an optimistic bulk scan of a busy
+table does not commit while the writers run, at either isolation level. For that
+read, use `AS OF SYSTEM TIME` or pessimistic locking.
 
 Choose optimistic when conflicts are rare and you want fewer lock waits. Keep
 pessimistic when the same keys are contended. Under contention, an optimistic
@@ -89,8 +128,9 @@ transaction does all its work and then aborts at commit.
 | Lock | Taken by | Effect |
 | --- | --- | --- |
 | Exclusive key lock plus write intent | Every write, for each modified row and index key | Detects write-write and unique-index conflicts |
-| Shared point lock | A serializable read-write point read, such as a lookup by unique key | A writer to that key waits, retries, or aborts. Promoted to write protection if the same transaction writes the key. |
-| Shared range lock | A serializable read-write scan | Overlapping scans still run together. A write into the range waits or retries. |
+| Exclusive row lock | `SELECT ... FOR UPDATE`, at every isolation level, on each returned row | Another transaction cannot update, delete, or lock the row. A plain `SELECT` is not blocked. |
+| Shared point lock | A serializable read-write read of a row or index entry by key: a primary-key read, a row fetched through a secondary index, a unique join probe, and the inner lookup of a semi-join or `EXISTS` | A writer to that key waits, retries, or aborts. A key read as absent is locked too. Promoted to write protection if the same transaction writes the key. |
+| Shared range lock | A serializable read-write scan, including join leaves, the inner scan of `IN (SELECT ...)` and `EXISTS`, and a non-unique index probe in a join | Overlapping scans still run together. A write into the range waits or retries. A join leaf filter that no index serves locks the whole table. |
 | Bucket lock (escalated) | Many point read locks in one table or index bucket | Bounded bookkeeping. Protects more rows than were read. |
 | Foreign-key parent lock | A child write | A shared lock on each distinct parent key until the transaction ends |
 
@@ -106,7 +146,12 @@ time. The lifetime cap is.
 - A transaction that holds no lock and staged no write can safely wait for a
   short in-flight writer.
 - One lock wait is capped by `lock_wait_deadline_ms` (default `500`). Past that,
-  CamusDB reports a conflict.
+  CamusDB reports a retryable error, `CADB0502` or `CADB0504`.
+- A key that is still replicating or settling is not a lock conflict. It waits up
+  to `replication_wait_deadline_ms` (default `5000`), then fails with `CADB0504`.
+  The message names the budget that ran out.
+- A commit that the coordinator refuses (`CADB0502`) names the refusal class, the
+  reason, the staged mutation count, and the finalize time.
 - A `CADB0502` message includes bounded context: the table or database, a small
   sample of contended keys, and the waiting transaction mode when available.
   Use it to find the hot key.
@@ -124,8 +169,10 @@ Ways to reduce conflicts:
 A transaction pins the schema version of each table it touches. At commit,
 CamusDB checks that each table still exists and that the pinned version is
 still compatible. A transaction that writes a table which gained an index or a
-constraint aborts and must be replayed. CamusDB never commits a write that mixes
-two layouts.
+constraint aborts and must be replayed. So does one whose table changed its row
+layout after the statement was planned, at the commit or at the next statement on
+that table. Both give `CADB0502`. CamusDB never commits a write that mixes two
+layouts.
 
 ## Where to set each option
 
@@ -153,7 +200,9 @@ range_lock_expires_ms: 150000
 max_serializable_transaction_lifetime_ms: 3600000
 lock_escalation_threshold: 50
 lock_wait_deadline_ms: 500
-key_range_sharding: false
+replication_wait_deadline_ms: 5000
+max_open_explicit_transactions: 10000
+key_range_sharding: false                    # fixed when the cluster is created
 ```
 
 - `max_serializable_transaction_lifetime_ms` at `0` or below disables the
@@ -163,7 +212,7 @@ key_range_sharding: false
 
 Docs:
 
-- https://camusdb.github.io/docs/serializable-transactions
+- https://camusdb.github.io/docs/serializable-transactions#read-committed-snapshots-and-limits
 - https://camusdb.github.io/docs/sql-transactions
 - https://camusdb.github.io/docs/transactions-locking-internals
 - https://camusdb.github.io/docs/http-api

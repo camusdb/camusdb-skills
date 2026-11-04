@@ -44,7 +44,7 @@ Extra connection-string keys shown in the docs:
 | `User`, `Password` | Credentials. A flag overrides the same key. |
 | `MaxAutoPrepare` | Number of auto-prepared statements kept. `0` turns auto-prepare off. |
 | `AutoPrepareMinUsages` | Executions before a statement is prepared. |
-| `BackupEndpoint` | HTTP endpoint for `backup` commands. Needed with `Protocol=grpc` or a node pool. |
+| `BackupEndpoint` | HTTP endpoint for `backup` commands. Needed when `-c` sets `Protocol=grpc`. With a node pool, point `backup coordinated` at the coordinator. |
 | `BackupTimeout` | Backup request timeout in seconds. Default `300`. |
 
 ## Options

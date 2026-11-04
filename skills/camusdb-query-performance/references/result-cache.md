@@ -8,7 +8,7 @@ enabled by default and does nothing until a query opts in with a hint.
 
 Add a hint only when all of these hold:
 
-- The query reads one table. No join.
+- The query reads one table. No join and no set operation.
 - It runs in autocommit mode, not inside `BEGIN ... COMMIT`.
 - It repeats often with the same parameter values.
 - Its data changes much less often than it is read.
@@ -102,7 +102,19 @@ Bypass reasons:
 `family=<name>, eligible=<true|false>[, reason=<join|cache-disabled>], ttl=<n>ms|default, strict=<bool>`.
 It does not probe the cache.
 
-## Settings (config.yml only)
+## Settings
+
+Set these in `config.yml`. Every key except `query_result_cache_enabled` can also
+change on a running node with `SET CLUSTER SETTING`. Changing
+`query_result_cache_enabled` needs a restart.
+
+- `query_result_cache_default_ttl_ms` governs entries published after the change.
+  An existing entry keeps its expiry.
+- `query_result_cache_max_entries` and `query_result_cache_max_bytes` trim resident
+  entries to the new cap at once, least recently used first.
+- `query_result_cache_sweep_interval_ms` re-arms the sweep timer at the new interval.
+- The per-entry caps, dependency caps, single-flight wait and strict-validation
+  budget apply from the next query.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
@@ -135,6 +147,8 @@ stored.
 ## Common mistakes
 
 - Hinting a join. It always bypasses (`reason=join`).
+- Expecting a set operation result in the cache. `UNION`, `INTERSECT` and `EXCEPT`
+  results are never stored.
 - Hinting inside an explicit transaction, including `READ ONLY`. It reads live
   storage.
 - Expecting another node's write to evict this node's entry. Use a short `ttl`

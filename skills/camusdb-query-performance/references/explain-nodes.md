@@ -10,12 +10,26 @@ EXPLAIN SELECT ...              -- physical plan, no rows read
 EXPLAIN (PHYSICAL) SELECT ...   -- identical to plain EXPLAIN
 EXPLAIN (LOGICAL) SELECT ...    -- same tree, stage column = 'logical'
 EXPLAIN (ANALYZE) SELECT ...    -- executes and drains the query, adds counters
+EXPLAIN SELECT ... UNION SELECT ...          -- a set operation
+EXPLAIN SELECT ... FOR UPDATE [NOWAIT | SKIP LOCKED]   -- a locking read, in every form
 ```
 
 - Only these three option words exist. Any other word is an error.
-- `EXPLAIN` accepts a `SELECT` statement only.
+- `EXPLAIN` accepts a `SELECT` statement only. A set operation and `FOR UPDATE`
+  count as a `SELECT`. `UPDATE`, `DELETE` and `INSERT` do not.
 - An uncorrelated subquery executes once during planning, even for plain
   `EXPLAIN`.
+- The join planner can read a small filtered dimension table during planning, even
+  for plain `EXPLAIN`. See the plan-time lookup in
+  [planner-rules.md](planner-rules.md).
+- Plain `EXPLAIN ... FOR UPDATE` takes no lock. It needs `SELECT` and `UPDATE` on
+  the table. It also works in a read-only or optimistic transaction.
+- `EXPLAIN (ANALYZE) ... FOR UPDATE` runs the statement and takes real row locks.
+  They stay until the transaction ends. Every check of the statement applies, and
+  `NOWAIT` can fail it with `CADB0555`. In autocommit it runs in a writable
+  transaction.
+- `EXPLAIN` without `ANALYZE` adds no count to `SHOW INDEX USAGE`.
+  `EXPLAIN (ANALYZE)` adds counts.
 - A `SELECT` without `FROM` renders `constant-source`, `project`, and `limit`
   when present. `EXPLAIN (ANALYZE)` rejects it.
 
@@ -40,6 +54,7 @@ Plain `EXPLAIN`:
 | `actual_time_ms` | Total wall-clock time of the whole plan. Root row only; `NULL` elsewhere. |
 | `kv_lookups` | Point lookups on a unique index. |
 | `kv_scan_entries` | KV entries visited by a table scan or index range scan. |
+| `estimate_trace` | JSON: how the row estimate was made. The formula, the rule (such as `equality-heavy`, `like-prefix`, `join-skew-pair`), input rows, and each factor with the statistics it read. `NULL` when the node has no estimate. |
 
 On a scan, `actual_rows <= rows_read`. The gap is rows rejected by the filter
 folded into the scan.
@@ -53,15 +68,17 @@ from the last row upward to follow data flow.
 
 | Node | Appears for | Detail |
 | --- | --- | --- |
-| `table-scan` | Full table scan, or a forced index | `table=<name>`; forced adds `, forced-index=<name>` |
+| `table-scan` | Full table scan, or an end-to-end scan of a forced index | `table=<name>`; forced adds `, forced-index=<name>` |
 | `index-lookup` | Equality on a unique index (`~pk` or `UNIQUE`) | `index=<name>, key=<value>`; covered adds `, index-only=true` |
 | `index-range-scan` | Range predicate, `BETWEEN`, equality on a non-unique index, or an ordered index read | `index=<name>, from>=<v>, to<<v>`; covered adds `index-only=true` |
 | `index-in-list` | `col IN (v1, v2, ...)` on an indexed column | `index=<name>, values=<n>` (distinct values probed) |
+| `gin-scan` | A JSONB predicate served by a GIN index. A `filter` above it checks each candidate | `index=<name>, groups=<n>, entries=<m>` |
 | `filter` | Residual predicate not served by the index | `<expr>` |
 | `aggregate` | `GROUP BY` or an aggregate function | `group=[...], aggs=[...]` |
 | `having-filter` | `HAVING` | `<expr>` |
 | `sort` | `ORDER BY` not satisfied by scan order, no usable bound | `<col> ASC/DESC, ...` |
-| `topk` | `ORDER BY` bounded by `LIMIT`; keeps `offset + limit` rows; never spills | `k: <n>, <col> ASC/DESC, ...` |
+| `topk` | `ORDER BY` bounded by `LIMIT`; keeps `offset + limit` rows. With spill on, it moves to disk only when those rows pass the byte cap | `k: <n>, <col> ASC/DESC, ...` |
+| `lock_rows` | `SELECT ... FOR UPDATE`. Below `limit`, above the sort. Locks each candidate, rereads it, rechecks `WHERE` | `for update`, `for update, nowait` or `for update, skip locked` |
 | `limit` | `LIMIT` / `OFFSET` | `<n>` or `<n> offset <m>` |
 | `project` | Final projection | none |
 | `distinct` | `SELECT DISTINCT` | `streaming: true` or `hash` |
@@ -73,17 +90,31 @@ from the last row upward to follow data flow.
 | `hash-join` | Equi-join with an in-memory hash table | `on=<left>=<right>, build=<alias>` |
 | `merge-join` | Equi-join over ordered inputs | `on=<l>=<r>, right-order=forced-index=<name>` or `right-order=sort` |
 | `derived-table-scan` | Subquery in `FROM` | `alias=<alias>` |
+| `window` | Window functions, one entry per distinct `(PARTITION BY, ORDER BY)` | `partition=[...] order=[...] functions=[...]` |
+| `function-scan` | Set-returning function in `FROM`, such as `generate_series`. No table access. Constant arguments give an exact `estimated_rows` | `<function>(<args>), alias=<alias>, column=<column>` |
+| `union` | `UNION [ALL]` | `all`, or `distinct: hash` |
+| `intersect`, `except` | `INTERSECT [ALL]`, `EXCEPT [ALL]` | `hash`, or `all, hash` |
+| `operand` | One operand of the set operation above it. The rows after it are that operand's plan | `left` or `right` |
 | `constant-source` | `SELECT` without `FROM` | `1 row` |
 | `gather` | Distributed scan split by span | `spans: <n>, remote_leader_fraction: <f>` |
 
 Range bound rendering: numeric types show a half-open range
-(`from>=2023, to<2024`). `STRING` and `OID` equality shows
-`from>=v, to<=v`. Both return the same rows.
+(`from>=2023, to<2024`). An equality with no computable next value shows
+`from>=v, to<=v`. That covers `STRING`, `OID`, `DATE`, `DATETIME`, `FLOAT32` and
+`BYTES` columns, a value at its type's maximum, and a descending column. Both forms
+return the same rows.
+
+On a set-operation row, `, spill` follows `hash` when spill is enabled. It means the
+hash table can move to disk, not that it did. `estimated_rows` on that row is the
+default derived-table estimate. The planner does not estimate the size of a set
+operation.
+
+A FROM-less operand of a set operation shows a one-row
+`function-scan(*single_row*(), ...)`.
 
 ### Extra detail suffixes on join rows
 
-These suffixes are emitted by the engine renderer (`PlanRenderer.cs`). The
-EXPLAIN doc mentions only some of them.
+The engine renderer (`PlanRenderer.cs`) emits these suffixes.
 
 | Suffix | Meaning |
 | --- | --- |
@@ -99,8 +130,36 @@ EXPLAIN doc mentions only some of them.
 | --- | --- |
 | `ran=grace-hash` | Hash join spilled and ran as a Grace hash join |
 | `ran=nested-loop-fallback` | Hash build exceeded its limit (`HashJoinMaxBuildRows`, default 1,000,000) with spill off |
-| `ran=broadcast` | Distributed hash join broadcast the build side |
-| `join-order-est-rows=<n>` | Row estimate from the join-order search |
+| `ran=nested-loop-rescan` | Nested-loop join reread its right side for every left row |
+| `ran=broadcast` | Distributed hash join broadcast the build side. One `broadcast-span` row follows per span |
+| `probe-memo-hits=<n>` | Index nested-loop join answered `n` probes from its memo. Shown only above zero |
+| `probe-batches=<n>` | Index nested-loop join probed in `n` pages of outer rows. Shown only above zero |
+| `join-order-est-rows=<n>` | Row estimate from the join-order search. Shown only when the search costed the order |
+| `partitions=<n> rows=<n> spilled=<n>` | On `window`: partitions computed, rows they held, partition buffers moved to disk |
+
+### The lock step under EXPLAIN (ANALYZE)
+
+The `lock_rows` detail adds three counters. They print also when they are zero.
+
+| Counter | Meaning |
+| --- | --- |
+| `locked=<n>` | Row locks the step got, including rows that `recheck-dropped` counts |
+| `skipped-held=<n>` | Rows that `SKIP LOCKED` left out because another transaction held them |
+| `recheck-dropped=<n>` | Rows locked and not returned: a concurrent commit deleted them or moved them out of `WHERE` |
+
+`actual_rows` of the step is `locked - recheck-dropped`. A dropped row stays locked
+until the transaction ends.
+
+### `plan-info` suffixes under EXPLAIN (ANALYZE)
+
+| Suffix | Meaning |
+| --- | --- |
+| `planning-ms=<ms>` | Time of the bind and plan stages, including subqueries folded during bind |
+| `join-order=cost-based` | The cost-based search chose the order |
+| `join-order=greedy` | The search passed its step budget. A greedy order was built instead |
+| `join-order=heuristic` | The search is off, statistics are not loaded, the join has more than 30 tables, or no order avoids a cross product |
+| `join-order=cached` | A plan-cache hit replayed an earlier order |
+| `join-steps-costed=<n>` | Join steps the search costed. Same count per run for the same query and statistics, so compare it between versions |
 
 ## Informational rows
 
@@ -112,6 +171,7 @@ They follow the operator rows. Their estimate columns are `NULL`.
 | `cache` | Query has a `{cache=...}` hint | `family=<name>, eligible=<bool>[, reason=<why>], ttl=<n>ms\|default, strict=<bool>` |
 | `distribution` | Distributed execution enabled | `distributed=yes` or `distributed=no (<reason>)` |
 | `gather-span` | `EXPLAIN (ANALYZE)` of a distributed scan | `partition <n>: mode=local\|remote\|remote-fallback, ...` |
+| `broadcast-span` | `EXPLAIN (ANALYZE)` of a broadcast join | Same columns as `gather-span` |
 
 `cache` reasons: `join` (joins are never cached) and `cache-disabled`. The row
 is static. It does not probe the cache. The runtime `cacheStatus` in the
@@ -122,10 +182,22 @@ response is authoritative.
 - A join row shows only its left input as the next row. The right input has no
   row of its own.
 - The join row's storage counters describe the work on its right side.
-- `nested-loop-join` counts every reread: 4 left rows × 7 right rows = 28
-  `rows_read`.
-- `index-nested-loop-join` counts probes. Unique probes add `kv_lookups`.
-  Non-unique walks add `kv_scan_entries`.
+- `nested-loop-join` reads a base-table right side once and keeps its rows, so
+  `rows_read` is the right rows one time. It reads nothing when the left side is
+  empty.
+- `nested-loop-join` rereads the right side for each left row in two cases: the
+  right-side filter calls a volatile function, or spill is off and the right side
+  exceeds `HashJoinMaxBuildRows`. Then `rows_read` is left rows × right rows, and the
+  detail shows `ran=nested-loop-rescan`.
+- `index-nested-loop-join` probes a page of outer rows at a time. The distinct keys
+  of a page cost one batched index read and one batched row read.
+- Unique probes add one `kv_lookups` per distinct non-NULL key. Non-unique probes add
+  one `kv_scan_entries` per index entry. A probe stops at its key, so it visits no
+  entry past the key.
+- A repeated key is answered from the join's memo and adds nothing to the counters.
+  `rows_read` counts the right rows fetched, before the right-side filter.
+- A `function-scan` reads nothing from storage. Its `actual_rows` counts generated
+  rows.
 - `hash-join` counts one read of the right side.
 - `merge-join` adds the reads of its ordered right input.
 - The root of a join plan is the last join. Grouping, sorting, final filters,
@@ -152,12 +224,18 @@ The filter is evaluated inside the scan loop:
 `estimated_rows` and `estimated_cost` come from `CostEstimator.AnnotatePlan`.
 Inputs: row count, min/max per column, histograms and distinct counts after
 `ANALYZE`. Without statistics, estimates use fixed defaults. Use
-`SHOW STATISTICS FOR <table>` to see the inputs.
+`SHOW STATISTICS FOR <table>` to see the inputs. Read `estimate_trace` to see which
+rule produced the number.
+
+The join-order search has its own estimate. `join-order-est-rows` shows it next to
+`estimated_rows` and `actual_rows`, so you can see which was closer. The plan
+annotation estimates one row per outer row for an `index-nested-loop-join`.
 
 Cost weights: KV point lookups, range entries and primary-row fetches cost 1.0
 each. In-memory rows cost 0.1 each. `NetworkFactor` is added under key-range
 sharding and is `0` on one node. A non-covering index scan pays twice per match
-(entry + row fetch), so a range scan loses to a full scan near half the table.
+(entry + row fetch). The planner replaces a predicate range scan with a full scan
+when estimated entries reach the 40 % breakeven.
 
 ## Diagnostic patterns
 
@@ -170,6 +248,11 @@ sharding and is `0` on one node. A non-covering index scan pays twice per match
 | `index-range-scan` without `index-only=true` | Query needs columns outside the index | `INCLUDE` the missing columns |
 | `distinct hash` | Columns not `NOT NULL`, or not in index order | Index the distinct columns, make them `NOT NULL` |
 | `nested-loop-join` | No equality key or no right-side index | Add an equality `ON` and index the right join key |
+| `ran=nested-loop-rescan` | Volatile right-side filter, or a large right side with spill off | Remove the volatile call, enable spill, or index the right join key |
+| `index-nested-loop-join`, high `rows_read`, few `probe-memo-hits` | Each key fans out to many right rows | Filter the right side |
+| `join-order=greedy` or `heuristic` in `plan-info` | The search was over budget, off, or had no statistics | `ANALYZE` the tables, or reduce the joined tables |
+| `window` with `spilled` above 0 | A partition passed the spill threshold | Narrow the `WHERE` |
+| `filter` above `gin-scan`, high `rows_read` | The GIN candidates are a superset of the matches | Expected. Add a more selective JSONB conjunct |
 | `ran=grace-hash` | Hash build side larger than its limit | Filter the build side, or index for a nested-loop or merge join |
 | Estimates off by orders of magnitude | Missing or stale statistics | `ANALYZE TABLE` |
 
@@ -206,6 +289,28 @@ Bounded sort:
 
 ```text
 physical  topk  k: 10, l2_distance(…) ASC
+```
+
+Set operation:
+
+```text
+union        distinct: hash
+operand      left
+project
+filter       x > 1
+table-scan   table=a
+operand      right
+project
+table-scan   table=b
+```
+
+Locking read under `EXPLAIN (ANALYZE)`, with rows 2 and 3 held by another
+transaction:
+
+```text
+node       detail                                                                actual_rows
+limit      3                                                                     3
+lock_rows  for update, skip locked, locked=3, skipped-held=2, recheck-dropped=0  3
 ```
 
 `EXPLAIN (ANALYZE)` of an indexed join:

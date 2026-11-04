@@ -6,6 +6,8 @@ it without a test.
 
 Sources: https://camusdb.github.io/docs/sql-schema,
 https://camusdb.github.io/docs/sql-indexes,
+https://camusdb.github.io/docs/json,
+https://camusdb.github.io/docs/sql-writes,
 https://camusdb.github.io/docs/check-constraints,
 https://camusdb.github.io/docs/foreign-keys,
 https://camusdb.github.io/docs/sequences,
@@ -63,6 +65,7 @@ Inline constraints inside the parentheses:
 PRIMARY KEY (col [, ...])
 KEY index_name (col [ASC|DESC] [, ...]) [INCLUDE (col [, ...])] [COMMENT 'text']
 UNIQUE KEY index_name (col [, ...]) [INCLUDE (col [, ...])] [COMMENT 'text']
+INVERTED INDEX index_name (jsonb_col) [COMMENT 'text']
 CONSTRAINT name CHECK (predicate)
 CHECK (predicate)
 [CONSTRAINT name] FOREIGN KEY (col [, ...]) REFERENCES parent [(col [, ...])]
@@ -135,8 +138,8 @@ rejected.
 | `EXTERNAL` | Never | At or above 2048 bytes | Images, archives, incompressible blobs |
 | `PLAIN` | Never | Never | Values every query reads, such as embeddings |
 
-- Only `STRING`, `BYTES`/`BLOB`, and `ARRAY` columns take a strategy. Others
-  fail with `CADB0414 ColumnStorageNotApplicable`.
+- Only `STRING`, `BYTES`/`BLOB`, `JSONB`, and `ARRAY` columns take a strategy.
+  Others fail with `CADB0414 ColumnStorageNotApplicable`.
 - Compression (LZ4) is tried at 256 bytes and kept at 12 percent saving.
 - Compression runs before the out-of-line decision.
 
@@ -157,11 +160,23 @@ CREATE [UNIQUE] INDEX name ON table (col [ASC|DESC] [, ...]) [INCLUDE (col [, ..
 
 ALTER TABLE t ADD INDEX name (col [ASC|DESC] [, ...]) [INCLUDE (...)];
 ALTER TABLE t ADD UNIQUE INDEX name (col [, ...]) [INCLUDE (...)];
-ALTER TABLE t DROP INDEX name;
 ALTER TABLE t RENAME INDEX old_name TO new_name;
 COMMENT ON INDEX t.name IS 'text';
+
+DROP INDEX [IF EXISTS] name ON t;
+DROP INDEX [IF EXISTS] t.name;
+ALTER TABLE t DROP INDEX [IF EXISTS] name;
 ```
 
+- The three `DROP INDEX` forms are one statement with the same rules.
+- A bare `DROP INDEX name` fails with `InvalidInput`. Index names are unique per
+  table, not per database. `DROP INDEX db.t.name` also fails.
+- A quoted table name that contains a dot cannot use `DROP INDEX t.name`. Use
+  `DROP INDEX name ON t`.
+- `IF EXISTS` hides a missing table or index only. A foreign key that needs the
+  index still fails with `DependentObjectsExist` (`CADB0530`).
+- `DROP INDEX` cannot reach the primary key. Use `ALTER TABLE t DROP PRIMARY KEY`.
+- `DROP INDEX` needs the `INDEX` privilege on the table.
 - `ASC` is the default direction.
 - `DESC` works on `OID`, `UUID`, `INT64`, `FLOAT64`, `FLOAT32`, `BOOL`, `DATE`,
   and `DATETIME`. `DESC` on `STRING` or `BYTES` fails with `InvalidInput`.
@@ -175,6 +190,72 @@ COMMENT ON INDEX t.name IS 'text';
 - Renaming to an existing name, or renaming a missing index, fails with
   `InvalidInput`.
 - `SHOW INDEXES FROM t` lists the indexes, including owned `~fk_` indexes.
+- `SHOW INDEX USAGE FROM t` shows the reads and writes of each index. An index
+  is a candidate to drop when `reads` and `constraint_reads` are 0 over a long
+  window, and `writes` is not 0.
+
+### GIN indexes
+
+A GIN index maps each part of a `JSONB` document to the rows that hold it.
+
+```sql
+CREATE INDEX events_payload_gin ON events USING GIN (payload);
+CREATE INDEX events_payload_gin ON events USING GIN (payload jsonb_path_ops);
+CREATE INVERTED INDEX events_payload_gin ON events (payload);
+
+CREATE TABLE events (
+  id INT64 PRIMARY KEY,
+  payload JSONB,
+  INVERTED INDEX events_payload_gin (payload)
+);
+```
+
+- A GIN index has exactly one column, and that column must be `JSONB`. It has no
+  `INCLUDE` and no `DESC`. Other shapes fail with `InvalidInput`.
+- `jsonb_ops` and `jsonb_path_ops` build the same index.
+- `SHOW INDEXES` shows `Index_type` `GIN`. `SHOW CREATE TABLE` shows the inline
+  `INVERTED INDEX` form.
+- `CREATE INDEX` over an existing table backfills while writes continue.
+
+The planner uses a GIN index for a top-level `WHERE` conjunct when the other
+operand is a constant:
+
+| Conjunct | Notes |
+| --- | --- |
+| `col @> doc`, `doc <@ col` | Containment |
+| `col ? key`, `col ?\| keys`, `col ?& keys` | Key or string element |
+| `col ->> 'k' = text` | Not when `text` starts with `{` or `[` |
+| `col -> 'k' = doc` | Same as `col @> {"k": doc}` |
+
+The index is not used for a conjunct under `OR` or `NOT`, `col <@ doc`,
+`col @> '{}'`, `col @> '[]'`, `col @> <scalar>`, or a join.
+
+Costs:
+
+- An `INSERT` writes one entry for each distinct leaf of the document. Each
+  entry counts against the mutation limit. Over the limit, the statement fails
+  with `CADB0506`. The index never leaves entries out.
+- An `UPDATE` writes only the entries that changed. A `NULL` document has none.
+- Under Serializable, a GIN scan takes a range lock over each entry range it
+  reads. A key that every document holds gives a large range, which blocks more
+  writers.
+
+### Unique indexes as conflict arbiters
+
+`INSERT ... ON CONFLICT` and `UPSERT` depend on unique indexes:
+
+- `ON CONFLICT (a, b)` needs a unique index on exactly the columns `{a, b}`. The
+  order does not matter. No match fails with `InvalidInput`.
+- `ON CONFLICT ON CONSTRAINT name` names a unique index. The primary key answers
+  to `<table>_pkey`.
+- `UPSERT` uses the primary key.
+- A `NULL` in the arbiter key never conflicts. The row is always inserted.
+- A duplicate on a unique index that is not an arbiter still fails with
+  `DuplicateUniqueKeyValue`.
+- A unique index still being built cannot be the arbiter.
+
+Add the unique index that the upsert needs. MySQL `ON DUPLICATE KEY UPDATE` and
+`MERGE` are not supported.
 
 ## ALTER TABLE: columns
 
@@ -182,6 +263,7 @@ COMMENT ON INDEX t.name IS 'text';
 ALTER TABLE t ADD COLUMN c STRING NULL;
 ALTER TABLE t ADD COLUMN c STRING NULL COMMENT 'Operator notes';
 ALTER TABLE t ADD COLUMN c INT64 NOT NULL DEFAULT (0);
+ALTER TABLE t ADD COLUMN doc JSONB NULL;
 ALTER TABLE t DROP COLUMN c;
 ALTER TABLE t RENAME COLUMN old_name TO new_name;
 ALTER TABLE t ALTER COLUMN c SET NOT NULL;
@@ -239,6 +321,10 @@ a malformed literal regex pattern.
 
 A check whose result is `NULL` passes. Combine it with `NOT NULL`.
 
+A comparison between types with no rule, such as a `STRING` column and a number,
+rejects the row at write time with `CADB0303`. Write a `CAST`. See
+[data-types.md](data-types.md#comparing-different-types).
+
 ## Foreign keys
 
 | Form | Result |
@@ -258,6 +344,7 @@ A check whose result is `NULL` passes. Combine it with `NOT NULL`.
 - The referenced columns must be exactly the parent primary key columns, or
   exactly the columns of a public unique index. Order can differ.
 - Paired columns must have the same type. `STRING(N)` lengths can differ.
+- A `JSONB` column cannot be part of a foreign key.
 - Omit the parent column list to reference the parent primary key.
 - Creating a foreign key needs `SELECT` on the parent. There is no
   `REFERENCES` privilege.
@@ -363,6 +450,7 @@ them again with `ALTER TABLE ... ADD CONSTRAINT`.
 SHOW CREATE TABLE orders;
 SHOW CREATE TABLE orders WITHOUT INDEXES;
 SHOW INDEXES FROM orders;
+SHOW INDEX USAGE FROM orders;
 SHOW RANGES FROM TABLE orders;
 SHOW RANGES FROM INDEX orders@orders_customer_idx;
 ```

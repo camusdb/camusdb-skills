@@ -1,7 +1,10 @@
 # CamusDB scalar function catalog
 
 Read this file before you call a function in CamusDB SQL. If a function is not
-listed here, the docs do not describe it. Do not use it.
+listed here or in the files below, the docs do not describe it. Do not use it.
+
+- `jsonb_*` functions and operators: [jsonb.md](jsonb.md).
+- Window functions and `generate_series`: [set-and-window.md](set-and-window.md).
 
 Source pages: https://camusdb.github.io/docs/functions and each
 `functions-*` page linked from it.
@@ -12,13 +15,18 @@ Source pages: https://camusdb.github.io/docs/functions and each
 - A function works anywhere a value works: projection, `WHERE`, `GROUP BY`,
   `HAVING`, `DEFAULT`, `CHECK`.
 - Most functions return `NULL` when an argument is `NULL`. Exceptions are noted.
-- CamusDB checks the argument count and types at execution, not at parse.
-- Volatile functions: `gen_id()`, `gen_uuid_v4()`, `gen_uuid_v7()`,
-  `current_timestamp()`, `now()`, `current_date()`, `unix_timestamp()`,
-  `random()`. Also `gen_random_bytes(n)`. Do not use them in a predicate that
-  must be stable across a scan.
+- CamusDB checks the argument count and types at execution, not at parse. It
+  checks the result types of `CASE`, `COALESCE`, `IFNULL`, and `IF` at bind.
+- Volatile functions fall into three groups:
+  - Per call: `gen_id()`, `gen_uuid_v4()`, `gen_uuid_v7()`, `random()`,
+    `gen_random_bytes(n)`, `clock_timestamp()`, `sysdate()`. Do not use them in a
+    predicate that must be stable across a scan.
+  - Per statement: `statement_timestamp()`.
+  - Per transaction: `now()`, `current_timestamp()`, `transaction_timestamp()`,
+    `current_date()`, `unix_timestamp()`, `unix_timestamp_ms()`.
 - A column `DEFAULT` may call a no-argument generator such as `gen_id()`,
-  `gen_uuid_v7()`, or `now()`. It runs once per inserted row.
+  `gen_uuid_v7()`, or `now()`. A per-call generator runs once per inserted row.
+  `DEFAULT now()` gives every row of one `INSERT` the same time.
 - Session functions are not allowed in `DEFAULT` or `CHECK`.
 - Bad input fails with `CADB0400` `InvalidInput` unless noted.
 
@@ -28,12 +36,39 @@ Source pages: https://camusdb.github.io/docs/functions and each
 | --- | --- |
 | `COUNT(*)` | Counts every row. |
 | `COUNT(col)` | Counts non-null values. |
-| `SUM(col)` | Sum. `INT64` in, `INT64` out; `NUMERIC` in, `NUMERIC` out; `FLOAT64` in, `FLOAT64` out. |
+| `SUM(col)` | Sum. `INT64` in, `INT64` out; `NUMERIC` in, `NUMERIC` out; `FLOAT64` in, `FLOAT64` out. An `INT64` total past the range fails with `CADB0420`. A float total past the range fails with `CADB0421`. |
 | `AVG(col)` | `NUMERIC` for `NUMERIC` input, else `FLOAT64`. |
 | `MIN(col)`, `MAX(col)` | Smallest or largest non-null value. |
 
 `COUNT(DISTINCT col)` is not supported. An empty input makes `SUM` return
-`NULL`; wrap it as `COALESCE(SUM(x), 0)`.
+`NULL`; wrap it as `COALESCE(SUM(x), 0)`. `jsonb_agg` and `jsonb_object_agg` are in
+[jsonb.md](jsonb.md). Add `OVER (...)` for the window form; see
+[set-and-window.md](set-and-window.md).
+
+## Comparison rule
+
+Two values compare only when their types have a rule:
+
+- Two values of the same type.
+- Two numbers. `INT64` with `NUMERIC` compares exactly. A float compares as a double.
+- A `DATE` with a `DATETIME`. The date reads as midnight UTC.
+- A `STRING` with a `DATE` or `DATETIME`. The string is parsed. A bad string fails
+  with `CADB0400`. A `DATE` takes only `yyyy-MM-dd`.
+- A `STRING` with a `UUID`, `OID`, or `JSONB`. The string is parsed. A bad string
+  equals no value, with no error.
+- Two arrays with the same element type, or one that is `ARRAY[]` or all `NULL`.
+
+Every other pair fails with `CADB0400`: `5 = '5'`, `0.0 = '0.0'`, `bool_col = 1`,
+`bytes_col = 'a'`, `NUMERIC '1' = '1'`, `ARRAY[1] = ARRAY[1.0]`. Write a `CAST`.
+
+- The rule covers `=`, `<>`, `<`, `<=`, `>`, `>=`, `BETWEEN`, `IN`, `NOT IN`, simple
+  `CASE`, `NULLIF`, `= ANY`, `array_contains`, `JOIN ... ON`, and `HAVING`.
+- A `CHECK` that compares such a pair rejects the row with `CADB0303`.
+- `x IN (a, b)` evaluates both items, so `1 IN (1, 'a')` fails.
+- A simple `CASE` stops at the first match, so `CASE 5 WHEN 5 THEN 1 WHEN 'a' THEN 2 END`
+  returns 1.
+- A `NULL` operand gives UNKNOWN before any type check: `NULL = 'a'` is `NULL`.
+- The check runs when values compare. A predicate over an empty table raises nothing.
 
 ## Session
 
@@ -61,7 +96,36 @@ A query with a session function bypasses the result cache.
 | `position(part IN x)` | `INT64` | Same as `strpos(x, part)`. `x` cannot start with `(`. |
 | `contains(x, part)` | `BOOL` | Ordinal substring test. Both arguments must have the same type. |
 | `starts_with(x, prefix)`, `ends_with(x, suffix)` | `BOOL` | Ordinal prefix or suffix test. |
-| `concat(value, ...)` | `STRING` | Joins `STRING`, `OID`, `UUID`, `INT64`, `FLOAT64`, `BOOL`. Skips `NULL`; `NULL` only if all are `NULL`. |
+| `concat(value, ...)` | `STRING` | Joins scalars by their text form. Skips `NULL`; `NULL` only if all are `NULL`. An array fails. |
+
+`a || b` also joins text, but a `NULL` operand gives `NULL`. See "Operators" below.
+
+The text form of a value is the same in `CAST(x AS string)`, `to_string`, `concat`,
+and `||`: a date is `2026-03-15`, bytes are `\xdeadbeef`, and a float is the shortest
+text that reads back as the same value. A `datetime` has seven fractional digits.
+
+## Operators
+
+| Operator | Operands | Meaning |
+| --- | --- | --- |
+| `a \|\| b` | two strings, two bytes, or a string with a scalar | Concatenation. A `NULL` operand gives `NULL`. `1 \|\| 2` and an array operand fail. |
+| `a & b`, `a \| b`, `a # b` | two `INT64`, or two `BYTES` of equal length | AND, OR, XOR. |
+| `~a` | `INT64` or `BYTES` | Bitwise NOT. After an operand, `~` is the regex match. |
+| `a << n`, `a >> n` | two `INT64` | Shifts. The count is modulo 64. `>>` keeps the sign. |
+| `-a` | a number | Negation. The smallest `INT64` fails with `CADB0420`. |
+
+- `^` is not an operator. Use `#` for XOR and `power()` for a power.
+- A float, `NUMERIC`, `BOOL`, or `STRING` operand of a bitwise operator fails.
+- `||` and the bitwise operators share one level, below `+` and `-`. So
+  `6 | 1 & 3` is `(6 | 1) & 3`, and `1 << 1 + 1` is `1 << 2`.
+- Prefix `~` binds as tightly as unary minus: `~a + 1` is `(~a) + 1`. PostgreSQL
+  reads it as `~(a + 1)`. Add parentheses.
+
+```sql
+SELECT first_name || ' ' || last_name FROM users;
+SELECT 'n=' || 5, X'01' || X'02';
+SELECT id FROM items WHERE flags & 4 = 4;
+```
 
 ## Math
 
@@ -69,43 +133,111 @@ Arguments are `INT64`, `FLOAT64`, or `NUMERIC`.
 
 | Function | Returns | Meaning |
 | --- | --- | --- |
-| `abs(v)` | same type | Absolute value. Fails on the minimum `INT64`. |
+| `abs(v)` | same type | Absolute value. Fails on the minimum `INT64` with `CADB0420`. |
 | `ceil(v)` / `ceiling(v)` | same type | Round up. |
 | `floor(v)` | same type | Round down. |
 | `round(v)` | same type | Nearest integer, half away from zero. |
 | `round(v, scale)` | `FLOAT64` or `NUMERIC` | Round to `scale` places. Negative scale rounds left of the point. |
 | `trunc(v [, scale])` | same / `FLOAT64` or `NUMERIC` | Truncate toward zero. |
 | `sqrt(v)` | `FLOAT64` | Square root. Negative input fails. |
-| `pow(b, e)` / `power(b, e)` | `FLOAT64` | Power. |
+| `pow(b, e)` / `power(b, e)` | `FLOAT64` | Power. Overflow or underflow fails with `CADB0421`. `pow(0, y)` for a negative `y` and a negative `b` with a non-integer `e` fail with `CADB0400`. |
 | `mod(a, b)` and `a % b` | `INT64`, `NUMERIC`, or `FLOAT64` | Remainder with the dividend's sign. Zero divisor fails. |
-| `sign(v)` | `INT64` | `-1`, `0`, or `1`. |
+| `sign(v)` | `INT64` | `-1`, `0`, or `1`. `sign(NaN)` fails. |
 | `random()` | `FLOAT64` | Volatile, in `[0.0, 1.0)`. |
+
+`INT64` arithmetic never wraps: a result past the range fails with `CADB0420`.
+Float arithmetic that overflows or underflows from finite values fails with
+`CADB0421`. `x / 0` fails with `CADB0400`. See "Float values" below.
+
+## Float values
+
+- `'Infinity'`, `'-Infinity'`, and `'NaN'` are values. Write them as text in a float
+  column, with `CAST`, or as a parameter. `inf` also works. Text is case-insensitive.
+- An operation on them gives the IEEE result: `CAST('Infinity' AS float64) + 1` is
+  `Infinity`.
+- The order is `-Infinity` < numbers < `Infinity` < `NaN`. `NaN = NaN` is true.
+  `-0` equals `0`. `MAX(v)` is `NaN` when a row holds it.
+- `CAST` of an infinity or `NaN` to `INT64` fails with `CADB0420`. To `NUMERIC`, it
+  fails with `CADB0400`.
+- A subnormal result is a value, not an underflow.
+- A value past the `FLOAT32` range, or one that rounds to zero, fails on a narrowing
+  write or cast.
 
 ## Date and time
 
 Inputs: a `DATE`, a `DATETIME`, `'YYYY-MM-DD'`, or a timestamp string with `Z`
 or an offset. A local timestamp string without an offset is rejected.
-Units: `year`, `month`, `day`, `hour`, `minute`, `second`, `millisecond`, and
-plurals such as `days`.
 
 | Function | Returns | Meaning |
 | --- | --- | --- |
-| `current_timestamp()` / `now()` | `DATETIME` | Current instant, UTC. |
-| `current_date()` | `DATE` | Current date, UTC. |
+| `now()`, `current_timestamp()`, `transaction_timestamp()` | `DATETIME` | Start of the transaction, UTC. Write the parentheses. |
+| `current_date()` | `DATE` | UTC date of the start of the transaction. |
+| `statement_timestamp()` | `DATETIME` | Start of the statement, UTC. |
+| `clock_timestamp()`, `sysdate()` | `DATETIME` | The clock at each call, UTC. |
 | `date_add(value, amount, unit)` | `DATETIME` | Add an `INT64` amount. A `DATE` becomes a `DATETIME`. |
-| `date_diff(start, end, unit)` | `INT64` | Whole units from `start` to `end`. |
+| `date_diff(start, end, unit)` | `INT64` | Whole units from `start` to `end`, truncated toward zero. |
 | `date_part(unit, value)` | `INT64` | UTC component. |
+| `EXTRACT(unit FROM value)` | `INT64` | SQL-standard form of `date_part`. The unit may be a bare word. |
 | `date_trunc(unit, value)` | `DATETIME` | Start of the unit, UTC. |
-| `unix_timestamp()` | `INT64` | Current Unix seconds. |
-| `unix_timestamp(value)` | `INT64` | Unix seconds of a date or time. |
-| `from_unixtime(seconds)` | `DATETIME` | Datetime from Unix seconds. |
+| `unix_timestamp([value])` | `INT64` | Unix seconds. With no argument, of the start of the transaction. |
+| `unix_timestamp_ms([value])` | `INT64` | Unix milliseconds, rounded down. With no argument, of the start of the transaction. |
+| `from_unixtime(seconds)` | `DATETIME` | Datetime from Unix seconds. A fraction rounds to the microsecond. |
 | `to_timestamp(seconds)` | `DATETIME` | PostgreSQL spelling of `from_unixtime`. |
+| `make_date(year, month, day)` | `DATE` | Integer parts. An invalid part fails. |
+| `make_timestamp(year, month, day, hour, minute, second)` | `DATETIME` | UTC. `second` may have a fraction. |
+| `makedate(year, day_of_year)` | `DATE` | MySQL. Day 1 is January 1. Past the year's end, it moves to the next year. |
+| `last_day(value)` | `DATE` | Last day of the UTC month. |
+| `year`, `month`, `day`, `dayofmonth`, `hour`, `minute`, `second`, `quarter`, `dayofyear` `(value)` | `INT64` | Same as `date_part`. |
+| `dayofweek(value)` | `INT64` | 1 = Sunday to 7 = Saturday. |
+| `weekday(value)` | `INT64` | 0 = Monday to 6 = Sunday. |
+| `week(value [, mode])` | `INT64` | Mode 0 (default): weeks start on Sunday, 0-53. Mode 3: ISO week, 1-53. Other modes fail. |
+| `dayname(value)`, `monthname(value)` | `STRING` | English names. |
+
+`now()` has one value for every row and statement of a transaction. A retry is a new
+transaction, so it gets a new `now()`. With `AS OF SYSTEM TIME`, `now()` is still the
+start of the transaction. A query that calls a clock function skips the query result
+cache. `WHERE col > now()` can use an index on `col`.
+
+`make_date`, `make_timestamp`, `makedate`, and `last_day` are deterministic. The year
+must be 1-9999. A `NULL` argument gives `NULL`.
+
+`DATE(x)` is not a function. Write `CAST(x AS date)`.
 
 ```sql
 SELECT date_add('2024-06-15', 1, 'day');            -- 2024-06-16T00:00:00Z
 SELECT date_diff('2024-06-01', '2024-06-11', 'days'); -- 10
 SELECT date_trunc('month', happened_at) FROM events;
+SELECT EXTRACT(week FROM created), dayofweek(created) FROM events;
+SELECT make_date(2024, 2, 29), last_day('2024-02-10');
 ```
+
+### Date units
+
+Every unit reads the UTC value. Plurals such as `days` work. The unit is a string,
+or a bare word in `EXTRACT`. A unit with no meaning in a function fails.
+
+| Unit | `date_part` / `EXTRACT` | `date_trunc` | `date_add` / `date_diff` |
+| --- | --- | --- | --- |
+| `year` | calendar year | January 1 | years |
+| `quarter` | 1-4 | first day of the quarter | 3 months |
+| `month` | 1-12 | first day of the month | months |
+| `week` | ISO week, 1-53 | Monday 00:00 | 7 days |
+| `day` | 1-31 | 00:00 | days |
+| `hour`, `minute`, `second` | 0-23, 0-59, 0-59 | start of the unit | the unit |
+| `millisecond` | fraction of the second, 0-999 | yes | yes |
+| `microsecond`, `us` | fraction of the second, 0-999999 | yes | yes |
+| `dow` | 0 = Sunday to 6 = Saturday | no | no |
+| `isodow` | 1 = Monday to 7 = Sunday | no | no |
+| `doy` | day of the year, 1-366 | no | no |
+| `isoyear` | ISO year of the ISO week | no | no |
+| `epoch` | whole seconds since 1970-01-01 UTC | no | no |
+| `decade` | year / 10 | January 1 of a year ending in 0 | 10 years |
+| `century` | 2000 is century 20, 2001 is century 21 | January 1 of a year ending in 01 | 100 years |
+| `millennium` | 2000 is millennium 2, 2001 is millennium 3 | January 1 of a year ending in 001 | 1000 years |
+
+A part is always `INT64`. PostgreSQL returns `numeric`, so two units differ: `epoch`
+is whole seconds, and `millisecond` and `microsecond` are the fraction of the current
+second only.
 
 ## Date patterns
 
@@ -121,8 +253,9 @@ Rules: all values are UTC. Names are English only. The functions are
 deterministic, so `CHECK`, `DEFAULT`, and view bodies can use them. Years run
 1–9999. Fractions have six digits. A parse is strict: the whole text must
 match, the pattern needs a year, and redundant fields (day name, quarter, week)
-must agree with the date. CamusDB does not compare `DATE` with `DATETIME`; cast
-the result of `str_to_date` to `DATE`, or use `to_date(text, pattern)`.
+must agree with the date. A comparison of a `DATE` with a `DATETIME` reads the date
+as midnight UTC. To get a `DATE`, cast the result of `str_to_date`, or use
+`to_date(text, pattern)`.
 
 PostgreSQL tokens (case-sensitive):
 
@@ -179,8 +312,8 @@ SELECT * FROM events WHERE day = CAST(str_to_date('June 17, 2024', '%M %e, %Y') 
 
 | Function | Returns | Meaning |
 | --- | --- | --- |
-| `to_string(v)` | `STRING` | From string, OID, UUID, INT64, FLOAT64, NUMERIC, BOOL. |
-| `to_int64(v)` | `INT64` | Float truncates toward zero; NUMERIC rounds half away from zero; bool → 1/0. |
+| `to_string(v)` | `STRING` | From any scalar, by its text form. An array fails. |
+| `to_int64(v)` | `INT64` | Same as `CAST(v AS int64)`. A float or NUMERIC rounds half away from zero; bool → 1/0. |
 | `to_float64(v)` | `FLOAT64` | From numbers, bool, numeric text. |
 | `to_float32(v)` | `FLOAT32` | From numbers or numeric text. |
 | `to_bool(v)` | `BOOL` | From bool, or `true`/`false` text in any case. |
@@ -192,7 +325,19 @@ SELECT * FROM events WHERE day = CAST(str_to_date('June 17, 2024', '%M %e, %Y') 
 `CAST` targets: `string`/`char`/`varchar`/`text`, `int`/`int64`/`integer`/`smallint`,
 `numeric`/`decimal`, `float`/`float64`/`double`, `float32`/`real`,
 `bool`/`boolean`, `oid`/`id`/`object_id`, `uuid`/`guid`, `date`,
-`datetime`/`timestamp`, `bytes`/`blob`. `x::type` accepts the same names.
+`datetime`/`timestamp`, `bytes`/`blob`, `jsonb`/`json`. `x::type` accepts the same
+names.
+
+### Cast to INT64
+
+`CAST(x AS int64)`, `x::int64`, and `to_int64(x)` use one rule. A number with a
+fraction rounds half away from zero: `2.5` gives `3`, and `-2.5` gives `-3`.
+
+- PostgreSQL rounds a float half to even, so its result for `2.5` is `2`.
+- A string must spell an integer. `CAST('2.5' AS int64)` fails with `CADB0400`.
+- `NaN`, an infinity, and a result past the range fail with `CADB0420`.
+- There is no implicit conversion. An `INT64` column, an integer function argument,
+  a subscript, a bitwise operator, and a `LIMIT` or `OFFSET` parameter refuse a float.
 
 ## Null handling
 
@@ -201,9 +346,39 @@ SELECT * FROM events WHERE day = CAST(str_to_date('June 17, 2024', '%M %e, %Y') 
 | `coalesce(v, ...)` | First non-null argument. |
 | `ifnull(v, fallback)` | Two-argument `coalesce`. |
 | `nvl(v, fallback)` | Alias of `ifnull`. |
+| `nullif(v, other)` | `NULL` when `v = other` is true, else `v`. The result has the type of `v`. |
+| `if(cond, a, b)` | `a` when `cond` is `TRUE`; `b` when it is `FALSE` or `NULL`. |
 
-Numeric arguments widen (`FLOAT64` > `FLOAT32` > `INT64`; `NUMERIC` with a
-float gives `FLOAT64`). Mixing `STRING` with a non-string fails.
+```sql
+SELECT id, total / NULLIF(cnt, 0) AS ratio FROM counts;
+SELECT IF(quantity > 0, 'in stock', 'sold out') AS availability FROM inventory;
+```
+
+`IF` is the same as `CASE WHEN cond THEN a ELSE b END`. It evaluates only the selected
+result, so `IF(true, 1, 1 / 0)` returns `1`. A non-boolean condition fails. `COALESCE`
+and `IFNULL` evaluate every argument. `NULLIF` follows the `=` type rule.
+
+### Result types
+
+`CASE`, `COALESCE`, `IFNULL`, `NVL`, and `IF` return one type. Every value converts
+to it. A bad pair fails with `CADB0400`, also in a branch that never runs.
+
+| Inputs | Result type |
+| --- | --- |
+| A `NULL` input, or an omitted `ELSE` | The type of the other inputs. |
+| One type | That type. |
+| Two numbers | The type `+` gives: `INT64` with `FLOAT64` is `FLOAT64`; `INT64` with `NUMERIC` is `NUMERIC`. |
+| `DATE` with `DATETIME` | `DATETIME`. The date becomes its midnight. |
+| A quoted string literal with `DATE` or `DATETIME` | That temporal type. The literal is parsed at bind. |
+| Two arrays | An array, when the element types agree or one is `ARRAY[]`. |
+| Any other pair | `CADB0400`. |
+
+- `COALESCE(1, 'a')` and `CASE WHEN c THEN 1 ELSE '2' END` fail. A quoted literal does
+  not become a number. Write `CAST('2' AS INT64)`.
+- `COALESCE(date_col, '2026-01-01')` is a `DATE`. Only a literal converts: a `STRING`
+  column with a `DATE` column fails.
+- A parameter or a function call is checked when its value is returned. A branch that
+  does not run is not checked then.
 
 ## Object id and UUID
 
@@ -215,6 +390,9 @@ float gives `FLOAT64`). Mixing `STRING` with a non-string fails.
 | `gen_uuid_v7()` | `UUID` | Time-ordered UUID. Volatile. |
 
 ## JSON (text in a STRING)
+
+These functions read JSON text. For a `jsonb` column, read [jsonb.md](jsonb.md). A
+`jsonb` argument here is read as its text.
 
 | Function | Returns | Meaning |
 | --- | --- | --- |
@@ -290,7 +468,7 @@ Hash a number with a cast first: `md5(x::text)`. These are not password hashes.
 | --- | --- | --- |
 | `cardinality(a)` | `INT64` | Element count; empty array gives `0`. |
 | `array_length(a, 1)` | `INT64` | Empty array gives `NULL`; any other dimension gives `NULL`. |
-| `array_contains(a, v)` | `BOOL` | Membership with `IN` null semantics. |
+| `array_contains(a, v)` | `BOOL` | Membership with `IN` null semantics. A value with no comparison rule fails with `CADB0400`. |
 
 ## Sequence
 

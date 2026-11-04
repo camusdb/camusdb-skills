@@ -1,6 +1,6 @@
 ---
 name: camusdb-local-dev
-description: Sets up CamusDB for local development and testing, and drives its developer tools. Covers installing CamusDB.Server (dotnet tool, camusdb, camusdb init, ~/.camusdb/config.yml), the camusdb/camusdb Docker image, the 3-node docker compose cluster (docker/local.yml), ports 5095/5096/7070/7141, camus-cli (-c, -e, -f, --format json, --tui, use, source), the Web Console, the operator dashboard, the browser playground, config.yml keys (data_dir, memory_profile, key_range_sharding), SHOW VARIABLES, SET CLUSTER SETTING, authentication (CAMUSDB_AUTH_ENABLED, CREATE USER, GRANT, bearer tokens, CADB0516, CADB0517, CADB0519), the CamusDB MCP server (CAMUS_MCP_ENDPOINT, .mcp.json) for Claude Code, Codex, or Cursor, load tests with camus-cli workload or CamusDB.Workload, and per-PR databases with CREATE DATABASE ... BRANCH FROM. Use it when a developer installs, starts, configures, connects to, secures, or load-tests a local CamusDB node or cluster.
+description: Sets up CamusDB for local development and testing, and drives its developer tools. Covers CamusDB.Server (dotnet tool, camusdb, camusdb init, ~/.camusdb/config.yml), the camusdb/camusdb Docker image, the compose cluster (docker/local.yml), growing a one-node cluster, ports 5095/5096/7070/7141, --grpc-port, camus-cli (-c, -e, -f, --format json, --tui), the Web Console, operator dashboard, browser playground, config.yml keys (data_dir, memory_profile, key_range_sharding, kahuna.storage, Solarium, max_statement_bytes), SHOW VARIABLES, SET CLUSTER SETTING, authentication (CAMUSDB_AUTH_ENABLED, CREATE USER, raft_mutual_tls_enabled, CADB0516, CADB0517, CADB0518, CADB0519), the MCP server (CAMUS_MCP_ENDPOINT, .mcp.json), load tests with camus-cli workload or CamusDB.Workload, per-PR databases with CREATE DATABASE ... BRANCH FROM, Testcontainers, .NET Aspire, and the Kubernetes Operator. Use it when a developer installs, starts, configures, connects to, secures, or load-tests a local CamusDB node or cluster.
 ---
 
 # CamusDB local development
@@ -41,7 +41,11 @@ Follow these steps in order. Skip the optional ones the user does not need.
 | Daily development, one node | `dotnet tool install --global CamusDB.Server`, then `camusdb` |
 | One node without .NET installed | Docker image `camusdb/camusdb:latest` |
 | Raft, failover, multi-node behavior | `docker compose -f docker/local.yml up --build` in the engine repo |
+| Grow from one node to three | Start in cluster mode (see `references/local-cluster.md`) |
 | Fault injection and chaos evidence | Caraxes (see `references/local-cluster.md`) |
+| A database per .NET test, from test code | Testcontainers (see "Other ways to run CamusDB") |
+| CamusDB beside your services in an AppHost | .NET Aspire (see "Other ways to run CamusDB") |
+| A self-managed cluster on Kubernetes | Kubernetes Operator (see "Other ways to run CamusDB") |
 
 ## Install and start a node
 
@@ -55,6 +59,7 @@ camusdb
 - With no configuration file, `camusdb` uses built-in defaults.
 - It serves the HTTP (REST) API on port `5095` and gRPC on port `5096`.
 - Update with `dotnet tool update --global CamusDB.Server`.
+- `camusdb --version` prints only the version line, so a script can read it.
 
 Write a user-owned starter configuration, then edit it and restart:
 
@@ -76,12 +81,24 @@ docker run --rm \
   --name camusdb camusdb/camusdb:latest
 ```
 
+## Other ways to run CamusDB
+
+- Testcontainers: `CamusDB.Testcontainers` starts a standalone server in Docker from test code.
+  `CamusDB.Testcontainers.Xunit` and `CamusDB.Testcontainers.XunitV3` add fixtures. Host ports are
+  random, so read addresses after `StartAsync`. Choose an image that has the features under test.
+  https://camusdb.github.io/docs/testcontainers
+- .NET Aspire: `CamusDB.Aspire.Hosting` runs a standalone container from the AppHost and creates
+  the declared databases. `CamusDB.Aspire.Client` and `CamusDB.Aspire.EntityFrameworkCore` register
+  the driver or an EF Core context in a service. https://camusdb.github.io/docs/aspire
+- Kubernetes Operator: an alpha operator, installed from a Helm chart, runs a `CamusDBCluster` resource. It
+  needs TLS. Do not use it for local development. https://camusdb.github.io/docs/kubernetes-operator
+
 ## Ports
 
 | Port | Use | Key / flag |
 | --- | --- | --- |
 | `5095` | HTTP REST API, operator dashboard | `http_port` / `--http-port` |
-| `5096` | Client gRPC API | `grpc_port` (YAML only) |
+| `5096` | Client gRPC API | `grpc_port` / `--grpc-port` |
 | `7141` | HTTPS, only when `https_certificate` is set | `https_port` / `--https-port` |
 | `7070` | Raft, cluster mode | `raft_port` / `--raft-port` |
 
@@ -107,7 +124,7 @@ Key rules:
 - With `--format json` or `yaml`, only rows go to stdout. Messages go to stderr.
 - `exit` and `use` are blocked while a transaction is open. `commit` or `rollback` first.
 - Server-level statements work with no database selected: `CREATE DATABASE`, `SHOW DATABASES`,
-  `CREATE USER`, `GRANT`, `SHOW BRANCHES FROM`, `SHOW ANCESTORS FROM`.
+  `SHOW TABLES FROM`, `CREATE USER`, `GRANT`, `SHOW BRANCHES FROM`, `SHOW ANCESTORS FROM`.
 
 Read `references/camus-cli.md` for every flag, meta command, and environment variable.
 
@@ -130,11 +147,17 @@ http_port: 5095
 grpc_port: 5096
 initial_partitions: 1
 slow_query_log_enabled: true
-key_range_sharding: false                   # restart-scoped; env CAMUS_KEY_RANGE_SHARDING overrides
+# key_range_sharding: true                  # fixed when the cluster is created; leave unset for hash routing
 ```
 
 - Use `memory_profile: dev` when the node shares a laptop with the app. It is not a server setting.
+- Choose the routing mode before you create data. `key_range_sharding` is fixed when the cluster
+  is created. Hash routing is the default. A node with no value follows the recorded mode. A node
+  set to the other mode refuses to start with `CADB0600`. To change mode, dump and reimport into a
+  new cluster.
 - `key_range_sharding` has no CLI flag. Set it in YAML or with `CAMUS_KEY_RANGE_SHARDING=true`.
+- `kahuna.storage` and `kahuna.wal_storage` accept `memory`, `sqlite`, `rocksdb`, and `solarium`.
+  Choose them before you create data. Solarium and RocksDB do not read each other's files.
 - Check what the node resolved. Do not reconstruct the merge by hand:
 
 ```sql
@@ -160,6 +183,8 @@ RESET CLUSTER SETTING max_mutations_per_transaction;
 - An invariant break across two fields fails with `CADB0600` `InvalidConfig`.
 - `RESET` removes the overlay. Each node falls back to its own local value.
 - `SHOW VARIABLES` is node-local. Run it on every node to confirm a fleet change.
+- Per-request limits such as `max_statement_bytes` are runtime settings. A value of `0` or less
+  disables one. Read `references/configuration.md` for the list and the error codes.
 
 ## Enable authentication
 
@@ -190,6 +215,8 @@ SHOW GRANTS FOR app;
 ```
 
 - Startup fails with an empty user catalog and no bootstrap values.
+- A node with auth on and at least one peer also needs `raft_mutual_tls_enabled: true` and
+  `raft_peer_ca`. Otherwise it refuses to start. A one-node setup does not need them.
 - Credentials over plaintext are refused (`CADB0519`), except from loopback.
 - A token lives 15 minutes by default. Clients renew from `expiresAtUnixMs`.
 - Prefer `CAMUS_PASSWORD` or the prompt to `-p secret` on a shared host.
@@ -198,7 +225,7 @@ SHOW GRANTS FOR app;
 | --- | --- | --- |
 | `CADB0516` | Not authenticated: missing, wrong, expired, or revoked credentials | Log in again or fix the credentials |
 | `CADB0517` | Authenticated, but a privilege is missing on a touched table | `GRANT` the privilege, including joined tables |
-| `CADB0518` | Too many login attempts | Wait for the rate-limit window |
+| `CADB0518` | Login rate limit, or the limit on concurrent password verifications | Wait, then retry |
 | `CADB0519` | Credentials over plaintext while TLS is required | Use `https://`, or connect from loopback |
 
 Read `references/configuration.md` for the Docker and TLS details of auth.
@@ -229,12 +256,12 @@ Register it in the client. This block is the generic form (Claude Code reads it 
 }
 ```
 
-- Always set `CAMUS_MCP_ENDPOINT`. Its default is `http://localhost:7141`, the HTTPS port, which a
-  default node does not serve.
+- `CAMUS_MCP_ENDPOINT` defaults to `http://localhost:5095`. Set it for any other node.
 - Point the agent at a branch, not at the source database: `CREATE DATABASE app_agent BRANCH FROM app;`.
 - With auth on, add `CAMUS_MCP_USER` and `CAMUS_MCP_PASSWORD`, and grant only `SELECT` for a read-only agent.
-- `select_query` accepts only `SELECT`, `SHOW`, and `DESCRIBE`. `create_database`, `create_table`,
-  and `insert_rows` can write.
+- `select_query` accepts only `SELECT`, `SHOW`, and `DESCRIBE`. It rejects row-locking reads such as
+  `FOR UPDATE`. `create_database`, `create_table`, and `insert_rows` can write.
+- Diagnostic tools such as `get_slow_queries` read server statistics. Most need a superuser with auth on.
 
 Read `references/mcp-server.md` for Codex and Cursor setup, all variables, and the tool list.
 
@@ -272,7 +299,7 @@ artifacts, compare, and baselines, use `CamusDB.Workload` from the engine source
 
 - Web Console: `docker run --rm -p 8080:8080 -e CamusDB__Endpoint=http://host.docker.internal:5095 -e CamusDB__Database=demo camusdb/camusdb-webconsole:latest`, then open `http://localhost:8080`.
 - Operator dashboard: open `http://localhost:5095/` in a browser. It is read-only.
-- Browser playground: real engine in WebAssembly, in memory. It has no `USE`; use the database selector.
+- Browser playground: real engine in WebAssembly, in memory. Queries use the `playground` database. It has no `USE`.
 
 Read `references/tools.md` for details and limits.
 
@@ -282,7 +309,8 @@ Read `references/tools.md` for details and limits.
 - Running a standalone node and the compose cluster together. Both want host port `5095`, and
   the cluster puts node `camus2` HTTP on host port `5096`, the standalone gRPC port.
 - Pointing a `Protocol=grpc` connection at port `5095`. gRPC is `5096` on a standalone node.
-- Leaving `CAMUS_MCP_ENDPOINT` unset. The default `7141` is HTTPS-only.
+- Listing a node's own `raft_host:raft_port` in `peers`. Startup fails with `InvalidConfig`. List the other nodes.
+- Setting `key_range_sharding` to a different mode on an existing cluster. The node refuses to start.
 - Putting `CAMUSDB_AUTH_*` values in `config.yml`. Auth reads them from the environment only.
 - Changing `CAMUSDB_AUTH_TOKEN_KEY` between nodes. Every node needs the same value.
 - Expecting the dashboard or `backup` commands to work remotely with auth off. Both are
@@ -295,9 +323,9 @@ Read `references/tools.md` for details and limits.
 ## References
 
 - `references/camus-cli.md`: all camus-cli flags, meta commands, history, output formats. Read before scripting the CLI.
-- `references/configuration.md`: discovery, precedence, key defaults, flags, auth environment, Docker auth, validation errors. Read before editing `config.yml`.
+- `references/configuration.md`: discovery, precedence, key defaults, flags, storage backends, request limits, auth environment, Docker auth, validation errors. Read before editing `config.yml`.
 - `references/mcp-server.md`: MCP build, environment variables, Claude Code / Codex / Cursor config, tools. Read before wiring an agent.
-- `references/local-cluster.md`: compose cluster ports, manual cluster flags, leadership transfer, Caraxes. Read before running more than one node.
+- `references/local-cluster.md`: compose cluster ports, manual cluster flags, growing a one-node cluster, leadership transfer, Caraxes. Read before running more than one node.
 - `references/tools.md`: Web Console, operator dashboard, browser playground, workload utility. Read before using any of them.
 
 Public docs:
@@ -306,6 +334,8 @@ Public docs:
 - https://camusdb.github.io/docs/camus-cli
 - https://camusdb.github.io/docs/configuration
 - https://camusdb.github.io/docs/cluster
+- https://camusdb.github.io/docs/growing-a-one-node-cluster
+- https://camusdb.github.io/docs/key-range-sharding
 - https://camusdb.github.io/docs/runtime-cluster-settings
 - https://camusdb.github.io/docs/sql-authentication
 - https://camusdb.github.io/docs/mcp-server
@@ -314,3 +344,6 @@ Public docs:
 - https://camusdb.github.io/docs/web-console
 - https://camusdb.github.io/docs/operator-dashboard
 - https://camusdb.github.io/docs/browser-playground
+- https://camusdb.github.io/docs/testcontainers
+- https://camusdb.github.io/docs/aspire
+- https://camusdb.github.io/docs/kubernetes-operator

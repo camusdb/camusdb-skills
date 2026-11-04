@@ -50,7 +50,7 @@ kahuna:
 - Authentication on: every endpoint needs a superuser bearer token
   (`Authorization: Bearer <token>`). Use HTTPS.
 - Authentication off: the server accepts backup requests from loopback only.
-  A remote caller is refused.
+  A remote caller fails with `CADB0517 InsufficientPrivilege`.
 
 ## The HTTP API
 
@@ -151,10 +151,11 @@ Confirm each step with the user. A restore replaces what a server will serve.
 4. **Start a server with `data_dir` set to `dataRoot`.** The restored storage is
    at `{targetDir}/kv`, with an empty `{targetDir}/wal`. No files need moving.
    Keep the same `kahuna.storage` value and revision settings as the backup.
+   Solarium does not read RocksDB files, and RocksDB does not read Solarium files.
 5. **Verify** with `SHOW DATABASES`, `SHOW TABLES`, and row counts.
-6. **In a cluster,** a restored node catches up by Raft after it rejoins. A
-   full-cluster recovery restores every node to one coordinated point, then
-   starts the cluster together.
+6. **In a cluster,** a full-cluster recovery restores every node to one
+   coordinated point, then starts the cluster together. To add a node to a
+   running cluster, use [a seeded join](#seed-a-joining-node-from-a-backup).
 
 To recover only one table or database: restore to a separate directory, start
 a separate server on it, then `camus-dump` the needed objects and replay them
@@ -164,6 +165,56 @@ into production with `camus-cli`.
 
 A physical backup is bound to its storage revision. To cross revisions, restore
 with the CamusDB version that took the backup, then use a logical dump.
+
+## Seed a joining node from a backup
+
+A node that joins with an empty WAL presents to the leader at index 0. The
+leader sends a full snapshot, and that snapshot overwrites a restored store. A
+restored data root alone saves nothing. A seeded join avoids this. The node
+replays the chain and writes one committed checkpoint per partition. The leader
+then sends only the later entries.
+
+1. **Restore the chain** into a fresh data root with `POST /v1/restore` on any
+   node. Note the `leafBackupId` and the `targetTimeMs`.
+2. **Copy the data root to the new host.** Use it as that node's `data_dir`. Do
+   not start a node on it before step 4. Its WAL must stay empty.
+3. **Make the backup catalog readable on the new host.** Set `kahuna.backup_dir`
+   to it. The seed reads the chain from there.
+4. **Start the node with the seed options:**
+
+   ```yaml
+   mode: cluster
+   peers: [10.0.0.1:7070, 10.0.0.2:7070]    # members of the running cluster
+   join_existing: true
+   pitr_bootstrap_from: <leafBackupId>
+   pitr_bootstrap_target_time_ms: 0          # the restore's targetTimeMs; 0 = latest
+   kahuna:
+     backup_dir: /opt/camusdb/backups
+   ```
+
+   The command-line form is
+   `--join-existing true --pitr-bootstrap-from <leafBackupId>`.
+5. **Remove `pitr_bootstrap_from`** from the configuration after the node is up.
+
+`pitr_bootstrap_target_time_ms` must match the restore's `targetTimeMs`.
+Otherwise the store and the WAL describe two different points in time.
+
+The node refuses to start with `CADB0710 PitrBootstrapFailed` when:
+
+- `{data_dir}/kv/{revision}` is missing or empty.
+- `{data_dir}/wal/{revision}` is not empty. Copy a fresh data root, or remove
+  `pitr_bootstrap_from` to start the node as it is.
+- The store or the WAL is not RocksDB.
+- A manifest fails authentication against `kahuna.backup_mac_key_file`.
+- A manifest carries a different `kahuna.backup_cluster_id`. A chain with no
+  cluster id is accepted.
+- The chain cannot be resolved, or the target is outside its coverage.
+- The target is older than the leader's retention window
+  (`pitr_window_seconds` plus `base_snapshot_interval_seconds`).
+- An earlier seed attempt in the same process failed.
+
+For joins without a backup, see
+https://camusdb.github.io/docs/growing-a-one-node-cluster.
 
 ## Clusters
 
@@ -197,6 +248,7 @@ throughput, plus the base images that overlap the window.
 
 | Code | Name | HTTP | Meaning |
 | --- | --- | --- | --- |
+| `CADB0517` | `InsufficientPrivilege` | 403 | Not a superuser, or a remote caller with authentication off. |
 | `CADB0700` | `BackupNotConfigured` | 503 | `kahuna.backup_dir` unset. |
 | `CADB0701` | `BackupChainInvalid` | 422 | No full root, gap, broken link, or cycle. |
 | `CADB0702` | `BackupNeedsFullBackup` | 409 | Parent aged past the retention floor. Take a full backup. |
@@ -213,6 +265,7 @@ throughput, plus the base images that overlap the window.
 | `CADB070D` | `BackupTopologyChanged` | 503 | Topology changed. Nothing published. Retry. |
 | `CADB070E` | `BackupNotCoordinator` | 421 | Coordinated backup sent to a non-coordinator. |
 | `CADB070F` | `BackupInsecureRoot` | 500 | Root is a symlink or group/world writable. |
+| `CADB0710` | `PitrBootstrapFailed` | - | A joining node could not seed itself from the chain. It refuses to start. |
 
 Retryable: `CADB070A`, `CADB070B`, `CADB070D`. The rest need an operator
 decision.
@@ -221,6 +274,8 @@ decision.
 
 - Every committed change goes through a per-partition Raft log (Kommander),
   then into the key/value store (Kahuna). RocksDB backs both by default.
+  `kahuna.storage` and `kahuna.wal_storage` can select another engine, such as
+  Solarium.
 - At startup each partition replays its log before it serves work. Proposed and
   rolled-back entries are skipped. Committed entries are applied again if the
   KV store lagged.

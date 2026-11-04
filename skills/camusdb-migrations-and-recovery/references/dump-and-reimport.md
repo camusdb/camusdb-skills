@@ -11,6 +11,8 @@ data is small enough to replay quickly:
 
 - moving a database or table to another machine or cluster
 - crossing a CamusDB storage revision
+- changing the storage engine or the routing mode
+- moving a standalone node into a cluster
 - exporting one table, or a filtered subset
 - a reviewable SQL snapshot
 
@@ -65,13 +67,24 @@ sent to an HTTP/2 only endpoint". With authentication on outside loopback, use
 | `--defer-indexes` | Secondary indexes after data. |
 | `--no-create-table`, `--no-data`, `--no-indexes` | Skip parts. |
 | `--all-users`, `--users` | Also export accounts and grants. |
-| `--strict` | Fail instead of writing `NULL` for NaN or infinity. |
+| `--strict` | Fail when a value has no exact rendering. |
 | `--no-header`, `--no-progress` | Quieter output. |
 
 By default the dump fixes one instant (one second behind the wall clock) and
 reads every table `AS OF SYSTEM TIME` that instant. The header records it.
 Only rows are time-traveled. Schema, indexes, and sequence positions are
 current.
+
+Read the end of the dump output on standard error. `camus-dump` reports every
+value it could not render exactly.
+
+A non-finite float is written as `CAST('NaN' AS float64)`. An older `camus-dump`
+wrote `NULL` instead. Dump over gRPC, the default, when a table holds such
+values. Over REST, CamusDB.Client 0.17.1 reads the value as text, and an array
+that mixes it with numbers does not load.
+
+A gRPC client built before `JSONB` support reads every `JSONB` cell as `NULL`,
+with no error. Update `camus-dump` before you dump a table with `JSONB` columns.
 
 ## Moving data between machines
 
@@ -106,8 +119,8 @@ same revision, so users and grants start empty on the new revision.
 
 1. **Record before the move** (as a superuser): `SHOW USERS`,
    `SHOW GRANTS FOR *`, `SHOW VIEWS` + `SHOW CREATE VIEW`,
-   `SHOW MATERIALIZED VIEWS` + `SHOW CREATE MATERIALIZED VIEW`, and
-   `SHOW VARIABLES` (keep non-default values).
+   `SHOW MATERIALIZED VIEWS` + `SHOW CREATE MATERIALIZED VIEW`, your
+   `CREATE TRIGGER` statements, and `SHOW VARIABLES` (keep non-default values).
 2. **Dump with the old version:**
 
    ```bash
@@ -117,14 +130,16 @@ same revision, so users and grants start empty on the new revision.
    ```
 
 3. **Start the new version** on the target `data_dir`. If authentication is on,
-   bootstrap a superuser first.
+   bootstrap a superuser first. If the dump installs C# extensions, deploy the
+   same extension files, list them in `extension_assemblies`, and restart first.
 4. **Load in this order:**
    1. Users (`users.sql`).
    2. Databases, tables, indexes, foreign keys, and rows.
    3. Views and materialized views. Refresh materialized views.
-   4. Grants (`grants.sql`).
-   5. Cluster settings with `SET CLUSTER SETTING`.
-   6. `ANALYZE` for each table.
+   4. Triggers, after the rows, so the reimport fires none.
+   5. Grants (`grants.sql`).
+   6. Cluster settings with `SET CLUSTER SETTING`.
+   7. `ANALYZE` for each table.
 
    ```bash
    camus-cli -c "Endpoint=http://db1.internal:5095;Database=test" -f /backup/camusdb-old/users.sql
@@ -142,6 +157,36 @@ same revision, so users and grants start empty on the new revision.
    old revision directories from every node.
 
 Do not set `kahuna.storage_revision` to an older value to reach old data.
+
+A dump carries `CREATE EXTENSION name VERSION 'version'` for each installed
+extension, but not the extension files. Reading the list needs a superuser. A
+dump by another user carries none and says so. A dump does not carry triggers.
+
+## Changing the engine, the routing mode, or the deployment
+
+Each of these needs the same procedure as a storage revision change.
+
+| Change | Why a dump is required | Target |
+| --- | --- | --- |
+| `kahuna.storage` or `kahuna.wal_storage` | Solarium and RocksDB do not read each other's files. Every node must use the same values. | A server on the new engine |
+| `key_range_sharding` | The mode is fixed when the cluster is created. A node set to the other mode refuses to start (`CADB0600`). | A new cluster |
+| Standalone to cluster | A standalone node refuses every join and every join seed. | A cluster-mode node |
+
+Decide these before the first boot of a new cluster. Each is fixed then:
+
+- `key_range_sharding`. Unset, a node follows the cluster's record.
+  `SHOW VARIABLES` then reports the source `cluster`.
+- `initial_partitions`. A later value is ignored, and the node logs a warning.
+
+A cluster created before the mode record has its mode inferred once, on the
+first start of the new version. Start an existing node first after that upgrade.
+A node that joins earlier with an empty data directory would record hash routing.
+
+To start small and grow, run one node in cluster mode, not standalone. Add nodes
+one at a time with `join_existing: true`, and wait for each to become a voter. A
+node with authentication on and at least one entry in `peers` needs
+`raft_mutual_tls_enabled`. See
+https://camusdb.github.io/docs/growing-a-one-node-cluster.
 
 ## Batch size and limits
 

@@ -38,8 +38,8 @@ What you can rely on:
 
 What you still must do:
 
-- Treat a failed explicit transaction as a failed unit. Replay it from `BEGIN`.
-  The replay may observe different data.
+- Treat a failed explicit transaction as a failed unit. Any failed statement
+  aborts it. Replay it from `BEGIN`. The replay may observe different data.
 - On `CADB0509`, resend the same finalize. Do not replay.
 
 Under hash routing (the default), all rows and indexes of one table live on one
@@ -59,6 +59,8 @@ change between versions.
   value the transaction modified or depended on.
 - The order is logically consistent. It is not tied to real time. CamusDB has no
   externally consistent commit-wait guarantee.
+- A read at a timestamp can miss a commit from a node with a later clock. Pass the
+  causal token at `BEGIN`. See `isolation-and-locking.md`.
 
 ## Durability and failure outcomes
 
@@ -67,6 +69,7 @@ change between versions.
 | Failure before the durable commit decision | Not reported as committed. Replay from `BEGIN` if you still want the change. |
 | Node restart after an acknowledged commit | CamusDB restores committed log entries and applies them to the KV store. |
 | Partition leader change | The new leader continues from a Raft-safe log. |
+| Coordinator lost before a decision | Recovery resolves the transaction by presumed abort. |
 | Coordinator lost after the commit decision | The decision-anchor partition drives the remaining participants to commit. |
 | Finalize outcome not known within the budget | `CADB0509`. Resend the same finalize. |
 
@@ -132,7 +135,8 @@ WHERE customer = 'acme';
 - Rejected inside an explicit multi-statement transaction.
 - Allowed as the source of `INSERT INTO ... SELECT` and `CREATE TABLE ... AS
   SELECT`. The writes target the current state.
-- Not allowed directly on `UPDATE`, `DELETE`, or `INSERT ... VALUES`.
+- Not allowed directly on `UPDATE`, `DELETE`, or `INSERT ... VALUES`. `SELECT ...
+  FOR UPDATE` with this clause fails with `CADB0400`.
 - Past instants only. A future time, or a time at or before the Unix epoch, is
   rejected.
 - A timestamp older than retained history returns an empty result, not an error.
@@ -153,7 +157,7 @@ Errors:
 | One query over a past state | `AS OF SYSTEM TIME` in autocommit |
 | Several queries over one consistent current snapshot | `BEGIN; SET TRANSACTION ISOLATION LEVEL SERIALIZABLE READ ONLY; ... COMMIT;` |
 | A dashboard that tolerates seconds of staleness and must not block writers | `AS OF SYSTEM TIME '-10s'` |
-| Read, decide, then write | Serializable read-write (default) |
+| Read, decide, then write | Serializable read-write (default), or `SELECT ... FOR UPDATE` in an explicit transaction |
 
 Docs:
 

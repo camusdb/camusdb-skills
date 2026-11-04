@@ -14,7 +14,8 @@ little-endian, no header, no padding. The dimension is `byteLength / 4`.
 Prefer a bind parameter on every transport. The server logs statement text but
 never parameter values, so embeddings stay out of log files. A 3,072-byte
 vector is far below the 4 MB gRPC message default and the 30 MB request body
-default.
+default. Inline SQL text over `max_statement_bytes` (8 MiB default) fails with
+`CADB0557`. Bound values do not count, so bind the vectors of a bulk `INSERT`.
 
 ## Worked byte example
 
@@ -122,6 +123,81 @@ static byte[] Pack(ReadOnlySpan<float> v)
 ```
 
 Do not use `BitConverter.GetBytes(double)`. It writes 8 bytes per element.
+
+## EF Core (`CamusDB.EntityFrameworkCore`)
+
+From 0.16.10, declare a `float[]` or `byte[]` property with `IsVector(dimensions)`:
+
+```csharp
+using CamusDB.EntityFrameworkCore;
+
+public class DocumentChunk
+{
+    public string Id { get; set; } = "";
+    public long TenantId { get; set; }
+    public string Content { get; set; } = "";
+    public float[] Embedding { get; set; } = [];
+}
+
+modelBuilder.Entity<DocumentChunk>(b =>
+{
+    b.ToTable("chunks");
+    b.HasKey(c => c.Id);
+    b.HasIndex(c => c.TenantId);
+    b.Property(c => c.Embedding).IsRequired().IsVector(1536, loadWithEntity: false);
+});
+```
+
+`IsVector` configures:
+
+| What | Note |
+| --- | --- |
+| `BYTES(dimensions × 4)` | A maximum, not a fixed width. |
+| `STORAGE PLAIN` | A later `HasStorage` replaces it. |
+| `CHECK (vector_dims(col) = dimensions)` named `CK_{table}_{column}_dims` | A `NULL` vector passes it. Add `IsRequired()`. |
+| For `float[]`: a value converter and an element-wise comparer | The column holds bytes. An edit in place is saved. |
+
+Rank with the `EF.Functions` helpers and always add `Take(k)`. The server then runs a
+bounded top-k, not a full sort:
+
+```csharp
+float[] question = await EmbedAsync("warranty claims");
+
+var hits = await ctx.Chunks
+    .Where(c => c.TenantId == tenantId)
+    .OrderBy(c => EF.Functions.CosineDistance(c.Embedding, question))
+    .Select(c => new { c.Id, c.Content, Distance = EF.Functions.CosineDistance(c.Embedding, question) })
+    .Take(8)
+    .ToListAsync();
+```
+
+| Helper | SQL function | Order |
+| --- | --- | --- |
+| `EF.Functions.L2Distance(a, b)` | `l2_distance` | `OrderBy` |
+| `EF.Functions.CosineDistance(a, b)` | `cosine_distance` | `OrderBy` |
+| `EF.Functions.InnerProduct(a, b)` | `inner_product` | `OrderByDescending` |
+| `EF.Functions.VectorDims(v)` | `vector_dims` | Not a ranking metric |
+| `EF.Functions.OctetLength(v)` | `octet_length` | Not a ranking metric |
+
+A `float[]` query vector travels as packed bytes through the column's converter. For a
+`byte[]` property, pack the query vector with `CamusVector.ToBytes`.
+
+`IsVector(n, loadWithEntity: false)` keeps the vector out of queries that return the
+entity. The property is then `null`:
+
+- The property must be required. The model validator refuses an optional one.
+- A query that names the vector still reads it: a `Where`, an `OrderBy`, or a
+  projection such as `Select(c => new { c.Id, c.Embedding })`.
+- `SaveChanges` never writes a `null` vector over the stored one. This covers a tracked
+  entity and `ctx.Update(detachedEntity)`.
+- A shape the rewrite does not recognize keeps the vector: a collection `Include`, a
+  split query, a nested collection, or `Distinct()`. The result is correct, but the
+  vector is read.
+
+## Dapper (`CamusDB.Dapper`)
+
+Bind a vector with `CamusValue.Vector(floats)`. It packs a `float` span for a `BYTES`
+column.
 
 ## TypeScript (`camusdb`)
 

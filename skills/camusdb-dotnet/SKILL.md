@@ -1,6 +1,6 @@
 ---
 name: camusdb-dotnet
-description: Writes and reviews .NET (C#) code that talks to CamusDB through the CamusDB.Client ADO.NET driver, the CamusDB.Dapper adapter, or the CamusDB.EntityFrameworkCore provider. Use when code references CamusConnection, CamusCommand, CamusConnectionStringBuilder, CamusTransaction, SerializableRetryHelper, ColumnType, CamusValue, CamusDapper, UseCamusDB, EnableRetryOnFailure, or CADB error codes, or when a user asks how to connect a .NET, ASP.NET, Dapper, or EF Core app to CamusDB. Covers connection strings, parameters, type mapping (OID, UUID, NUMERIC, DATETIME, BYTES, ARRAY), transactions and serializable retries, endpoint pools and learned routing, prepared statements, streaming readers, migrations, and primary-key choice.
+description: Writes and reviews .NET (C#) code that talks to CamusDB through the CamusDB.Client ADO.NET driver, the CamusDB.Dapper adapter, the CamusDB.EntityFrameworkCore provider, or CamusDB.OpenTelemetry. Use when code references CamusConnection, CamusCommand, CamusConnectionStringBuilder, CamusDataSource, CamusTransaction, CamusPipeline, SerializableRetryHelper, ColumnType, CamusValue, CamusDapper, UseCamusDB, EnableRetryOnFailure, IsVector, or CADB error codes such as CADB0824, or when a user asks how to connect a .NET, ASP.NET, Dapper, or EF Core app to CamusDB. Covers connection strings, parameters, type mapping (OID, UUID, NUMERIC, JSONB, DATETIME, BYTES, ARRAY), transactions, failed statements, serializable retries, pipelines, endpoint pools and learned routing, prepared statements, streaming readers, telemetry, migrations, and primary-key choice.
 ---
 
 # CamusDB for .NET
@@ -8,13 +8,14 @@ description: Writes and reviews .NET (C#) code that talks to CamusDB through the
 CamusDB is a distributed NewSQL database. Its default isolation is Serializable.
 A conflicting transaction aborts, and the client must replay it.
 This skill helps you write correct .NET data-access code for CamusDB.
-It covers three NuGet packages that share one connection string format.
+It covers four NuGet packages. The first three share one connection string format.
 
 | Package | Use it for | Targets |
 | --- | --- | --- |
 | `CamusDB.Client` | ADO.NET driver: full SQL control | `net8.0`, `net9.0`, `net10.0` |
 | `CamusDB.Dapper` | Dapper mapping over `CamusConnection` | `net8.0`, `net9.0`, `net10.0` |
 | `CamusDB.EntityFrameworkCore` | EF Core 10 provider, LINQ, migrations | `net10.0` |
+| `CamusDB.OpenTelemetry` | Optional `AddCamusDBInstrumentation()` for traces and metrics | `net8.0`, `net9.0`, `net10.0` |
 
 ## Workflow
 
@@ -24,8 +25,8 @@ Follow these steps when you write or review CamusDB .NET code.
 2. Build the connection string. Set `Endpoint` and `Database`. Add `Protocol=grpc` only with the gRPC port.
 3. Create the database explicitly. Opening a connection creates nothing.
 4. Choose primary keys with the placement rules in "Primary keys" below.
-5. Bind every value as a parameter. Set the `ColumnType` for OID, UUID, NUMERIC, and arrays.
-6. Wrap each read-write unit of work in a retry loop that replays from `BEGIN`.
+5. Bind every value as a parameter. Set the `ColumnType` for OID, UUID, NUMERIC, JSONB text, and arrays.
+6. Wrap each read-write unit of work in a retry loop that replays from `BEGIN`. Let statement errors reach that loop.
 7. Use a streaming reader for large results.
 8. Check the "Common mistakes" list before you finish.
 
@@ -48,6 +49,7 @@ await connection.CreateDatabaseAsync(ifNotExists: true);
 - A comma-separated `Endpoint` is a pool. The driver rotates and skips a dead endpoint for 30 seconds.
 - Add `User` and `Password` when the server enables authentication. Use `https://` outside loopback.
 - Log `builder.ToRedactedString()`, never `ToString()`. `ToString()` includes credentials.
+- For code that uses the abstract ADO.NET types, use `CamusDataSource` or `CamusProviderFactory.Instance`.
 
 Read [references/driver-api.md](references/driver-api.md) for every connection-string key.
 
@@ -88,7 +90,7 @@ command.Parameters.Add("@tags", ColumnType.Integer64, new long[] { 1, 2, 3 }, is
 command.Parameters.Add("@none", ColumnType.String, Array.Empty<string>(), isArray: true);
 ```
 
-Read [references/type-mapping.md](references/type-mapping.md) before you bind OID, UUID, NUMERIC, DATE, DATETIME, BYTES, or ARRAY values.
+Read [references/type-mapping.md](references/type-mapping.md) before you bind OID, UUID, NUMERIC, JSONB, DATE, DATETIME, BYTES, or ARRAY values.
 
 ## Read rows
 
@@ -106,14 +108,41 @@ while (await reader.ReadAsync())
 ```
 
 - `ExecuteReaderAsync()` materializes the result first. Use it for small results.
+- A buffered result over the server caps fails with `CADB0556`. The defaults are 1,000,000 rows and 256 MiB.
+- `ExecuteStreamReaderAsync()` is incremental on REST and on gRPC. Plain reads have no result cap.
+- The server buffers a write with `RETURNING` before commit, so `CADB0556` still applies to it.
 - The streaming reader cannot replay a serializable conflict after rows arrive. Use the buffered reader when automatic retry matters more.
+- On gRPC, `CommandTimeout` bounds each wait for the next row of a stream, not the whole read.
 - `DATETIME` values come back with `DateTimeKind.Utc`.
+
+## JSONB
+
+`JSONB` (alias `JSON`) holds one JSON document. A document travels as JSON text on both transports.
+
+```csharp
+using System.Text.Json;
+using System.Text.Json.Nodes;
+
+insert.Parameters.Add("@payload", ColumnType.Null, new JsonObject { ["kind"] = "login" }); // infers JSONB
+select.Parameters.Add("@filter", ColumnType.Jsonb, """{"kind": "login"}""");            // text needs the type
+
+string text = reader.GetString(0);                       // PostgreSQL text form
+JsonElement payload = reader.GetFieldValue<JsonElement>(0);
+```
+
+- A `JsonDocument`, `JsonElement`, or `JsonNode` parameter binds as `JSONB` with no `ColumnType` set.
+- A plain `string` binds as `STRING`. A `jsonb` column parses it when it is written.
+- `GetString` and `GetValue` return text. `GetFieldValue<T>` returns a `JsonDocument`, `JsonElement`, `JsonNode`, `JsonObject`, or `JsonArray`.
+- A list of documents fails with `CADB0400`. The server has no `ARRAY(JSONB)`. Bind one JSON array instead.
+- JSON `null` reads as the text `null`. SQL `NULL` reads as `DBNull`.
+- Invalid JSON fails with `CADB0418`. Nesting deeper than 512 levels fails with `CADB0419`.
 
 ## Transactions and retries
 
 `CADB0502`, `CADB0504`, and `CADB0505` abort the transaction. Replay the whole unit of work from `BEGIN`.
 `CADB0509` means the commit outcome is unknown. Never replay the work for it.
-`CamusTransaction.CommitAsync()` and `RollbackAsync()` already re-issue the same finalize on `CADB0509`.
+`CamusTransaction.CommitAsync()` and `RollbackAsync()` already re-issue the same finalize on `CADB0509`, up to 10 times with backoff.
+If `CADB0509` still reaches you, re-issue the same finalize. Do not replay the work.
 
 ```csharp
 await SerializableRetryHelper.ExecuteAutocommitAsync(async ct =>
@@ -144,6 +173,34 @@ await SerializableRetryHelper.ExecuteAutocommitAsync(async ct =>
 - Keep side effects out of the retried body. It can run more than once.
 - Use `CamusTransactionOptions.Snapshot` for a consistent read-only view across statements.
 - Do not retry `CADB0506` (mutation limit). Split the work below 20,000 mutations.
+- Disposing an unfinished transaction rolls it back. A rollback failure during dispose is ignored.
+- `CADB0555` (`FOR UPDATE NOWAIT` met a held row) ends the transaction. `IsRetryable` returns false for it.
+- For many round trips per transaction, use `tx.CreatePipeline()`. See [references/driver-api.md](references/driver-api.md).
+
+### A failed statement ends the transaction
+
+Any failed statement aborts an explicit transaction, reads included. There are no savepoints.
+Earlier writes of that transaction cannot commit.
+
+- Over REST and gRPC, the server rolls the transaction back as soon as the statement fails.
+- A later statement or `CommitAsync()` on that transaction fails with `CADB0400` ("Unknown transaction").
+- `CADB0824` (`TransactionRollbackOnly`) is the engine code for this state. Treat both codes as "this transaction is gone".
+- `RollbackAsync()` after the failure is safe. It succeeds and does nothing.
+
+Do not catch a statement error in the body and continue.
+The commit then fails with `CADB0400`, which `IsRetryable` rejects, so a swallowed `CADB0502` is never replayed.
+
+```csharp
+// Wrong: the transaction is already gone when the catch runs.
+try { await insert.ExecuteNonQueryAsync(ct); }
+catch (CamusException ex) when (ex.Code == "CADB0300") { /* carry on */ }
+await tx.CommitAsync(ct); // fails with CADB0400
+
+// Right: state the conflict rule in SQL, so the statement does not fail.
+// INSERT INTO users (id, email) VALUES (@id, @email) ON CONFLICT (email) DO NOTHING
+```
+
+To continue after an expected failure, roll back and start a new transaction.
 
 Transaction options precedence: per-transaction options, then connection-string defaults, then the server default.
 
@@ -172,6 +229,7 @@ Robot robot = await connection.QuerySingleAsync<Robot>(
 
 - Wrap OID strings with `CamusValue.Id(...)`, UUIDs with `CamusValue.Uuid(...)`, wide decimals with `CamusValue.Numeric("...")`.
 - `IN @values` expands a list as usual. Use `CamusValue.Array(...)` with `= ANY(@values)` for one native array value.
+- `Register()` also binds and reads `JsonDocument`, `JsonElement`, `JsonNode`, `JsonObject`, and `JsonArray` as `JSONB`. Use `CamusValue.Jsonb("{...}")` for JSON text.
 - Pass the `CamusTransaction` as `transaction: tx`.
 
 Read [references/dapper.md](references/dapper.md) for array handlers and object ids.
@@ -195,6 +253,11 @@ var options = new DbContextOptionsBuilder<AppDbContext>()
 - `EnableRetryOnFailure()` retries `CADB0502`, `CADB0504`, and `CADB0505` only.
 - `EnsureCreatedAsync()` creates the database when it is missing, then the tables.
 - Migrations cannot change a column type in place, add or drop a primary key, or create computed columns.
+- `Union`, `Concat`, `Intersect`, and `Except` translate to `UNION`, `UNION ALL`, `INTERSECT`, and `EXCEPT`.
+- String `+`, `string.Concat`, and interpolation of strings and integers translate to `||`.
+- `JsonDocument`, `JsonElement`, `JsonNode`, `JsonObject`, and `JsonArray` properties map to `JSONB`. `EF.Functions.JsonContains` and related helpers translate.
+- `IsVector(dimensions)` declares a `float[]` or `byte[]` embedding.
+- The provider has no LINQ API for `ON CONFLICT`, `UPSERT`, or `FOR UPDATE`. Send those as raw SQL.
 
 Read [references/ef-core.md](references/ef-core.md) before you model entities, write migrations, or use LINQ features.
 
@@ -233,7 +296,9 @@ For a composite key, put a well-spread column such as `tenant_id` first, then th
 - Storing UUIDs in `STRING` columns. Use a native `UUID` column and `ColumnType.Uuid`.
 - Declaring a `Guid` EF property with `HasColumnType("id")`. ObjectIds are 12 bytes; use `string`.
 - Reading a wide `NUMERIC` into `decimal`. Read it with `GetString()` or a `string` property.
-- Using `ExecuteReaderAsync()` for a huge result. It buffers everything; use `ExecuteStreamReaderAsync()`.
+- Catching a statement error inside an explicit transaction and continuing. The transaction is already gone. Rethrow it.
+- Using `ExecuteReaderAsync()` for a huge result. It buffers everything and can fail with `CADB0556`; use `ExecuteStreamReaderAsync()`.
+- Binding a list of `JsonDocument` values. `ARRAY(JSONB)` does not exist; bind one JSON array document.
 - Using `ExecuteNonQueryAsync()` to read `RETURNING` rows. It returns only the count.
 - Running `TRUNCATE TABLE` inside an explicit transaction. CamusDB rejects it (`CADB0538`).
 - Forgetting `command.Transaction = tx`. The command then runs in autocommit on any endpoint.
@@ -247,9 +312,9 @@ For a composite key, put a well-spread column such as `tenant_id` first, then th
 
 Read these files when the task needs the detail:
 
-- [references/driver-api.md](references/driver-api.md): connection-string keys, connection and command API, routing, prepared statements, auth, backups, low-level gRPC client.
+- [references/driver-api.md](references/driver-api.md): connection-string keys, connection factories, command API, routing, prepared statements, pipelines, auth, telemetry, node stats, extensions, backups, low-level gRPC client.
 - [references/type-mapping.md](references/type-mapping.md): SQL type to `ColumnType`, .NET, EF Core, and Dapper mappings.
-- [references/ef-core.md](references/ef-core.md): provider options, model mapping, LINQ translation, migrations, limits.
+- [references/ef-core.md](references/ef-core.md): provider options, model mapping, LINQ translation, JSONB, vectors, migrations, limits.
 - [references/dapper.md](references/dapper.md): `CamusValue`, array handlers, transactions with Dapper.
 
 Public docs:
@@ -263,3 +328,5 @@ Public docs:
 - https://camusdb.github.io/docs/sql-routing-advice
 - https://camusdb.github.io/docs/best-practices
 - https://camusdb.github.io/docs/grpc-api
+- https://camusdb.github.io/docs/json
+- https://camusdb.github.io/docs/sql-transactions

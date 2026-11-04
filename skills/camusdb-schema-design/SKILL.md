@@ -1,6 +1,6 @@
 ---
 name: camusdb-schema-design
-description: Designs and reviews CamusDB schemas. Covers CREATE TABLE, primary keys, CREATE INDEX with INCLUDE covering columns, column types (OID, UUID, INT64, NUMERIC, STRING(N), BYTES, DATETIME, ARRAY), defaults such as gen_id(), gen_uuid_v4() and gen_uuid_v7(), CHECK and FOREIGN KEY constraints, CREATE SEQUENCE, SERIAL and identity columns, STORAGE strategies for large values, row-level TTL (ttl_expiration_expression), and COMMENT ON. Applies the CamusDB best practices for hotspots under hash routing and key_range_sharding. Use when writing or changing CamusDB DDL or a migration, when choosing a primary key, an index, or a column type, when auditing an existing schema or migration file (review mode), or when DDL fails with CADB0400, CADB0302, CADB0414, CADB0415, CADB0416, CADB0530 or CADB0533, or writes hit CADB0502 on a hot row or CADB0506 from too many index mutations.
+description: Designs and reviews CamusDB schemas. Covers CREATE TABLE, primary keys, CREATE INDEX with INCLUDE covering columns, GIN indexes, DROP INDEX, column types (OID, UUID, INT64, NUMERIC, STRING(N), BYTES, DATETIME, ARRAY, JSONB), defaults such as gen_id(), gen_uuid_v4() and gen_uuid_v7(), CHECK and FOREIGN KEY constraints, CREATE SEQUENCE, SERIAL and identity columns, STORAGE strategies for large values, row-level TTL (ttl_expiration_expression), and COMMENT ON. Applies the CamusDB best practices for hotspots under hash routing and key_range_sharding. Use when writing or changing CamusDB DDL or a migration, when choosing a primary key, an index, or a column type, when auditing an existing schema or migration file (review mode), or when DDL fails with CADB0400, CADB0302, CADB0414, CADB0415, CADB0416, CADB0530 or CADB0533, or writes hit CADB0418, CADB0420, CADB0421, CADB0502 on a hot row or CADB0506 from too many index mutations.
 ---
 
 # CamusDB schema design
@@ -19,11 +19,12 @@ The skill has two modes:
 
 ## Workflow: design mode
 
-1. Find the routing mode. Hash routing is the default. Key-range sharding is
-   on when `config.yml` has `key_range_sharding: true`, or when
-   `CAMUS_KEY_RANGE_SHARDING` is set. If you cannot tell, ask. If no answer
-   comes, design for key-range sharding. That design also works under hash
-   routing.
+1. Find the routing mode. Hash routing is the default. A cluster records its
+   mode once, when it is created. On a running cluster, check
+   `key_range_sharding` in `SHOW VARIABLES`. For a new cluster, read
+   `key_range_sharding` in `config.yml` and `CAMUS_KEY_RANGE_SHARDING`. If you
+   cannot tell, ask. If no answer comes, design for key-range sharding. That
+   design also works under hash routing.
 2. List the queries and the write rate of each table. Name the filter columns
    and the `ORDER BY` of each hot query.
 3. Choose the primary key. Use the table in [Primary keys](#primary-keys).
@@ -69,6 +70,10 @@ The skill has two modes:
 - With key-range sharding, new rows always go to the newest range of the row
   space. The primary key choice spreads the primary index and the secondary
   indexes only.
+- With key-range sharding, a new table stays on one partition until its first
+  split. Indexes of every column type can split, `STRING` included.
+- The routing mode cannot change on existing data. A node set to the other mode
+  refuses to start (`CADB0600`). To move, dump and reimport into a new cluster.
 
 See [Best practices](https://camusdb.github.io/docs/best-practices) and
 [Key-range sharding](https://camusdb.github.io/docs/key-range-sharding).
@@ -143,14 +148,7 @@ A low-cardinality column such as `kind` spreads writes only across its
 values. `player_id` or `tenant_id` is better. There is no hash-sharded index.
 
 Use a covering index on a hot read path. The keyword is `INCLUDE`, not
-`STORING`:
-
-```sql
-CREATE INDEX match_events_kind_idx
-ON match_events (kind, created_at)
-INCLUDE (score);
-```
-
+`STORING`: `CREATE INDEX i ON match_events (kind, created_at) INCLUDE (score)`.
 `EXPLAIN` shows `index-only=true` for a covered scan. `EXPLAIN (ANALYZE)` shows
 `rows_read = 0`.
 
@@ -158,15 +156,19 @@ Index rules:
 
 - Add an index only for a real query. Each index adds one mutation per insert
   and per delete. An update of an indexed column also writes the index.
-- One index spans at most 32 columns, key and included together.
-- The included payload is at most 4 KiB per index entry.
+- One index spans at most 32 columns, key and included together. The included
+  payload is at most 4 KiB per index entry.
 - An included column cannot also be a key column. It takes no `ASC`/`DESC`.
 - A predicate on an included column is a filter, not an index bound.
 - `ORDER BY` must match a left prefix of the index, with the same directions.
   CamusDB scans an index forward only.
 - An `ARRAY(T)` column cannot be an index key. It can be an `INCLUDE` column.
-- Drop an index with `ALTER TABLE t DROP INDEX name`. To change `INCLUDE`,
-  drop the index and create it again.
+- A `JSONB` column cannot be an ordered index key. Use a GIN index:
+  `CREATE INDEX i ON t USING GIN (doc)`.
+- Drop an index with `DROP INDEX name ON t`, `DROP INDEX t.name`, or
+  `ALTER TABLE t DROP INDEX name`. Each form takes `IF EXISTS`. A bare
+  `DROP INDEX name` is refused. To change `INCLUDE`, drop the index and create
+  it again.
 
 See [Indexes](https://camusdb.github.io/docs/sql-indexes).
 
@@ -183,17 +185,27 @@ The rules that matter most:
 - A bare `STRING` allows 2,621,440 characters. A bare `BYTES` allows
   10,485,760 bytes.
 - `DATETIME` is an instant in UTC. `TIMESTAMP` is an alias.
-- The type list has no JSON type and no `INTERVAL` type. Store JSON text in
-  `STRING` and use the JSON functions.
-- `ARRAY(T)` holds scalars only. No nested arrays and no `ARRAY(NUMERIC)`.
+- The type list has no `INTERVAL` type.
+- `ARRAY(T)` holds scalars only. No nested arrays, no `ARRAY(NUMERIC)`, and no
+  `ARRAY(JSONB)`. An array of documents is one `JSONB` document.
+- `INT64` overflow fails with `CADB0420`. `FLOAT64` and `FLOAT32` overflow
+  fails with `CADB0421`. Neither wraps or becomes infinity.
+
+Choose `JSONB` (alias `JSON`) when queries read inside the document. Choose
+`STRING` when you must keep the exact input text. `JSONB` sorts keys, drops
+duplicate keys, and rejects invalid JSON with `CADB0418`.
+
+A `JSONB` column cannot be in a primary key, a `UNIQUE` constraint, an ordered
+index, or a foreign key. To sort on a value, enforce it, or reference it, copy
+it to a typed column. See [JSON](https://camusdb.github.io/docs/json).
 
 ## Rows, large values, and hot rows
 
 A row is the unit of storage and of versions. An update of one column writes a
 new version of the whole row.
 
-- The default `EXTENDED` strategy moves a `STRING`, `BYTES`, or `ARRAY` value of
-  2048 bytes or more (`large_value_threshold_bytes`) under its own key. Do not
+- The default `EXTENDED` strategy moves a `STRING`, `BYTES`, `JSONB`, or `ARRAY`
+  value of 2048 bytes or more (`large_value_threshold_bytes`) under its own key. Do not
   create a side table only to hold a large value.
 - A smaller value stays in the row. Move it to a separate table when it sits
   beside a column that changes often. Example: a 1 KiB JSON profile next to a
@@ -205,18 +217,9 @@ new version of the whole row.
 - `SELECT *` fetches every out-of-line value. Name the columns you need.
 
 Avoid a single hot row. A global counter makes all writers conflict, and they
-abort with `CADB0502 TransactionConflict`. Shard the counter:
-
-```sql
-CREATE TABLE stat_counters (
-  name STRING(64) NOT NULL,
-  shard INT64 NOT NULL,
-  value INT64 NOT NULL
-) PRIMARY KEY (name, shard);
-```
-
-Each writer updates one shard. Readers `SUM(value)`. See
-[Large values](https://camusdb.github.io/docs/storage-layout).
+abort with `CADB0502 TransactionConflict`. Shard the counter with
+`PRIMARY KEY (name, shard)`. Each writer updates one shard. Readers
+`SUM(value)`. See [Large values](https://camusdb.github.io/docs/storage-layout).
 
 ## Constraints
 
@@ -227,7 +230,9 @@ Each writer updates one shard. Readers `SUM(value)`. See
   Name a check at table level: `CONSTRAINT name CHECK (...)`. A named
   column-level check is not supported.
 - **UNIQUE.** Use a column-level `UNIQUE`, an inline `UNIQUE KEY name (cols)`,
-  or `CREATE UNIQUE INDEX`. Uniqueness applies to key columns only.
+  or `CREATE UNIQUE INDEX`. Uniqueness applies to key columns only. A `NULL`
+  key never conflicts. `INSERT ... ON CONFLICT (a, b)` needs a unique index on
+  exactly those columns, and `UPSERT` uses the primary key.
 - **FOREIGN KEY.** Only `NO ACTION` (default) and `RESTRICT`. `CASCADE`,
   `SET NULL`, `SET DEFAULT`, `MATCH FULL`, and `DEFERRABLE` fail with
   `CADB0533`. A cycle across two or more tables fails with `CADB0416`.
@@ -247,21 +252,13 @@ See [Check constraints](https://camusdb.github.io/docs/check-constraints) and
 ## Sequences and identity columns
 
 Use a sequence for a number people see: an invoice, an order, a ticket. Do not
-use one as the primary key of a high-write table.
-
-```sql
-CREATE TABLE invoices (
-  id OID PRIMARY KEY NOT NULL DEFAULT (gen_id()),
-  invoice_no INT64 GENERATED BY DEFAULT AS IDENTITY,
-  total NUMERIC NOT NULL
-);
-```
+use one as the primary key of a high-write table. Keep an `OID` or `UUID` key,
+and add `invoice_no INT64 GENERATED BY DEFAULT AS IDENTITY`.
 
 - `SERIAL` and `BIGSERIAL` are `INT64` identity shorthand, not storage types.
-- Sequence values are unique but have gaps, and they are not a perfect insert
-  order. `CYCLE` is not supported. `INCREMENT` must be positive.
-- `nextval` works only in `INSERT ... VALUES`, column defaults, and a `SELECT`
-  without `FROM`. Elsewhere it fails with `CADB0547`.
+- Sequence values have gaps and are not a perfect insert order. `CYCLE` is not
+  supported. `nextval` elsewhere than `INSERT ... VALUES`, a column default, or
+  a `SELECT` without `FROM` fails with `CADB0547`.
 
 See [Sequences](https://camusdb.github.io/docs/sequences).
 
@@ -288,9 +285,8 @@ See [Row-level TTL](https://camusdb.github.io/docs/row-level-ttl).
 ## Comments
 
 Add a `COMMENT '...'` clause to each table, column, and inline index. Agents
-that use the CamusDB MCP server read these comments. A comment holds at most
-65,535 characters (`CADB0511`). See
-[Schema comments](https://camusdb.github.io/docs/comment-on).
+that use the CamusDB MCP server read them. A comment holds at most 65,535
+characters (`CADB0511`). See [Schema comments](https://camusdb.github.io/docs/comment-on).
 
 ## Schema changes
 
@@ -317,11 +313,12 @@ Habits from other databases that are wrong in CamusDB:
 | Hash-sharded index, bit-reversed sequence | CockroachDB, Spanner | Not available. Use `gen_uuid_v4()` or a spread leading column. |
 | `NUMERIC(10, 2)` | All | Rejected. `NUMERIC` is fixed at precision 38, scale 9. |
 | UUID in `VARCHAR(36)` | MySQL | Use a native `UUID` column. |
-| `JSONB` / `JSON` column | PostgreSQL, MySQL | No JSON type. Use `STRING` and JSON functions. |
+| `JSON` to keep the input text | PostgreSQL | `JSON` is an alias of `JSONB`. Keys are sorted. Use `STRING` for exact text. |
+| Ordered index or key on a `JSONB` column | All | Refused with `CADB0400`. Use a GIN index or a typed column. |
 | `ON DELETE CASCADE` / `SET NULL` | All | Refused with `CADB0533`. Delete children in the application. |
 | `DEFERRABLE INITIALLY DEFERRED` | PostgreSQL | Refused with `CADB0533`. |
 | `"identifier"` in double quotes | PostgreSQL | Double quotes make a string literal. Quote identifiers with backticks. |
-| `DROP INDEX name` | PostgreSQL | Use `ALTER TABLE t DROP INDEX name`. |
+| Bare `DROP INDEX name` | PostgreSQL | Refused with `CADB0400`. Use `DROP INDEX name ON t` or `DROP INDEX t.name`. |
 | `CONSTRAINT u UNIQUE (a, b)` | PostgreSQL | Use `UNIQUE KEY u (a, b)` or `CREATE UNIQUE INDEX`. |
 | `DESC` index on a `STRING` column | All | Rejected. `DESC` works on fixed-width types only. |
 | Expecting TTL to hide expired rows | Cassandra, Redis | Filter on the expiry column in queries. |
@@ -344,8 +341,7 @@ Read these files when the task needs the detail:
   a statement fails, or when you size a transaction or an index.
 
 Public docs, under `https://camusdb.github.io/docs/`: `best-practices`,
-`data-types`, `sql-schema`, `sql-indexes`, `sequences`, `foreign-keys`,
-`check-constraints`, `row-level-ttl`, `storage-layout`, `storage`,
+`data-types`, `json`, `sql-schema`, `sql-indexes`, `sql-writes`, `sequences`,
+`foreign-keys`, `check-constraints`, `row-level-ttl`, `storage-layout`, `storage`,
 `key-range-sharding`, `functions-uuid`, `functions-object-id`, `comment-on`,
-`transaction-limits`, and `databases`. For example,
-https://camusdb.github.io/docs/best-practices.
+`transaction-limits`, and `databases`.

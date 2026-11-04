@@ -29,6 +29,9 @@ Preconditions:
 - The source must have no schema change in flight (`CADB0400`).
 - The source must have no foreign key still being added (refused).
 
+A create on the node that runs a staged change waits for it first. The branch
+then copies the element in `Public`.
+
 ## What a branch sees
 
 Reads resolve in order: the branch overlay, then the source at the fork
@@ -50,6 +53,8 @@ Constraints:
 
 - Uniqueness checks cover the branch plus inherited data. Inserting a key that
   exists in the snapshot conflicts. Delete the inherited row first.
+- `INSERT ... ON CONFLICT` treats an inherited key as a conflict. An update
+  writes the branch's own copy. A key the branch deleted does not conflict.
 - Foreign keys are inherited. Checks stay inside the branch.
 - A branch cannot reference a table in its source database.
 - A transaction runs inside one database. It cannot span a branch and its
@@ -102,6 +107,10 @@ DROP DATABASE feature_checkout;
   DatabaseHasLiveDescendants`.
 - A branch drop is immediate. `RELINK TO` cannot recover it. Confirm with the
   user before dropping a branch that holds unsaved work.
+- `DROP DATABASE` waits for any staged schema change on the database. It returns
+  only after its purge completes.
+- A transient failure of the descendant scan fails the drop with the retryable
+  `CADB0504`.
 - Dropping a branch releases its retention hold on the source.
 - In cluster mode, dropping a parent is fenced against concurrent branch
   creation. If the fence is indeterminate, the drop fails with a retryable

@@ -9,6 +9,8 @@ permissions of a CamusDB diagnostic tool.
 - SHOW QUERIES and CANCEL QUERY
 - SHOW CONNECTIONS
 - SHOW SLOW QUERIES
+- SHOW STATEMENT STATS
+- SHOW INDEX USAGE
 - SHOW ENGINE STATS
 - SHOW VARIABLES
 - Operator dashboard
@@ -22,6 +24,8 @@ permissions of a CamusDB diagnostic tool.
 | `SHOW CONNECTIONS` | Which client sockets are open, idle, or busy | Node; `SHOW CLUSTER CONNECTIONS` for all | No; users see their own rows | No |
 | `CANCEL QUERY '<id>'` | Stops a running read | Any node forwards it | No; users cancel their own | No |
 | `SHOW SLOW QUERIES` | Which statements crossed a threshold, and why | Node | Yes | Yes |
+| `SHOW STATEMENT STATS` | Running totals per statement shape | Node | Yes | Yes |
+| `SHOW INDEX USAGE` | Which indexes statements read and write | Node | Yes | No |
 | `SHOW ENGINE STATS` | Kahuna and Kommander metrics since process start | Node | Yes | No |
 | `SHOW VARIABLES` | Effective configuration and its source | Node | Yes (`CADB0517` otherwise) | No |
 | Operator dashboard | Browser view of the above | Node | Four panels | No |
@@ -66,7 +70,8 @@ Facts:
   shows a growing `rows_returned`.
 - Only reads (`SELECT`, `SHOW`, `EXPLAIN ANALYZE`) are cancellable. They stop at
   the next row boundary. Writes and schema changes run to commit or rollback.
-- The cancelled client gets `CADB0554`. Buffered rows may still arrive first.
+- The cancelled client gets `CADB0554`. Buffered rows may still arrive first. A
+  cancelled statement aborts its explicit transaction.
 - Not listed: typed row APIs (`/query`, `/insert`, `/update`, `/delete`, gRPC
   `CamusRows`), worker-side distributed scans, and idle explicit transactions.
 - There is no `KILL CONNECTION`.
@@ -78,6 +83,10 @@ Runtime settings (change with `SET CLUSTER SETTING`):
 | `query_activity_enabled` | `true` |
 | `query_activity_max_sql_length` | `1024` |
 | `cluster_activity_peer_timeout_ms` | `2000` |
+| `cluster_activity_max_concurrent_fan_outs` | `8` |
+
+A cluster form past the fan-out cap fails with `CADB0558` (HTTP 503). It is safe to
+retry. A value of `0` disables the cap. The local forms are never refused.
 
 ## SHOW CONNECTIONS
 
@@ -100,7 +109,9 @@ One gRPC channel usually appears as one row, even with many concurrent calls.
 
 ## SHOW SLOW QUERIES
 
-Enable in `config.yml`:
+Enable it in `config.yml`, or run `SET CLUSTER SETTING slow_query_log_enabled =
+true`. The next statement is recorded, with no restart.
+`slow_query_log_max_entries` needs a restart. The other three apply at once.
 
 ```yaml
 slow_query_log_enabled: true        # default false
@@ -134,6 +145,83 @@ Facts: newest first; memory only, lost on restart; node-local; not an audit
 log; `SHOW SLOW QUERIES` itself is never recorded. If `seq` jumped by more than
 the ring size between reads, entries were overwritten.
 
+## SHOW STATEMENT STATS
+
+Running totals for each literal-free statement shape, like PostgreSQL's
+`pg_stat_statements`. It finds fast statements that the slow query log never sees.
+
+```yaml
+statement_stats_enabled: true       # default false, runtime
+statement_stats_max_shapes: 2000    # restart to change
+```
+
+```sql
+SET CLUSTER SETTING statement_stats_enabled = true;
+SHOW STATEMENT STATS;
+SHOW STATEMENT STATS LIKE '%FROM orders%';
+```
+
+| Column | Meaning |
+| --- | --- |
+| `node`, `database` | Context. |
+| `shape_id` | 16-character fingerprint. The same across nodes and restarts, for one build. |
+| `kind` | `select`, `insert`, `update`, or `delete`. |
+| `sample_sql` | Text of the first statement seen for the shape. Passwords masked. |
+| `calls`, `errors` | Executions that ended, and those that failed. |
+| `total_ms`, `sum_sq_ms` | Sum of durations, and of squared durations. |
+| `min_ms`, `max_ms` | Shortest and longest duration. |
+| `mean_ms`, `stddev_ms`, `cv` | Derived over the whole life of the shape. `cv` = stddev / mean. |
+| `rows_read`, `rows_returned` | Rows read from storage, and rows returned or affected. |
+| `full_scans`, `spills` | Executions that read a whole relation, or spilled. |
+| `retries` | Failures with `CADB0502`, `CADB0504`, or `CADB0505`. |
+| `plan_changes`, `last_plan` | Executions whose plan differed from the one before, and a hash of the last plan. |
+| `first_seen_at`, `last_seen_at` | ISO-8601 UTC. |
+
+Facts:
+
+- It records `SELECT`, `INSERT`, `UPDATE`, and `DELETE`. Schema changes, transaction
+  control, and `SHOW` are not recorded.
+- Literals become `?`. A constant list becomes `?*`, so `IN` lists of any length are
+  one shape.
+- Rows come back sorted by `cv`, highest first. A high `cv` means two regimes, such
+  as a changing plan or a cold cache.
+- Totals are cumulative. Read twice and subtract for a window.
+- The table never evicts. When full, a new shape is dropped.
+  `statement_stats.dropped` in `SHOW ENGINE STATS` counts it.
+- Memory only, lost on restart. Node-local. Inspect each node.
+
+## SHOW INDEX USAGE
+
+Counts reads and writes per index, like PostgreSQL's `pg_stat_user_indexes`. It is
+on by default (`index_usage_enabled`, runtime, node-scoped).
+
+```sql
+SHOW INDEX USAGE;
+SHOW INDEX USAGE FROM orders;
+```
+
+| Column | Meaning |
+| --- | --- |
+| `node`, `database`, `table` | Context. |
+| `index`, `unique` | Index name (`~pk` for the primary key), and whether it is unique. |
+| `reads` | Statement reads opened through the index. |
+| `constraint_reads` | Reads that enforce a unique key or a foreign key. |
+| `entries_read` | Index entries returned by all reads. |
+| `last_read_at` | Newest read or constraint read. `NULL` when there was none. |
+| `writes` | Index entries written or removed by DML. |
+| `tracked_since` | When this node started counting the index. |
+
+Facts:
+
+- An index is a candidate to drop when, over a long window on every node, `reads`
+  and `constraint_reads` are 0 and `writes` is not 0.
+- A unique index enforces a constraint. Zero reads does not make it removable.
+- Compare the window with `tracked_since`. Zero reads since an hour ago proves
+  nothing.
+- A full table scan counts on no index. `EXPLAIN` without `ANALYZE` counts nothing.
+- A transaction that rolls back still shows the writes it staged.
+- Memory only, zero at node start. Node-local.
+
 ## SHOW ENGINE STATS
 
 ```sql
@@ -147,7 +235,7 @@ SHOW ENGINE STATS LIKE 'kahuna.range%';
 | Column | Meaning |
 | --- | --- |
 | `node` | Local Raft endpoint. |
-| `source` | `kommander` or `kahuna`. |
+| `source` | `kommander` or `kahuna`. `camusdb` for the `statement_stats.*` rows. |
 | `metric` | Instrument name. |
 | `tags` | Sorted `k=v` pairs. |
 | `kind` | `counter`, `histogram`, or `gauge`. |
@@ -179,6 +267,7 @@ Useful metrics:
 | `kahuna.backup.*` | Backup or PITR cycles. |
 | `kahuna.tx_admission.queued` | Waiters at the admission gate, by priority. Zero means the gate does not bind. |
 | `kahuna.tx_admission.in_flight`, `max_queue_depth`, `admitted`, `aged_promotions`, `abandoned_while_waiting`, `rejected_queue_full` | Admission detail. |
+| `statement_stats.shapes`, `statement_stats.dropped` | Shapes held, and new shapes refused because the table was full. A moving `dropped` means `SHOW STATEMENT STATS` is incomplete. Present when statement statistics were enabled. |
 | `kahuna.range.splits`, `kahuna.range.split.indivisible_refusals`, `kahuna.range.split.no_relief_skips`, `kahuna.range.split.settle_skips`, `kahuna.range.merge.warm_skips` | Range splitter activity, with key-range sharding. Pair with `SHOW RANGES`. |
 
 The `kahuna.collect.*` metrics arrive only in a Kahuna release after `0.9.8`.
@@ -213,6 +302,8 @@ Facts:
   `RESET CLUSTER SETTING name`. A `config.yml` edit needs a restart.
 - A `restart` setting changed at runtime shows the new value, but the node obeys
   the old one until it restarts.
+- `key_range_sharding` left unset follows the cluster's recorded routing mode. It
+  then shows `source = cluster`.
 
 ## Operator dashboard
 
@@ -276,6 +367,8 @@ Docs:
 
 - https://camusdb.github.io/docs/query-activity
 - https://camusdb.github.io/docs/slow-query-log
+- https://camusdb.github.io/docs/statement-stats
+- https://camusdb.github.io/docs/index-usage
 - https://camusdb.github.io/docs/engine-stats
 - https://camusdb.github.io/docs/show-variables
 - https://camusdb.github.io/docs/operator-dashboard

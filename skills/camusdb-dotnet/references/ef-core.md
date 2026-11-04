@@ -1,6 +1,6 @@
 # CamusDB EF Core provider
 
-Read this file when you configure a `DbContext`, map entities, write migrations, or check LINQ support.
+Read this file when you configure a `DbContext`, map entities, use JSONB or vectors, write migrations, or check LINQ support.
 Package: `CamusDB.EntityFrameworkCore` (targets `net10.0`, EF Core 10 relational).
 Namespace: `CamusDB.EntityFrameworkCore`.
 Source docs: https://camusdb.github.io/docs/ef-core
@@ -57,6 +57,10 @@ await strategy.ExecuteAsync(async () =>
 
 `CADB0509` is not replayed. The commit is re-issued on the same transaction.
 
+Any failed statement aborts an explicit transaction, and the server rolls it back at once.
+Do not catch `DbUpdateException` inside the body and call `SaveChangesAsync()` again.
+The next statement or commit fails with `CADB0400` ("Unknown transaction"), which the strategy does not retry. Let the exception leave the body.
+
 ## Map entities
 
 ```csharp
@@ -91,15 +95,67 @@ Supported:
 - Inner, left, right, and cross joins. Correlated subqueries such as `o.Items.Any(...)`.
 - `ids.Contains(e.Id)` expands to `IN (@p0, @p1, ...)`.
 - String methods: `StartsWith`, `EndsWith`, `Contains`, `ToUpper`, `ToLower`, `Trim`, `TrimStart`, `TrimEnd`, `Replace`, `Length`.
+- String concatenation: `a + b` and `string.Concat(...)` translate to `||` since 0.16.8. It needs a server from 2026-10-12 or later.
+- String interpolation: `$"{a} {b}"` translates to `||` since 0.16.9.
+- Set operators: `Union`, `Concat`, `Intersect`, and `Except` translate to `UNION`, `UNION ALL`, `INTERSECT`, and `EXCEPT`.
 - `string.Compare(...)` and `CompareTo` against zero, for keyset pagination.
 - Regex: `Regex.IsMatch`, `Regex.Replace`, `EF.Functions.RegexpLike`, `RegexpReplace`, `RegexpCount`, `RegexpSubstr`, `RegexpInstr`.
 - Vectors: `EF.Functions.L2Distance`, `CosineDistance`, `InnerProduct`, `VectorDims`, `OctetLength`. Pair `OrderBy(distance)` with `Take(k)`.
+- JSON: `EF.Functions.JsonContains`, `JsonContained`, `JsonExists`, `JsonExistAny`, `JsonExistAll`, `JsonTypeof`.
 
 Not supported:
 
-- Lateral joins, window functions, `UNION`, `UNION ALL`.
-- Per-row `Take`, `Skip`, or `First` inside a collection, such as filtered includes.
+- Lateral joins. A `SelectMany` correlated outside an equality key throws `InvalidOperationException`.
+- Per-row `Take`, `Skip`, or `First` inside a collection, such as filtered includes. EF Core would write `ROW_NUMBER()` for it, and the provider refuses that shape.
+- Window functions in LINQ. The server has them. Use raw SQL.
 - A LINQ predicate over an `ARRAY(T)` property.
+- Member access on a document, such as `e.Payload.RootElement.GetProperty("kind")`, and the `->` and `->>` operators. Use `FromSql`.
+- `ToJson()` mapping of owned and complex types.
+
+The provider has no LINQ API for these statements. Send them as raw SQL:
+
+- `INSERT ... ON CONFLICT` and `UPSERT INTO`.
+- `SELECT ... FOR UPDATE`, with `NOWAIT` or `SKIP LOCKED`.
+
+Interpolation limits:
+
+- It needs plain `{0}` placeholders, literal text, and arguments that are strings or integers.
+- A format, an alignment, or another argument type is not translated.
+- In the final `Select`, EF Core then builds the text on the client. In `Where`, `OrderBy`, or a join, the query throws `InvalidOperationException`.
+
+## JSONB
+
+A `JsonDocument`, `JsonElement`, `JsonNode`, `JsonObject`, or `JsonArray` property maps to `JSONB`.
+A `string` property needs `HasColumnType("jsonb")`.
+
+```csharp
+modelBuilder.Entity<Event>(b =>
+{
+    b.Property(e => e.Payload);                  // JsonDocument -> JSONB
+    b.HasIndex(e => e.Payload).HasMethod("gin"); // CREATE INDEX ... USING GIN (Payload)
+});
+
+var logins = await ctx.Events
+    .Where(e => EF.Functions.JsonContains(e.Payload, """{"kind": "login"}"""))
+    .ToListAsync();
+```
+
+- A value reads back with canonical spacing and key order.
+- A change inside a `JsonNode` is saved. Replace a whole `JsonDocument` or `JsonElement` value to change it.
+- A GIN index has one column and cannot be unique. `EnsureCreated` creates no model index.
+
+## Vectors
+
+`IsVector(dimensions)` declares a `float[]` or `byte[]` property as a float32 vector.
+
+```csharp
+b.Property(c => c.Embedding).IsRequired().IsVector(1536, loadWithEntity: false);
+```
+
+- It sets `BYTES(dimensions x 4)`, `STORAGE PLAIN`, and a dimension `CHECK` named `CK_{table}_{column}_dims`.
+- With `loadWithEntity: false`, an entity query reads `NULL` for the vector, and `SaveChanges` never writes that `null` back.
+- `loadWithEntity: false` needs a required property. A query that names the vector still reads it.
+- See the `camusdb-vector-search` skill for search design.
 
 ## Bulk update and delete
 
@@ -141,7 +197,9 @@ The cache serves single-table autocommit reads only. Joins, views, and explicit 
 | Add / drop check constraint | `ADD CONSTRAINT ... CHECK (...)`, `DROP CONSTRAINT` |
 | Add / drop foreign key | `ADD CONSTRAINT ... FOREIGN KEY ... REFERENCES`, `DROP CONSTRAINT` |
 | Unique constraint / alternate key | `CREATE UNIQUE INDEX`, `ALTER TABLE ... DROP INDEX` |
-| Create / drop / rename index | `CREATE [UNIQUE] INDEX IF NOT EXISTS`, `DROP INDEX`, `RENAME INDEX ... TO` |
+| Create / drop / rename index | `CREATE [UNIQUE] INDEX IF NOT EXISTS`, `ALTER TABLE ... DROP INDEX`, `RENAME INDEX ... TO` |
+| Column storage | Inline `STORAGE X`, `ALTER COLUMN ... SET STORAGE X` (`HasStorage(...)`) |
+| Rewrite stored rows | `migrationBuilder.RewriteStorage(...)` runs `ALTER TABLE ... REWRITE STORAGE [INLINE]` |
 | Comments | `COMMENT ON TABLE / COLUMN / INDEX ... IS ...` |
 | Views | `migrationBuilder.CreateView(...)`, `DropView(...)`, `RenameView(...)` |
 | Truncate | `migrationBuilder.TruncateTable(...)` |
@@ -162,6 +220,9 @@ Refresh a materialized view with `ctx.Database.ExecuteSqlRawAsync("REFRESH MATER
 ## Other helpers
 
 - `await ctx.Database.TruncateTableAsync("table");` then `ctx.ChangeTracker.Clear();`. It cannot run inside an explicit transaction.
+- `await ctx.Database.RewriteStorageAsync("table");` converts stored rows. Pass `inline: true` for the inline form.
+- Procedures: `await ctx.Database.ExecuteSqlAsync($"CALL transfer({from}, {to}, {amount})");`.
+- Extension functions: map with `HasDbFunction(...).HasName("slugify")`. The provider has no model API for triggers.
 - Index comments: `b.HasIndex(u => u.Email, "email_idx").HasComment("...")`.
 - Table and column comments use EF Core `HasComment`.
 

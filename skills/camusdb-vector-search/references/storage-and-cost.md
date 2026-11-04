@@ -18,7 +18,7 @@ Bytes = dimensions × 4. A bare `BYTES` column allows up to 10,485,760 bytes.
 
 ## Storage strategies
 
-Each `STRING`, `BYTES` and `ARRAY` column has one strategy.
+Each `STRING`, `BYTES`, `JSONB` and `ARRAY` column has one strategy.
 
 | Strategy | Compresses | Out of line | Use for vectors when |
 | --- | --- | --- | --- |
@@ -65,6 +65,8 @@ ALTER TABLE docs REWRITE STORAGE;
 `REWRITE STORAGE` runs in transactions of `large_value_rewrite_batch_rows`. It
 is idempotent and resumable. It can make concurrent writes retry with
 `CADB0502 TransactionConflict`. Run it in a quiet period.
+
+EF Core `IsVector` sets `STORAGE PLAIN` for you. A later `HasStorage` replaces it.
 
 `SHOW CREATE TABLE` shows a strategy that was set explicitly. A strategy on a
 non-variable-length column fails with `CADB0414 ColumnStorageNotApplicable`.
@@ -115,11 +117,14 @@ Example: 200,000 candidate rows × 240 ns ≈ 48 ms of distance work.
 5. Avoid `OFFSET` for deep pages. The `topk` keeps `offset + limit` rows.
 6. In a cluster, run the query on a node near the data. The coordinator ranks
    every qualifying row, and there is no distributed top-k.
+7. In EF Core, use `IsVector(n, loadWithEntity: false)` when list pages do not read the
+   vector.
 
 ## What does not help
 
 - A secondary index on the embedding column. Distance is not an
   order-preserving function of the bytes.
+- A GIN index. It needs a `jsonb` column.
 - Changing `k`. `LIMIT 10` and `LIMIT 100` measure the same.
 - `{cache=...}` result-cache hints, unless the same query vector repeats. The
   cache key includes every bound value.

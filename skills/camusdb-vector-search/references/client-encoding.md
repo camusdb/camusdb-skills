@@ -1,7 +1,20 @@
 # Encoding vectors in client code
 
+Use the driver helper to pack an embedding, then bind it as a parameter. The
+driver handles the transport encoding:
+
+| Driver | Bind an embedding |
+| --- | --- |
+| .NET | `CamusVector.ToBytes(embedding)`, passed as a `ColumnType.Bytes` parameter. Dapper also offers `CamusValue.Vector(embedding)`. |
+| TypeScript | `camus.vector(embedding)`, passed in the named parameter object. |
+| Python | Bind packed float32 bytes as a Python `bytes` value. Python has no vector-packing helper. |
+
+The .NET and TypeScript drivers prepare repeated statements automatically.
+
+The rest of this file is for custom vector producers and client implementers.
 Every client must write the same layout: packed float32 elements, each
 little-endian, no header, no padding. The dimension is `byteLength / 4`.
+A 768-dimension embedding occupies 3,072 bytes.
 
 ## Transport encodings
 

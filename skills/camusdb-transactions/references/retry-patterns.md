@@ -3,6 +3,11 @@
 Read this file when you write or review the retry code for a CamusDB
 transaction. It gives the full contract, then one version per client.
 
+Use the driver helpers in application code. The .NET, TypeScript, and Python
+helpers recognize retryable conflicts and replay your callback, so you do not
+write a loop or a backoff. A hand-written loop is for a client that manages the
+transaction lifecycle itself, or that speaks HTTP or gRPC without a helper.
+
 ## Contents
 
 - The contract
@@ -10,6 +15,7 @@ transaction. It gives the full contract, then one version per client.
 - Backoff
 - .NET driver
 - TypeScript connector
+- Python driver
 - Raw HTTP
 - gRPC
 - Review checklist
@@ -21,9 +27,9 @@ transaction. It gives the full contract, then one version per client.
 | `CADB0502` `TransactionConflict` | A lock conflict, a conflicting concurrent write, a commit that returned `Aborted`, or a table that gained an index or a constraint or changed its row layout. | Dead. Nothing committed. | Roll back. Replay from `BEGIN`. |
 | `CADB0504` `TransactionMustRetry` | A transient condition exhausted internal retries: start, admission, routing, leader transition, transport, lock-wait or replication-wait deadline, storage write conflict before the write, a read that waited too long for a commit, an unservable read range, or a schema leader change during DDL. | Dead. Nothing written. | Roll back. Replay from `BEGIN` with backoff. |
 | `CADB0505` `TransactionLifetimeExceeded` | A serializable read-write transaction passed its lifetime cap (1 hour by default). | Dead. | Roll back. Replay from `BEGIN`. Shorten it. |
-| `CADB0509` `TransactionFinalizeUnresolved` | A `COMMIT` or `ROLLBACK` has no final answer after the server's own retries. | Unknown. It may have committed. | Send the same finalize again, on the same transaction id. |
+| `CADB0509` `TransactionFinalizeUnresolved` | A `COMMIT` or `ROLLBACK` has no final answer after the server's own retries. | Unknown. It may have committed. | The driver's commit or rollback method resends the same finalize, with bounded retries. If the error still reaches you, send the same finalize again, on the same transaction id. Never replay the callback. |
 | `CADB0506` `TransactionMutationLimitExceeded` | The transaction would pass the mutation cap. | Rejected before storage. | Do not retry. Split the work. |
-| `CADB0503` `SchemaCatchingUp` | The node is more than one schema version behind. | Rejected. | Retry later, or on another node. |
+| `CADB0503` `SchemaCatchingUp` | The node is more than one schema version behind. | Rejected. | Not in the helpers' automatic set. Retry after the node catches up, or on another node. |
 | `CADB0555` `LockNotAvailable` | `SELECT ... FOR UPDATE NOWAIT` met a held row. | Dead. | Roll back. Do not replay automatically: `NOWAIT` asked not to wait. Let the application decide. |
 | `CADB0558` `ConcurrencyLimitExceeded` | `BEGIN` passed `max_open_explicit_transactions` on the node. | Not started. | Retry after a back-off. |
 | `CADB0824` `TransactionRollbackOnly` | A statement, or the commit, ran after an earlier statement failed. | Dead. A commit rolled it back. | Roll back. Fix the code that swallowed the error. Handle the error that the message names. |
@@ -71,12 +77,13 @@ COMMIT                             # refused, nothing is stored
 Choose one of these instead:
 
 - Prevent the expected error in SQL, with `INSERT ... ON CONFLICT` or `UPSERT INTO`.
-- Let the error reach the loop. The loop rolls back, then replays or raises.
+- Let the error reach the retry helper or loop. It rolls back, then replays or raises.
 - To run a fallback, roll back first. Then do the fallback in a new transaction.
 
 ## Backoff
 
-Both driver helpers use the same schedule:
+The .NET and TypeScript helpers use this schedule (the Python helper also uses
+bounded exponential backoff with jitter):
 
 ```text
 delay = min(20 ms * 2^attempt, 400 ms), plus or minus 25 percent jitter
@@ -91,37 +98,31 @@ Jitter stops conflicting clients from retrying in step. Always back off on
 Package namespace: `CamusDB.Client`. The exception type is `CamusException`,
 with a `Code` property.
 
-Single-statement work:
+The recommended form: keep the transaction inside the callback, so each attempt
+starts fresh. Disposal rolls back unfinished work.
 
 ```csharp
+using CamusDB.Client;
+
 await SerializableRetryHelper.ExecuteAutocommitAsync(async ct =>
 {
-    CamusTransaction tx = await connection.BeginTransactionAsync(ct);
-    try
-    {
-        await using CamusCommand update = connection.CreateCamusCommand("""
-            UPDATE robots SET price = @price WHERE name = @name
-            """);
-
-        update.Transaction = tx;
-        update.Parameters.Add("@price", ColumnType.Float64, 99.0);
-        update.Parameters.Add("@name", ColumnType.String, "T-800");
-
-        await update.ExecuteNonQueryAsync(ct);
-        await tx.CommitAsync(ct);
-    }
-    catch
-    {
-        await tx.RollbackAsync(ct);
-        throw;
-    }
-}, maxAttempts: 5, cancellationToken);
+    await using var tx = await connection.BeginTransactionAsync(ct);
+    await using var command = connection.CreateCamusCommand("""
+        UPDATE products SET stock = stock - 1 WHERE name = @name AND stock > 0
+        """);
+    command.Transaction = tx;
+    command.Parameters.Add("@name", ColumnType.String, "kettle");
+    await command.ExecuteNonQueryAsync(ct);
+    await tx.CommitAsync(ct);
+}, maxAttempts: 5);
 ```
 
-A generic overload `ExecuteAutocommitAsync<T>(Func<CancellationToken, Task<T>>,
-int maxAttempts = 5, CancellationToken)` returns a value.
+For a single autocommit statement, the callback can run the command without an
+explicit transaction. A generic overload
+`ExecuteAutocommitAsync<T>(Func<CancellationToken, Task<T>>, int maxAttempts = 5,
+CancellationToken)` returns a value.
 
-A multi-statement transaction needs your own loop:
+If you own the loop, use `IsRetryable` and replay every read and write:
 
 ```csharp
 const int MaxAttempts = 5;
@@ -235,7 +236,44 @@ await withRetry(async (attempt) => {
 
 Docs: https://camusdb.github.io/docs/typescript-connector
 
+## Python driver
+
+Package: `camusdb` (`camusdb-py`). Start with no transaction open. The helper
+begins and commits each attempt, and rolls back on failure:
+
+```python
+import camusdb
+
+
+def reserve_kettle(conn):
+    return conn.execute(
+        "UPDATE products SET stock = stock - 1 WHERE name = @name AND stock > 0",
+        {"name": "kettle"},
+    ).rowcount
+
+
+with camusdb.connect(
+    endpoint="http://localhost:5095", database="shop", autocommit=True,
+) as conn:
+    changed = camusdb.run_transaction(conn, reserve_kettle, max_attempts=5)
+```
+
+- For asyncio, pass an async callback to
+  `await camusdb.aio.run_transaction(conn, callback, max_attempts=5)`.
+- `CADB0502`, `CADB0504`, and `CADB0505` map to `SerializationFailure`, a
+  subclass of `OperationalError`. `camusdb.is_retryable(exc)` supports a custom
+  loop.
+- `commit()` retries an unresolved finalize (`CADB0509`). It does not replay the
+  callback.
+- After a statement failure, the driver refuses more statements until
+  `rollback()` clears the failed state. A commit of the failed transaction raises
+  `InternalError`.
+
+Docs: https://camusdb.github.io/docs/python-driver#transactions-and-retries
+
 ## Raw HTTP
+
+Read this section only for a custom client. The drivers do these steps for you.
 
 1. `POST /start-transaction` with `databaseName` and optional
    `isolationLevel`, `transactionMode`, `locking`, `priority`.
@@ -289,4 +327,6 @@ https://camusdb.github.io/docs/sql-transactions#failed-statements
 - [ ] `CADB0506` is not retried. The code splits the work instead.
 - [ ] Backoff with jitter is present, and attempts are bounded.
 - [ ] Rollback runs on every failure path.
-- [ ] All statements of one transaction go to one node.
+- [ ] All statements of one transaction go to one node. The drivers do this; a
+      custom protocol client must do it itself.
+- [ ] Application code uses the driver's retry helper, not a hand-written loop.

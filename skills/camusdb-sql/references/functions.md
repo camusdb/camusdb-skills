@@ -15,8 +15,12 @@ Source pages: https://camusdb.github.io/docs/functions and each
 - A function works anywhere a value works: projection, `WHERE`, `GROUP BY`,
   `HAVING`, `DEFAULT`, `CHECK`.
 - Most functions return `NULL` when an argument is `NULL`. Exceptions are noted.
-- CamusDB checks the argument count and types at execution, not at parse. It
-  checks the result types of `CASE`, `COALESCE`, `IFNULL`, and `IF` at bind.
+- An unknown function (`CADB0407`) or a wrong argument count (`CADB0400`) fails
+  before any row is read, also on an empty table. Argument types known from
+  literals, casts, or columns are checked then too. Parameters and some argument
+  types are checked when the value arrives. See [expressions.md](expressions.md).
+- Inline C# functions (`CREATE FUNCTION ... LANGUAGE csharp`) share this namespace.
+  They are in the `camusdb-csharp-extensions` skill.
 - Volatile functions fall into three groups:
   - Per call: `gen_id()`, `gen_uuid_v4()`, `gen_uuid_v7()`, `random()`,
     `gen_random_bytes(n)`, `clock_timestamp()`, `sysdate()`. Do not use them in a
@@ -63,12 +67,14 @@ Every other pair fails with `CADB0400`: `5 = '5'`, `0.0 = '0.0'`, `bool_col = 1`
 
 - The rule covers `=`, `<>`, `<`, `<=`, `>`, `>=`, `BETWEEN`, `IN`, `NOT IN`, simple
   `CASE`, `NULLIF`, `= ANY`, `array_contains`, `JOIN ... ON`, and `HAVING`.
-- A `CHECK` that compares such a pair rejects the row with `CADB0303`.
+- A new `CHECK` that compares such a known pair fails at definition. A type error
+  while an existing `CHECK` runs rejects the row with `CADB0303`.
 - `x IN (a, b)` evaluates both items, so `1 IN (1, 'a')` fails.
 - A simple `CASE` stops at the first match, so `CASE 5 WHEN 5 THEN 1 WHEN 'a' THEN 2 END`
   returns 1.
 - A `NULL` operand gives UNKNOWN before any type check: `NULL = 'a'` is `NULL`.
-- The check runs when values compare. A predicate over an empty table raises nothing.
+- Known incompatible types fail before any row is read, also on an empty table.
+  Types known only from values, such as parameters, are checked when compared.
 
 ## Session
 
@@ -85,18 +91,33 @@ A query with a session function bypasses the result cache.
 
 | Function | Returns | Meaning |
 | --- | --- | --- |
-| `length(text)` | `INT64` | Character count. For `BYTES`, byte count. |
+| `length(text)` | `INT64` | Unicode code points; an emoji counts as one. For `BYTES`, byte count. |
 | `octet_length(x)` | `INT64` | Byte count. For a string, UTF-8 bytes. |
 | `bit_length(x)` | `INT64` | 8 × bytes of `BYTES`, or of UTF-8 text. |
 | `lower(text)`, `upper(text)` | `STRING` | Case change, invariant rules. |
-| `trim(x [, set])`, `ltrim(...)`, `rtrim(...)` | same as input | No set: strip white space (text) or `0x00` (bytes). With set: strip those characters or bytes. |
-| `substring(x, start [, length])` | same as input | 1-based. `start < 1` and negative `length` are invalid. |
+| `trim(x [, set])`, `ltrim(...)`, `rtrim(...)` | same as input | No set: strip white space (text) or `0x00` (bytes). With set: strip those code points or bytes. |
+| `substring(x, start [, length])`, `substr(...)` | same as input | 1-based, in code points (text) or bytes. See below. |
 | `replace(text, search, replacement)` | `STRING` | Replace every ordinal match. |
-| `strpos(x, part)` | `INT64` | 1-based position of `part`, or `0`. |
+| `strpos(x, part)` | `INT64` | 1-based code-point position of `part`, or `0`. |
 | `position(part IN x)` | `INT64` | Same as `strpos(x, part)`. `x` cannot start with `(`. |
 | `contains(x, part)` | `BOOL` | Ordinal substring test. Both arguments must have the same type. |
 | `starts_with(x, prefix)`, `ends_with(x, suffix)` | `BOOL` | Ordinal prefix or suffix test. |
 | `concat(value, ...)` | `STRING` | Joins scalars by their text form. Skips `NULL`; `NULL` only if all are `NULL`. An array fails. |
+| `like_escape(pattern, escape)` | `STRING` | A `LIKE` pattern with a custom escape, in backslash form. `ESCAPE` uses it. |
+
+`substring` and `substr` follow PostgreSQL. A start below 1 uses up that part of
+the length. Without a length, a start below 1 returns the whole value. A start
+past the end returns an empty value. A negative length fails with `CADB0400`.
+
+```sql
+SELECT substr('abcde', 0, 2);      -- 'a'
+SELECT substring('abcde', -1, 3);  -- 'a'
+SELECT substring('x🙂y', 2, 1);    -- '🙂'
+SELECT ltrim('🙂x', '😀');          -- '🙂x', the set counts code points
+```
+
+Text positions count code points, but sorting uses binary UTF-16 order. See
+"Text and Unicode" in [expressions.md](expressions.md).
 
 `a || b` also joins text, but a `NULL` operand gives `NULL`. See "Operators" below.
 
@@ -114,10 +135,11 @@ text that reads back as the same value. A `datetime` has seven fractional digits
 | `a << n`, `a >> n` | two `INT64` | Shifts. The count is modulo 64. `>>` keeps the sign. |
 | `-a` | a number | Negation. The smallest `INT64` fails with `CADB0420`. |
 
-- `^` is not an operator. Use `#` for XOR and `power()` for a power.
+- `a ^ b` is power, the same as `pow(a, b)`. It binds tighter than `*`. Use `#` for XOR.
 - A float, `NUMERIC`, `BOOL`, or `STRING` operand of a bitwise operator fails.
-- `||` and the bitwise operators share one level, below `+` and `-`. So
-  `6 | 1 & 3` is `(6 | 1) & 3`, and `1 << 1 + 1` is `1 << 2`.
+- `||`, the bitwise operators, the regex operators, and the `jsonb` operators share
+  one level, below `+` and `-`. So `6 | 1 & 3` is `(6 | 1) & 3`, and `1 << 1 + 1` is
+  `1 << 2`. The full table is in [expressions.md](expressions.md).
 - Prefix `~` binds as tightly as unary minus: `~a + 1` is `(~a) + 1`. PostgreSQL
   reads it as `~(a + 1)`. Add parentheses.
 
@@ -137,17 +159,25 @@ Arguments are `INT64`, `FLOAT64`, or `NUMERIC`.
 | `ceil(v)` / `ceiling(v)` | same type | Round up. |
 | `floor(v)` | same type | Round down. |
 | `round(v)` | same type | Nearest integer, half away from zero. |
-| `round(v, scale)` | `FLOAT64` or `NUMERIC` | Round to `scale` places. Negative scale rounds left of the point. |
-| `trunc(v [, scale])` | same / `FLOAT64` or `NUMERIC` | Truncate toward zero. |
+| `round(v, scale)` | `NUMERIC` for `INT64` or `NUMERIC` input, `FLOAT64` for a float | Round to `scale` places. Negative scale rounds left of the point. `round(15, -1)` is `NUMERIC` 20. |
+| `trunc(v [, scale])` | same type | Truncate toward zero. `INT64` input stays `INT64`. |
 | `sqrt(v)` | `FLOAT64` | Square root. Negative input fails. |
-| `pow(b, e)` / `power(b, e)` | `FLOAT64` | Power. Overflow or underflow fails with `CADB0421`. `pow(0, y)` for a negative `y` and a negative `b` with a non-integer `e` fail with `CADB0400`. |
+| `pow(b, e)` / `power(b, e)` / `b ^ e` | `FLOAT64` | Power. Overflow or underflow fails with `CADB0421`. `pow(0, y)` for a negative `y` and a negative `b` with a non-integer `e` fail with `CADB0400`. |
+| `ln(v)` | `FLOAT64` | Natural logarithm. |
+| `log10(v)`, `log(v)` | `FLOAT64` | Base-10 logarithm. |
+| `log(base, v)` | `FLOAT64` | Base first, as in PostgreSQL: `log(2, 8)` is 3. GoogleSQL uses the other order. |
+| `exp(v)` | `FLOAT64` | e raised to `v`. Overflow or underflow to zero fails with `CADB0421`. |
 | `mod(a, b)` and `a % b` | `INT64`, `NUMERIC`, or `FLOAT64` | Remainder with the dividend's sign. Zero divisor fails. |
 | `sign(v)` | `INT64` | `-1`, `0`, or `1`. `sign(NaN)` fails. |
 | `random()` | `FLOAT64` | Volatile, in `[0.0, 1.0)`. |
 
+Logarithms and `exp` return `FLOAT64`, also for `NUMERIC` input. A logarithm
+refuses zero and negative arguments, and a base of 1.
+
 `INT64` arithmetic never wraps: a result past the range fails with `CADB0420`.
 Float arithmetic that overflows or underflows from finite values fails with
-`CADB0421`. `x / 0` fails with `CADB0400`. See "Float values" below.
+`CADB0421`. `x / 0` fails with `CADB0400`. With constant operands, it fails before
+any row is read. See "Float values" below.
 
 ## Float values
 
@@ -313,7 +343,7 @@ SELECT * FROM events WHERE day = CAST(str_to_date('June 17, 2024', '%M %e, %Y') 
 | Function | Returns | Meaning |
 | --- | --- | --- |
 | `to_string(v)` | `STRING` | From any scalar, by its text form. An array fails. |
-| `to_int64(v)` | `INT64` | Same as `CAST(v AS int64)`. A float or NUMERIC rounds half away from zero; bool → 1/0. |
+| `to_int64(v)` | `INT64` | Same as `CAST(v AS int64)`. From `INT64`, `FLOAT64`, `FLOAT32`, `NUMERIC`, `BOOL`, or integer text. A float or `NUMERIC` rounds half away from zero; bool → 1/0. |
 | `to_float64(v)` | `FLOAT64` | From numbers, bool, numeric text. |
 | `to_float32(v)` | `FLOAT32` | From numbers or numeric text. |
 | `to_bool(v)` | `BOOL` | From bool, or `true`/`false` text in any case. |
@@ -322,8 +352,10 @@ SELECT * FROM events WHERE day = CAST(str_to_date('June 17, 2024', '%M %e, %Y') 
 | `to_bytes(v)` | `BYTES` | From bytes, or `0x`-prefixed hex text. |
 | `to_id(v)` / `str_id(v)` | `OID` | From an OID, or 24 lowercase hex characters. |
 
-`CAST` targets: `string`/`char`/`varchar`/`text`, `int`/`int64`/`integer`/`smallint`,
-`numeric`/`decimal`, `float`/`float64`/`double`, `float32`/`real`,
+`CAST` targets: `string`/`char`/`varchar`/`text`, `int64`/`bigint`,
+`int`/`integer` (an `INT64` value checked against the signed 32-bit range),
+`smallint` (checked against the signed 16-bit range), `numeric`/`decimal`,
+`float`/`float64`/`double`/`double precision`, `float32`/`real`,
 `bool`/`boolean`, `oid`/`id`/`object_id`, `uuid`/`guid`, `date`,
 `datetime`/`timestamp`, `bytes`/`blob`, `jsonb`/`json`. `x::type` accepts the same
 names.
@@ -333,6 +365,8 @@ names.
 `CAST(x AS int64)`, `x::int64`, and `to_int64(x)` use one rule. A number with a
 fraction rounds half away from zero: `2.5` gives `3`, and `-2.5` gives `-3`.
 
+- A narrow cast (`smallint`, `int`) rounds first, then checks the range:
+  `CAST(32768 AS SMALLINT)` fails with `CADB0420`.
 - PostgreSQL rounds a float half to even, so its result for `2.5` is `2`.
 - A string must spell an integer. `CAST('2.5' AS int64)` fails with `CADB0400`.
 - `NaN`, an infinity, and a result past the range fail with `CADB0420`.
@@ -355,8 +389,28 @@ SELECT IF(quantity > 0, 'in stock', 'sold out') AS availability FROM inventory;
 ```
 
 `IF` is the same as `CASE WHEN cond THEN a ELSE b END`. It evaluates only the selected
-result, so `IF(true, 1, 1 / 0)` returns `1`. A non-boolean condition fails. `COALESCE`
-and `IFNULL` evaluate every argument. `NULLIF` follows the `=` type rule.
+result. A non-boolean condition fails. `NULLIF` evaluates both arguments and follows
+the `=` type rule.
+
+`COALESCE`, `IFNULL`, and `NVL` evaluate from left to right and stop at the first
+non-`NULL` value:
+
+```sql
+SELECT COALESCE(1, 1 / 0);               -- 1; the fallback does not run
+SELECT COALESCE(NULL, 2);                -- 2
+SELECT COALESCE(1, nextval('s'));        -- does not advance s
+```
+
+- The stop does not skip a known type error: `COALESCE(1, upper('a'))` fails.
+- An uncorrelated subquery, an aggregate, or a window result can be computed before
+  the row expression. An unused fallback does not guard its errors:
+  `COALESCE(1, (SELECT id FROM orders))` can fail on many rows.
+- A correlated subquery's value error is raised only when the value is used.
+- A proven unused fallback or branch is skipped, also for a constant division by
+  zero: `IF(TRUE, 1, 1 / 0)` returns 1. A row-dependent condition does not hide a
+  constant division by zero. See [expressions.md](expressions.md).
+- `nextval` after a non-`NULL` literal or parameter that is proven returned draws
+  nothing. When the statement cannot prove that, it can draw a value and leave a gap.
 
 ### Result types
 
@@ -377,8 +431,11 @@ to it. A bad pair fails with `CADB0400`, also in a branch that never runs.
   not become a number. Write `CAST('2' AS INT64)`.
 - `COALESCE(date_col, '2026-01-01')` is a `DATE`. Only a literal converts: a `STRING`
   column with a `DATE` column fails.
-- A parameter or a function call is checked when its value is returned. A branch that
-  does not run is not checked then.
+- A built-in call with known argument types, or an extension function with a declared
+  C# return type, gives its result type even when unused. So `COALESCE(1, upper('a'))`
+  fails, and `COALESCE(1, sqrt(4.0))` is always `FLOAT64`.
+- A parameter, a call with unknown argument types, and `json_value` are checked when
+  the value arrives. A branch that does not run is not checked then.
 
 ## Object id and UUID
 
@@ -422,6 +479,12 @@ usually gives `NULL`, not an error.
 Flags: `i`, `c`, `m`, `n`, `s`, `x`, `g`. Unknown flags fail. The engine is
 .NET; use `\p{L}`, not `[[:alpha:]]`. `regexp_matches` and
 `regexp_split_to_table` are not supported.
+
+A start argument and a returned position count Unicode code points from 1. The match
+itself works on UTF-16 units: `regexp_count('🙂', '.')` is 2, and
+`regexp_like('🙂', '^.$')` is false, unlike PostgreSQL. A result that holds half a
+surrogate pair, or a position inside a pair, fails with `CADB0400`. Name the
+character in the pattern when you can.
 
 Write a pattern in a plain string with single backslashes. A plain string keeps
 each backslash as typed, so `'\d'` reaches the regex engine as `\d`. Do not
@@ -478,6 +541,9 @@ Hash a number with a cast first: `md5(x::text)`. These are not password hashes.
 | `currval('s')` | Last value this transaction drew from `s`. |
 | `lastval()` | Last value this transaction drew from any sequence. |
 | `setval('s', n [, is_called])` | Move the counter. Only as the whole projection of a `SELECT` without `FROM`. |
+
+A sequence call in a nested `SELECT` without `FROM` fails with `CADB0547`.
+`COALESCE(1, nextval('s'))` does not advance `s`. See "Null handling" above.
 
 See the `camusdb-schema-design` skill for sequences and identity columns.
 

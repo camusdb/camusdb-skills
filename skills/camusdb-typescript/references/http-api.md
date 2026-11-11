@@ -1,6 +1,10 @@
 # CamusDB HTTP (REST/JSON) API
 
 Read this file before you write a raw HTTP client in any language, or a curl script.
+The docs call this page the HTTP/JSON protocol reference. It is for driver authors, custom clients
+in languages without a driver, health probes, and endpoint diagnostics. Application code in
+.NET, TypeScript, or Python uses its driver, which handles encoding, tokens, transaction handles,
+and retries.
 Source docs: https://camusdb.github.io/docs/http-api and https://camusdb.github.io/docs/sql-authentication
 
 ## Contents
@@ -22,6 +26,11 @@ Source docs: https://camusdb.github.io/docs/http-api and https://camusdb.github.
 
 - Every request and response property uses camel case.
 - SQL, transaction, and row endpoints use `POST` with `Content-Type: application/json`.
+- The SQL query, streaming-query, non-query, and DDL endpoints return `CADB0400` for a malformed
+  JSON body, including an escaped lone surrogate half. The message gives the JSON path and byte
+  position. Administrative endpoints do not all have this check yet.
+- Valid JSON with invalid SQL text or parameters follows the engine rules. A lone surrogate half in
+  a SQL string parameter fails with `CADB0400` before execution.
 - `GET /ping` and `GET /health` answer without a credential. `GET /v1/admin/stats` returns node stats.
 - HTTP/1.1 and HTTP/2 work. HTTP/3 works on the HTTPS port when `http3_enabled: true`.
 - Success bodies carry `"status": "ok"`. Failures carry `"status": "failed"`, `code`, and `message`.

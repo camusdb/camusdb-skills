@@ -223,9 +223,9 @@ Windows run after `WHERE`, `GROUP BY`, and `HAVING`, and before the select list,
 | `SELECT ... FOR UPDATE` with a window | `CADB0400` |
 | `SELECT DISTINCT * ... ORDER BY <window call>` | `CADB0400` |
 
-A subquery that holds a window call reads a derived table. So it cannot be a scalar
-subquery in the select list, or a correlated `EXISTS`. An uncorrelated `IN`,
-`EXISTS`, or scalar subquery in `WHERE` works.
+An uncorrelated subquery can read a window query, also from an outer select list.
+A select list that holds a window call refuses a correlated subquery (`CADB0533`).
+A correlated `EXISTS` body can use window functions.
 
 ## Set-returning functions in FROM
 
@@ -296,4 +296,4 @@ or page the result.
 | `unnest`, `generate_subscripts`, `regexp_matches`, `regexp_split_to_table` in `FROM` | `CADB0533`. |
 | A scalar function in `FROM`, such as `FROM upper('a')` | `CADB0400`. |
 | An unknown name, such as `FROM no_such_function(1)` | `CADB0400`. |
-| A correlated `EXISTS` whose subquery reads a function | Error. |
+| An outer column inside a table-function argument | Not supported. |

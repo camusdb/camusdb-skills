@@ -46,8 +46,8 @@ Under hash routing (the default), all rows and indexes of one table live on one
 partition. A transaction across tables can still span partitions. Key-range
 sharding splits a table across partitions, so more writes become distributed.
 
-Distributed transaction support is an alpha feature. APIs and behavior can
-change between versions.
+The isolation choices apply on one node and across a cluster. Writes that span
+several partitions commit atomically.
 
 ## HLC timestamps
 
@@ -59,8 +59,10 @@ change between versions.
   value the transaction modified or depended on.
 - The order is logically consistent. It is not tied to real time. CamusDB has no
   externally consistent commit-wait guarantee.
-- A read at a timestamp can miss a commit from a node with a later clock. Pass the
-  causal token at `BEGIN`. See `isolation-and-locking.md`.
+- A read at a timestamp can miss a commit from a node with a later clock. The
+  .NET and TypeScript gRPC clients carry the causal token for you. Python does
+  not track causal tokens. A custom client passes the token at `BEGIN`. See
+  `isolation-and-locking.md`.
 
 ## Durability and failure outcomes
 
@@ -78,8 +80,9 @@ CamusDB never exposes a half-committed SQL transaction.
 ## Node affinity of a transaction
 
 - An explicit transaction lives in memory on the node that started it.
-- Send every statement and the `COMMIT` or `ROLLBACK` to that node. Other nodes
-  do not know the handle and reject it.
+- Every statement and the `COMMIT` or `ROLLBACK` must go to that node. Other
+  nodes do not know the handle and reject it. Let the driver keep this
+  affinity. A custom protocol client must keep it itself.
 - An autocommit statement can go to any node.
 - A transaction is not tied to a socket. A client can reconnect and continue
   with the same handle, on the same node.

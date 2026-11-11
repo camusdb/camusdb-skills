@@ -12,6 +12,7 @@ permissions of a CamusDB diagnostic tool.
 - SHOW STATEMENT STATS
 - SHOW INDEX USAGE
 - SHOW ENGINE STATS
+- Storage health endpoint
 - SHOW VARIABLES
 - Operator dashboard
 - Prometheus and OpenTelemetry
@@ -263,6 +264,8 @@ Useful metrics:
 | `raft.wal.*` | WAL flush behavior. |
 | `raft.heartbeat_delay_ms` | Leader scheduling pressure. Far above the heartbeat interval means CPU shortage. |
 | `raft.elections_started_total` | Leadership churn. |
+| `raft.transport.channel_rebuilds_total` | Rebuilds of inter-node gRPC channels that stayed in TransientFailure. A growing count means repeated transport recovery. |
+| `raft.transport.channels_in_transient_failure` | Inter-node channels in TransientFailure now, tagged by peer. Use it to find an unreachable or stuck peer. |
 | `kahuna.kv.write.batches`, `kahuna.kv.write.entries` | Write aggregation. Entries / batches = coalescing factor. |
 | `kahuna.backup.*` | Backup or PITR cycles. |
 | `kahuna.tx_admission.queued` | Waiters at the admission gate, by priority. Zero means the gate does not bind. |
@@ -273,6 +276,23 @@ Useful metrics:
 The `kahuna.collect.*` metrics arrive only in a Kahuna release after `0.9.8`.
 Until CamusDB uses that release, a collection tick shows only as an unexplained
 gap.
+
+## Storage health endpoint
+
+`GET /v1/cluster/health` reports whether a node can serve. Use it to keep a node
+with detected storage damage out of service.
+
+- A reported store or partition storage fault makes `ready` false, and the
+  endpoint returns HTTP 503. Read the body as well as the status.
+- `storageFault` holds the engine's fault message. `partitionStorageFaults`
+  lists faults for hosted partitions. The messages can contain file paths.
+- With authentication on, only a superuser sees these details. Other callers
+  still get the readiness result.
+- The endpoint does not scan for damage or repair it. Detection covers RocksDB
+  and Solarium. A healthy answer does not prove that every stored byte is intact.
+
+A read that hits the damage fails with `CADB0837 StorageCorrupted` (HTTP 500,
+gRPC `DATA_LOSS`). It is not retryable.
 
 ## SHOW VARIABLES
 
@@ -294,7 +314,8 @@ SHOW VARIABLES LIKE 'kahuna.%';
 
 Facts:
 
-- `LIKE` is case-sensitive. All names are lowercase.
+- `LIKE` is case-sensitive. All names are lowercase. It uses the query wildcards:
+  `_` matches one character. Escape a literal underscore: `SHOW VARIABLES LIKE 'ttl\_%'`.
 - Secrets render as `********` when set.
 - Not listed: `mode`, `node_name`, ports, `peers`, `http_peers`, certificate
   paths, the `diagnostics:` section, and computed values.

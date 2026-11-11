@@ -10,13 +10,15 @@ https://camusdb.github.io/docs/json, and https://camusdb.github.io/docs/storage.
 | --- | --- | --- | --- | --- |
 | `OID` | A 12-byte ObjectId | 12 bytes | Yes | Yes |
 | `UUID` | A 128-bit UUID | 16 bytes | Yes | Yes |
-| `INT64` | A 64-bit signed integer | 8 bytes | Yes | Yes |
+| `INT64`, `BIGINT` | A 64-bit signed integer | 8 bytes | Yes | Yes |
+| `INT`, `INTEGER` | A signed 32-bit range, stored as `INT64` | 8 bytes | Yes | Yes |
+| `SMALLINT` | A signed 16-bit range, stored as `INT64` | 8 bytes | Yes | Yes |
 | `SERIAL`, `BIGSERIAL` | An `INT64` identity column | 8 bytes | Yes | Yes |
 | `NUMERIC` | An exact decimal, precision 38, scale 9 | Fixed-point | Yes | See note |
 | `FLOAT64` | An IEEE-754 double | 8 bytes | Yes | Yes |
 | `FLOAT32` | An IEEE-754 single | 4 bytes | Yes | Yes |
 | `BOOL` | A boolean | 1 byte | Yes | Yes |
-| `STRING`, `STRING(N)` | UTF-16 text | Length prefix + text | Yes | No |
+| `STRING`, `STRING(N)` | Unicode text | Length prefix + text | Yes | No |
 | `DATE` | A calendar date, UTC ticks at midnight | Ticks | Yes | Yes |
 | `DATETIME` | An instant in UTC | Ticks | Yes | Yes |
 | `BYTES`, `BYTES(N)` | Opaque bytes | Length prefix + bytes | Yes | No |
@@ -34,9 +36,9 @@ applies to primary keys and secondary indexes.
 
 | Alias | Canonical type |
 | --- | --- |
-| `INT`, `INTEGER`, `SMALLINT` | `INT64` |
+| `BIGINT` | `INT64` |
 | `DECIMAL` | `NUMERIC` |
-| `FLOAT` | `FLOAT64` (`DOUBLE` only inside a `CAST`) |
+| `FLOAT`, `DOUBLE PRECISION` | `FLOAT64` (`DOUBLE` only inside a `CAST`) |
 | `REAL` | `FLOAT32` |
 | `TIMESTAMP` | `DATETIME` |
 | `BLOB`, `BLOB(N)` | `BYTES`, `BYTES(N)` |
@@ -46,8 +48,9 @@ applies to primary keys and secondary indexes.
 | `BOOLEAN` | `BOOL` |
 | `JSON` | `JSONB` |
 
-`SMALLINT` is still a 64-bit integer. `CHAR(N)` is not fixed-width. It is a
-maximum, like `VARCHAR(N)`.
+`INT`, `INTEGER`, and `SMALLINT` are not aliases. They keep their own range.
+See "Integer type names" below. `CHAR(N)` is not fixed-width. It is a maximum,
+like `VARCHAR(N)`.
 
 In an HTTP table definition, the `OID` type is named `id`. In SQL, `id` is an
 ordinary column name.
@@ -75,6 +78,37 @@ ordinary column name.
 The type list has no `INTERVAL` type. Every `DATETIME` is an instant in UTC.
 CamusDB parses date and datetime text as UTC.
 
+## Integer type names
+
+| Declaration | Accepted range | `SHOW CREATE TABLE` shows |
+| --- | --- | --- |
+| `SMALLINT` | -32768 to 32767 | `SMALLINT` |
+| `INT`, `INTEGER` | -2147483648 to 2147483647 | `INT` |
+| `INT64`, `BIGINT` | The full 64-bit range | `INT64` |
+
+- A write or a cast outside the declared range fails with `CADB0420` (HTTP 400,
+  gRPC `OUT_OF_RANGE`). This covers `INSERT`, `UPDATE`, upserts, row APIs,
+  defaults, the fill of an added column, and the elements of `ARRAY(SMALLINT)`
+  and `ARRAY(INT)`.
+- Every width uses `INT64` storage, arithmetic, indexes, and results. If
+  `quantity SMALLINT` holds 32767, `quantity + 1` returns 32768, but a write of
+  that value back to the column fails.
+- `CREATE TABLE ... AS SELECT` makes `INT64` columns, even from a narrow source.
+- `INT16` and `INT32` are not types.
+- **Existing columns keep their old range.** Before this change, `INT` and
+  `SMALLINT` were unbounded `INT64` aliases. Those columns still accept any
+  `INT64` and show as `INT64`. Old stored views and `CHECK` bodies keep their
+  `INT64` casts.
+- `SERIAL` and `BIGSERIAL` are both `INT64`, unlike PostgreSQL `SERIAL`.
+- A sequence on a `SMALLINT` or `INT` column keeps its own bounds. A generated
+  value outside the column range fails the write with `CADB0420`.
+- Use `INT64` or `BIGINT` when a value can pass the 32-bit range.
+
+```sql
+CREATE TABLE inventory (id BIGINT PRIMARY KEY, quantity SMALLINT, deliveries INT);
+SELECT CAST(32768 AS SMALLINT);  -- CADB0420
+```
+
 ## INT64
 
 - The range is `-9223372036854775808` to `9223372036854775807`.
@@ -82,9 +116,14 @@ CamusDB parses date and datetime text as UTC.
   never wraps. The statement stores nothing.
 - `+`, `-`, `*`, `/`, unary minus, `SUM`, integer literals, and conversions to
   `INT64` are checked. Use `NUMERIC '...'` for a wider exact value.
-- `CAST(x AS INT64)` rounds a fraction half away from zero, for `FLOAT64`,
-  `FLOAT32`, `NUMERIC`, and a `JSONB` number. `CAST(2.5 AS INT64)` is `3`.
-- `CAST` of `NaN` or an infinity fails with `CADB0420`.
+- `CAST(x AS INT64)`, `x::int64`, and `to_int64(x)` round a fraction half away
+  from zero, for `FLOAT64`, `FLOAT32`, `NUMERIC`, and a `JSONB` number.
+  `CAST(2.5 AS INT64)` is `3` and `CAST(-2.5 AS INT64)` is `-3`. PostgreSQL
+  rounds a half to the nearest even integer.
+- A cast to `SMALLINT` or `INT` rounds first, then checks the range.
+- `CAST` of `NaN`, an infinity, or an out-of-range value fails with `CADB0420`.
+- `LIMIT`, `OFFSET`, subscripts, and integer columns still refuse a float
+  without an explicit `CAST`.
 - `CAST('2.5' AS INT64)` fails with `CADB0400`. A string must spell an integer.
 - An `INT64` column refuses a float value without a `CAST`.
 
@@ -125,11 +164,33 @@ Two values compare only when their types have a rule. These pairs have one:
 - Two arrays with the same element type.
 
 Any other pair fails with `CADB0400`. Examples: `INT64` with `STRING`, `BOOL`
-with `INT64`, `BYTES` with `STRING`, and `NUMERIC` with `STRING`. In a `CHECK`,
-such a comparison rejects the row at write time with `CADB0303`. Write a `CAST`.
+with `INT64`, `BYTES` with `STRING`, and `NUMERIC` with `STRING`. Write a `CAST`.
 
-A stored `CHECK` with a float-to-`INT64` cast uses the rounding rule for new
-writes only. Existing rows are not checked again.
+- Known incompatible types fail before any row is read, even on an empty table.
+  Types known only from a parameter value are checked at evaluation.
+- A new `CHECK` with known incompatible types fails at definition time. A type
+  error reached while an existing check runs rejects the write with `CADB0303`.
+- A stored `CHECK` with a float-to-`INT64` cast uses the rounding rule for new
+  writes only. Existing rows are not checked again.
+
+## Errors before reading rows
+
+A mistake whose types are known from literals, casts, columns, or operators
+fails even on an empty table, under `LIMIT 0` or `WHERE FALSE`, or in an unused
+branch:
+
+- Unknown functions (`CADB0407`) and wrong argument counts (`CADB0400`).
+- Incompatible operators and comparisons, and known invalid assignments
+  (`CADB0401`). A table with a `BEFORE` trigger checks assignments after the
+  trigger, because the trigger can replace the value.
+- A `WHERE`, `HAVING`, `JOIN ON`, or `CHECK` condition that is not boolean or
+  `NULL`. `WHERE 1` and `WHERE 'true'` fail with `CADB0400`. Write `WHERE TRUE`.
+- A constant division by zero, such as `1 / 0`, fails with `CADB0400`. A proven
+  unused branch, such as `IF(TRUE, 1, 1 / 0)`, is skipped. Stored view and
+  `CHECK` definitions defer this error until use.
+
+These checks cover writes, subqueries, CTAS, views, and new `CHECK`
+definitions.
 
 ## JSONB
 
@@ -198,8 +259,8 @@ GIN index rules are in [ddl-syntax.md](ddl-syntax.md#gin-indexes).
 
 | Column | Maximum |
 | --- | --- |
-| `STRING(N)` | `N` UTF-16 code units |
-| `STRING` | 2,621,440 characters |
+| `STRING(N)`, `CHAR(N)`, `VARCHAR(N)` | `N` Unicode code points |
+| `STRING` | 2,621,440 code points |
 | `BYTES(N)` | `N` bytes |
 | `BYTES` | 10,485,760 bytes (10 MB) |
 
@@ -209,6 +270,24 @@ GIN index rules are in [ddl-syntax.md](ddl-syntax.md#gin-indexes).
   This applies to `INSERT`, `UPDATE`, `CAST`, and a `DEFAULT`.
 - A `NULL` is not checked against the bound.
 - For an exact byte count, add a `CHECK`.
+- An emoji such as `🙂` is one code point, so it fits in `CHAR(1)`. Combining
+  marks count separately.
+- `CHAR(N)` neither pads nor trims spaces. `'ab'` differs from `'ab '`, and
+  `'abc '` is too long for `CHAR(3)`. PostgreSQL `CHAR` differs.
+
+## Text order and valid Unicode
+
+- Comparisons, sorting, `MIN`, `MAX`, and indexes use binary UTF-16 code-unit
+  order. There is no locale collation and no `COLLATE` clause. Use `LOWER` for a
+  case-insensitive comparison.
+- A lone half of a UTF-16 surrogate pair is invalid text. A SQL string parameter
+  or string-array element with one fails with `CADB0400` before execution, even
+  when the parameter is unused. Typed row writes also refuse it and name the
+  column.
+- Stored replacement characters (U+FFFD) stay unchanged.
+- A gRPC (Protobuf) client can replace a surrogate half with U+FFFD before it
+  sends the value. The server cannot detect that change. Validate text in the
+  application.
 
 ## ARRAY(T)
 
@@ -260,7 +339,7 @@ String literal rules:
 | `DEFAULT (gen_id())` | `OID` | New ObjectId per row. Time-ordered. |
 | `DEFAULT (gen_uuid_v4())` | `UUID`, `GUID` | Random UUID per row. |
 | `DEFAULT (gen_uuid_v7())` | `UUID`, `GUID` | Time-ordered UUID per row. |
-| `DEFAULT (nextval('seq'))` | `INT64` | Next sequence value. |
+| `DEFAULT (nextval('seq'))` | `INT64` or a narrower integer | Next sequence value. A value outside the column range fails with `CADB0420`. |
 | `DEFAULT (now())` | `DATETIME` | Current time. All rows of one statement get the same value. |
 
 - A function default must be a bare call with no argument.
@@ -277,6 +356,8 @@ oid object_id int int64 integer smallint string char varchar text bool boolean
 serial bigserial numeric decimal float float32 float64 real date datetime
 timestamp bytes blob uuid guid array
 ```
+
+`BIGINT` and `PRECISION` stay usable as identifiers.
 
 Only the exact word is reserved. `dates`, `internal`, and `blob_store` are
 valid names.

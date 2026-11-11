@@ -9,6 +9,7 @@ you explain why a transaction conflicted.
 - Isolation levels
 - Read-only and read-write modes
 - Reads at a statement snapshot
+- Correlated subqueries in writes
 - Locking strategy combinations
 - Lock types
 - Conflict resolution
@@ -89,8 +90,13 @@ round trip, in every routing mode. Such a read has two costs:
   5 s for a scan page and about 16 s for a point read. The statement then fails
   with a retryable error. CamusDB does not resend a read after 15 s of attempts.
 - **It can miss a commit from another node.** A commit made at a later clock time
-  stays invisible, even when it finished first. Pass the causal token of your last
-  commit:
+  stays invisible, even when it finished first. For read-your-writes across
+  nodes, use the session behavior of your driver. The .NET and TypeScript gRPC
+  clients propagate causal tokens for you, so application queries do not copy
+  token fields. Python does not track causal tokens yet.
+
+A custom protocol client forwards the complete causal token of the last commit
+to the next autocommit query or `BEGIN`. It sets a minimum snapshot timestamp:
 
 | Transport | Commit returns | Pass it to |
 | --- | --- | --- |
@@ -98,7 +104,21 @@ round trip, in every routing mode. Such a read has two costs:
 | gRPC | `causal_token_*` in `CommitReply` | `causal_token_*` on `StartTxnRequest`, a batch `START`, or an autocommit `SqlRequest` |
 
 The server does not read the token on `TxnHandle`, or on a statement inside an
-explicit transaction. Give the transaction its floor at the start.
+explicit transaction. A change to it after the start does not advance the
+snapshot floor. Give the transaction its floor at the start.
+
+## Correlated subqueries in writes
+
+A correlated subquery in `UPDATE ... SET`, `UPDATE ... WHERE`, or `DELETE ...
+WHERE` uses the target row as its outer scope. It reads the target table and
+the other tables at the statement timestamp. So it does not see changes that
+the same statement made earlier:
+
+```sql
+UPDATE app_users
+SET post_count = (SELECT COUNT(*) FROM posts p WHERE p.user_id = app_users.id)
+WHERE active = true;
+```
 
 ## Locking strategy combinations
 

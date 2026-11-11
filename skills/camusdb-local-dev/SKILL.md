@@ -1,6 +1,6 @@
 ---
 name: camusdb-local-dev
-description: Sets up CamusDB for local development and testing, and drives its developer tools. Covers CamusDB.Server (dotnet tool, camusdb, camusdb init, ~/.camusdb/config.yml), the camusdb/camusdb Docker image, the compose cluster (docker/local.yml), growing a one-node cluster, ports 5095/5096/7070/7141, --grpc-port, camus-cli (-c, -e, -f, --format json, --tui), the Web Console, operator dashboard, browser playground, config.yml keys (data_dir, memory_profile, key_range_sharding, kahuna.storage, Solarium, max_statement_bytes), SHOW VARIABLES, SET CLUSTER SETTING, authentication (CAMUSDB_AUTH_ENABLED, CREATE USER, raft_mutual_tls_enabled, CADB0516, CADB0517, CADB0518, CADB0519), the MCP server (CAMUS_MCP_ENDPOINT, .mcp.json), load tests with camus-cli workload or CamusDB.Workload, per-PR databases with CREATE DATABASE ... BRANCH FROM, Testcontainers, .NET Aspire, and the Kubernetes Operator. Use it when a developer installs, starts, configures, connects to, secures, or load-tests a local CamusDB node or cluster.
+description: Sets up CamusDB for local development and testing, and drives its developer tools. Covers CamusDB.Server (dotnet tool, Homebrew brew install camusdb/tap/camusdb, brew services, camusdb init, ~/.camusdb/config.yml), the camusdb/camusdb Docker image, the compose cluster (docker/local.yml), growing a one-node cluster, ports 5095/5096/7070/7141, --grpc-port, camus-cli (-c, -e, -f, --tui), the Web Console, operator dashboard, browser playground, config.yml keys (data_dir, memory_profile, key_range_sharding, kahuna.storage, Solarium, max_statement_bytes), SHOW VARIABLES, SET CLUSTER SETTING, authentication (CAMUSDB_AUTH_ENABLED, CREATE USER, CADB0516 to CADB0519), the MCP server (CAMUS_MCP_ENDPOINT, .mcp.json), load tests (camus-cli workload), per-PR databases with CREATE DATABASE ... BRANCH FROM, Testcontainers, .NET Aspire (AddCamusDB, AddCamusDBCluster), and the Kubernetes Operator. Use it when a developer installs, starts, configures, connects to, secures, or load-tests a local CamusDB node or cluster.
 ---
 
 # CamusDB local development
@@ -38,9 +38,10 @@ Follow these steps in order. Skip the optional ones the user does not need.
 | Need | Use |
 | --- | --- |
 | Try SQL with nothing installed | Browser playground: https://camusdb.github.io/playground/ |
-| Daily development, one node | `dotnet tool install --global CamusDB.Server`, then `camusdb` |
-| One node without .NET installed | Docker image `camusdb/camusdb:latest` |
+| Daily development, one node | NuGet tool `CamusDB.Server`, or Homebrew `camusdb/tap/camusdb` |
+| One node without .NET installed | Homebrew (runtime included) or Docker image `camusdb/camusdb:latest` |
 | Raft, failover, multi-node behavior | `docker compose -f docker/local.yml up --build` in the engine repo |
+| Develop an app against a 3-node cluster | Aspire `AddCamusDBCluster` (see `references/local-cluster.md`) |
 | Grow from one node to three | Start in cluster mode (see `references/local-cluster.md`) |
 | Fault injection and chaos evidence | Caraxes (see `references/local-cluster.md`) |
 | A database per .NET test, from test code | Testcontainers (see "Other ways to run CamusDB") |
@@ -49,37 +50,25 @@ Follow these steps in order. Skip the optional ones the user does not need.
 
 ## Install and start a node
 
-The server needs the .NET 10 runtime.
+Choose one method. Each starts a standalone node with REST on port `5095` and gRPC on `5096`.
 
 ```bash
-dotnet tool install --global CamusDB.Server
-camusdb
+dotnet tool install --global CamusDB.Server && camusdb    # NuGet tool; needs the .NET 10 SDK
+brew install camusdb/tap/camusdb && camusdb               # macOS or Linux; runtime included
+brew services start camusdb                                # Homebrew background service
+docker run --rm -p 5095:5095 -p 5096:5096 -v camus-data:/data --name camusdb camusdb/camusdb:latest
+curl --fail http://localhost:5095/health                   # check the node
 ```
 
-- With no configuration file, `camusdb` uses built-in defaults.
-- It serves the HTTP (REST) API on port `5095` and gRPC on port `5096`.
-- Update with `dotnet tool update --global CamusDB.Server`.
+- With no configuration file, `camusdb` uses built-in defaults. `camusdb init` writes a starter
+  `~/.camusdb/config.yml` (Windows: `%APPDATA%\camusdb\config.yml`). It refuses to overwrite a file.
+- The Homebrew service has its own configuration and data under `$(brew --prefix)/var/camusdb`.
+  It does not read the foreground command's user configuration.
+- `CAMUS_HOME` relocates the user configuration and the default data directory.
 - `camusdb --version` prints only the version line, so a script can read it.
+- Do not edit `CamusDB/Config/config.yml` in a source checkout; a pull can replace it.
 
-Write a user-owned starter configuration, then edit it and restart:
-
-```bash
-camusdb init    # writes ~/.camusdb/config.yml and creates the default data directory
-```
-
-On Windows the file is `%APPDATA%\camusdb\config.yml`. `CAMUS_HOME` relocates both the
-configuration and the default data directory. `camusdb init` refuses to overwrite an existing
-file. Do not edit `CamusDB/Config/config.yml` in a source checkout; a pull can replace it.
-
-Run one node with Docker:
-
-```bash
-docker run --rm \
-  -p 5095:5095 \
-  -p 5096:5096 \
-  -v camus-data:/data \
-  --name camusdb camusdb/camusdb:latest
-```
+Read `references/installation.md` for updates, file locations, and logs.
 
 ## Other ways to run CamusDB
 
@@ -87,11 +76,12 @@ docker run --rm \
   `CamusDB.Testcontainers.Xunit` and `CamusDB.Testcontainers.XunitV3` add fixtures. Host ports are
   random, so read addresses after `StartAsync`. Choose an image that has the features under test.
   https://camusdb.github.io/docs/testcontainers
-- .NET Aspire: `CamusDB.Aspire.Hosting` runs a standalone container from the AppHost and creates
-  the declared databases. `CamusDB.Aspire.Client` and `CamusDB.Aspire.EntityFrameworkCore` register
-  the driver or an EF Core context in a service. https://camusdb.github.io/docs/aspire
-- Kubernetes Operator: an alpha operator, installed from a Helm chart, runs a `CamusDBCluster` resource. It
-  needs TLS. Do not use it for local development. https://camusdb.github.io/docs/kubernetes-operator
+- .NET Aspire: `CamusDB.Aspire.Hosting` runs a standalone container (`AddCamusDB`) or a local cluster
+  (`AddCamusDBCluster`, three nodes by default) from the AppHost, and creates the declared databases.
+  `CamusDB.Aspire.Client` and `CamusDB.Aspire.EntityFrameworkCore` register the driver or an EF Core
+  context in a service. https://camusdb.github.io/docs/aspire
+- Kubernetes Operator: an early-stage operator, installed from a Helm chart, runs a `CamusDBCluster`
+  resource. It needs TLS. Do not use it for local development. https://camusdb.github.io/docs/kubernetes-operator
 
 ## Ports
 
@@ -158,6 +148,9 @@ slow_query_log_enabled: true
 - `key_range_sharding` has no CLI flag. Set it in YAML or with `CAMUS_KEY_RANGE_SHARDING=true`.
 - `kahuna.storage` and `kahuna.wal_storage` accept `memory`, `sqlite`, `rocksdb`, and `solarium`.
   Choose them before you create data. Solarium and RocksDB do not read each other's files.
+- Inline C# functions and triggers are off by default. `inline_functions_enabled` and
+  `inline_triggers_enabled` turn them on (restart, same value on every node). Use the
+  `camusdb-csharp-extensions` skill for the feature.
 - Check what the node resolved. Do not reconstruct the merge by hand:
 
 ```sql
@@ -297,7 +290,8 @@ artifacts, compare, and baselines, use `CamusDB.Workload` from the engine source
 
 ## Other tools
 
-- Web Console: `docker run --rm -p 8080:8080 -e CamusDB__Endpoint=http://host.docker.internal:5095 -e CamusDB__Database=demo camusdb/camusdb-webconsole:latest`, then open `http://localhost:8080`.
+- Web Console: `dotnet tool install -g CamusDB.WebConsole`, then
+  `camusdb-webconsole --endpoint http://localhost:5095` (opens `http://127.0.0.1:5164`). A Docker image also exists.
 - Operator dashboard: open `http://localhost:5095/` in a browser. It is read-only.
 - Browser playground: real engine in WebAssembly, in memory. Queries use the `playground` database. It has no `USE`.
 
@@ -319,18 +313,21 @@ Read `references/tools.md` for details and limits.
 - Using `memory_profile: dev` for a benchmark. It caps caches at about 96 MiB.
 - Forgetting to drop per-PR branches. Each one pins history on its source.
 - Using an uppercase `LIKE` pattern with `SHOW VARIABLES`. Variable names are lowercase and the match is case-sensitive.
+  `_` is a wildcard; write `LIKE 'ttl\_%'` to match a literal underscore.
 
 ## References
 
+- `references/installation.md`: NuGet, Homebrew, and Docker install, update, file and log locations. Read before installing or upgrading a node.
 - `references/camus-cli.md`: all camus-cli flags, meta commands, history, output formats. Read before scripting the CLI.
 - `references/configuration.md`: discovery, precedence, key defaults, flags, storage backends, request limits, auth environment, Docker auth, validation errors. Read before editing `config.yml`.
 - `references/mcp-server.md`: MCP build, environment variables, Claude Code / Codex / Cursor config, tools. Read before wiring an agent.
-- `references/local-cluster.md`: compose cluster ports, manual cluster flags, growing a one-node cluster, leadership transfer, Caraxes. Read before running more than one node.
+- `references/local-cluster.md`: Aspire cluster, compose cluster ports, manual cluster flags, cluster sizing, growing a one-node cluster, storage health, manual range split, leadership transfer, Caraxes. Read before running more than one node.
 - `references/tools.md`: Web Console, operator dashboard, browser playground, workload utility. Read before using any of them.
 
 Public docs:
 
 - https://camusdb.github.io/docs/intro
+- https://camusdb.github.io/docs/server-installation
 - https://camusdb.github.io/docs/camus-cli
 - https://camusdb.github.io/docs/configuration
 - https://camusdb.github.io/docs/cluster

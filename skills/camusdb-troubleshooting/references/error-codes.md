@@ -52,7 +52,7 @@ value comes from the code's documented meaning.
 | `CADB0300` | `DuplicateUniqueKeyValue` | Insert, update, or index backfill violates a unique index or key. | Change the value, or update the existing row. | No |
 | `CADB0301` | `NotNullViolation` | `NULL` into a `NOT NULL` column. | Supply a value or a default. | No |
 | `CADB0302` | `ValueTooLong` | `STRING` or `BYTES` longer than the column maximum. | Shorten the value or widen the column. | No |
-| `CADB0303` | `CheckConstraintViolation` | A row violates a `CHECK`, or the check hits incompatible values or a regex failure. | Fix the data or the constraint. | No |
+| `CADB0303` | `CheckConstraintViolation` | A row violates a `CHECK`, or an existing check hits incompatible values or a regex failure. A new `CHECK` with known incompatible types is refused when you define it. After an upgrade, a stored `LIKE` pattern in a check uses the new escape rules and can reject a value it accepted before. | Fix the data or the constraint. | No |
 | `CADB0304` | `ForeignKeyViolation` | Child row has no parent, or `ADD CONSTRAINT ... FOREIGN KEY` finds orphans. | Insert the parent first, or fix orphans. | No† |
 | `CADB0305` | `ForeignKeyRestrictDelete` | `DELETE` removes a parent key still referenced. | Delete or repoint children first. | No† |
 | `CADB0306` | `ForeignKeyRestrictUpdate` | `UPDATE` changes a parent key still referenced. | Update children first, or keep the key. | No† |
@@ -61,14 +61,14 @@ value comes from the code's documented meaning.
 
 | Code | Name | Meaning | Typical fix | Retry |
 | --- | --- | --- | --- | --- |
-| `CADB0400` | `InvalidInput` | Invalid request shape: missing names, bad DDL/DML parameters, bad casts, malformed UUID, duplicate aliases, invalid transaction priority, invalid TTL options, bad `INSERT ... SELECT` column count, bad `GROUP BY`/`HAVING`/`DISTINCT`. Also `CREATE TABLE` without a primary key. A comparison, or a `CASE` or `COALESCE` result, across types with no rule. A non-integer parameter bound to `LIMIT` or `OFFSET`. A `FOR UPDATE` shape or transaction that is refused. A typed `/update` or `/delete` with no filter. `Unknown transaction`: a handle used after a failed statement or an idle timeout, or on another node. HTTP 400. | Read the message. Fix the request. For `Unknown transaction`, start a new transaction. | No |
-| `CADB0401` | `UnknownType` | A type CamusDB cannot handle in that context. | Use a supported type or cast. | No† |
+| `CADB0400` | `InvalidInput` | Invalid request shape: missing names, bad DDL/DML parameters, bad casts, malformed UUID, duplicate aliases, invalid transaction priority, invalid TTL options, bad `INSERT ... SELECT` column count, bad `GROUP BY`/`HAVING`/`DISTINCT`. Also `CREATE TABLE` without a primary key. A comparison, or a `CASE` or `COALESCE` result, across types with no rule. A non-integer parameter bound to `LIMIT` or `OFFSET`, or a negative `LIMIT` or `OFFSET`. A `FOR UPDATE` shape or transaction that is refused. A typed `/update` or `/delete` with no filter. `Unknown transaction`: a handle used after a failed statement or an idle timeout, or on another node. Also these checks, which fail before any row is read, even on an empty table: a `WHERE`, `HAVING`, `JOIN ON`, or `CHECK` condition that is not boolean (`WHERE 1`); a constant division by zero (`SELECT 1 / 0 WHERE FALSE`); a wrong argument count; an `ORDER BY` name that two different output columns share. Also half of a UTF-16 surrogate pair in a SQL string parameter or string-array element (the message names the parameter and position, even when the parameter is unused), malformed JSON on a SQL endpoint (the message gives the JSON path and byte position), an `ESCAPE` value longer than one character, a `LIKE` pattern that ends with its escape character when matching reaches it, and a negative `substring` length. HTTP 400. | Read the message. Fix the request. For `Unknown transaction`, start a new transaction. For a non-boolean condition, write `WHERE TRUE`. Guard a row divisor with `CASE WHEN x <> 0 THEN 1 / x END`. Use unique aliases or `ORDER BY 2`. | No |
+| `CADB0401` | `UnknownType` | A type CamusDB cannot handle in that context. Also a known invalid assignment, refused before any row is read. A table with a `BEFORE` trigger checks the assignment after the trigger. | Use a supported type or cast. | No† |
 | `CADB0402` | `DuplicatePrimaryKey` | Reserved. Duplicates usually report `CADB0300`. | As for `CADB0300`. | No† |
 | `CADB0403` | `DuplicateColumn` | Same column name twice, ignoring case: in a schema, an `INSERT` column list, an `UPDATE` or `ON CONFLICT` `SET` list, or a typed row write. Also a rename to an existing column. Refused before any write. HTTP 400. | Remove or rename the repeated column. | No† |
 | `CADB0404` | `UnknownColumn` | Column not present or not visible. | Fix the name. Check quoting. | No |
 | `CADB0405` | `UnknownKey` | Planner or scanner got a key shape it cannot map. Uncommon; usually internal. | Capture and report. | Operator† |
-| `CADB0406` | `SqlSyntaxError` | The parser cannot parse the text. | Fix the SQL. Use backticks for reserved-word identifiers. | No |
-| `CADB0407` | `InvalidAstStmt` | Parsed, but the shape is unsupported or unusable. | Rewrite the statement. | No† |
+| `CADB0406` | `SqlSyntaxError` | The parser cannot parse the text. This includes an unknown character outside a literal, quoted identifier, or comment (a stray backslash, a bare `$`), a non-breaking space (U+00A0) or byte-order mark (U+FEFF), a raw line break or tab inside a literal, and a comparison chain such as `a = b = c`. The message gives the line and column. | Fix the SQL. Use backticks for reserved-word identifiers. Retype copied whitespace. Use `E'line\nnext'` for a line break in a literal. Join comparisons with `AND`. | No |
+| `CADB0407` | `InvalidAstStmt` | Parsed, but the shape is unsupported or unusable. Also an unknown function, even on an empty table or in an unused branch. | Rewrite the statement. | No† |
 | `CADB0408` | `SchemaLimitExceeded` | Name longer than `max_identifier_length`, or over `max_columns_per_table`, `max_indexes_per_table`, `max_tables_per_database`, or `max_databases`. | Shorten or reduce. | No |
 | `CADB0409` | `InvalidAsOfSystemTime` | Malformed, future, or non-positive time; bad parameter; or used inside an explicit transaction. | Use a past time in autocommit. | No |
 | `CADB0410` | `MalformedVector` | Vector `BYTES` not a whole number of 4-byte floats, or empty. | Fix the encoding. | No |
@@ -81,8 +81,8 @@ value comes from the code's documented meaning.
 | `CADB0417` | `NumericValueOutOfRange` | `NUMERIC` outside ±99999999999999999999999999999.999999999. | Scale the value. | No† |
 | `CADB0418` | `InvalidJsonText` | Text for a `JSONB` value is not storable: invalid JSON, a `\u0000` escape or lone surrogate, or a number past the PostgreSQL `numeric` limits. HTTP 400. | Fix the text. | No† |
 | `CADB0419` | `JsonNestingTooDeep` | A `JSONB` document nests deeper than 512 levels. HTTP 400. | Reduce the nesting. | No† |
-| `CADB0420` | `IntegerValueOutOfRange` | `INT64` result outside its range: arithmetic, unary minus, a `SUM` total, a literal, or a conversion. The statement stores nothing. HTTP 400, gRPC `OUT_OF_RANGE`. | Use `NUMERIC` for a wider exact value, or fix the data. | No† |
-| `CADB0421` | `FloatValueOutOfRange` | A float result from finite inputs overflows or underflows, or a `FLOAT64` value does not fit `FLOAT32`. HTTP 400, gRPC `OUT_OF_RANGE`. | Scale the values, or use `NUMERIC`. | No† |
+| `CADB0420` | `IntegerValueOutOfRange` | `INT64` result outside its range: arithmetic, unary minus, a `SUM` total, a literal, or a conversion. A write or cast outside a declared `SMALLINT` (16-bit) or `INT`/`INTEGER` (32-bit) range, also for defaults, upserts, sequence values, and array elements. A float cast to an integer that is NaN, infinite, or out of range. The statement stores nothing. HTTP 400, gRPC `OUT_OF_RANGE`. | Use `BIGINT`/`INT64`, or `NUMERIC` for a wider exact value, or fix the data. | No† |
+| `CADB0421` | `FloatValueOutOfRange` | A float result from finite inputs overflows or underflows, or a `FLOAT64` value does not fit `FLOAT32`. Also `exp` overflow, or underflow to zero. HTTP 400, gRPC `OUT_OF_RANGE`. | Scale the values, or use `NUMERIC`. | No† |
 | `CADB0422` | `JsonbValueTooLarge` | `jsonb_agg` or `jsonb_object_agg` built a value over 268,435,455 bytes. HTTP 400. | Reduce the group size. | No† |
 
 ## CADB05xx: transactions, schema catch-up, prepared statements, auth, objects
@@ -121,7 +121,7 @@ value comes from the code's documented meaning.
 | `CADB0530` | `DependentObjectsExist` | Change would orphan dependent views or foreign keys, including a truncate of a referenced parent. | Drop the dependent object first. | No |
 | `CADB0531` | `MaterializedViewNotPopulated` | Read of a `WITH NO DATA` view never refreshed. | Run `REFRESH MATERIALIZED VIEW`. | No |
 | `CADB0532` | `RefreshAlreadyInProgress` | Another refresh of the view is running. | Retry after it finishes. | Yes |
-| `CADB0533` | `FeatureNotSupported` | Parsed but not implemented, such as `REFRESH ... CONCURRENTLY`, `FOR SHARE`, `FOR KEY SHARE`, or `SKIP LOCKED` at Serializable. HTTP 501. | Use the form named in the message. | No |
+| `CADB0533` | `FeatureNotSupported` | Parsed but not implemented, such as `REFRESH ... CONCURRENTLY`, `FOR SHARE`, `FOR KEY SHARE`, or `SKIP LOCKED` at Serializable. A correlated subquery in `HAVING`, `JOIN ON`, `ON CONFLICT DO UPDATE`, or a grouped, aggregate, or windowed select list. HTTP 501. | Use the form named in the message. | No |
 | `CADB0534` | `ConcurrentSchemaChange` | The definition changed under a derive-and-publish operation. Nothing applied. | Re-read the definition and run again. | Yes |
 | `CADB0535` | `SequenceUnavailable` | No confirmed leader for a monotonic counter for `sequence_retry_budget_ms`. Nothing written. HTTP 503. | Run again once the election settles. | Yes |
 | `CADB0536` | `InsufficientDiskSpace` | Free space below `min_free_disk_bytes`. Writes refused; reads and DDL still work. HTTP 507. | Free disk or lower the threshold. | After fix |
@@ -135,7 +135,7 @@ value comes from the code's documented meaning.
 | `CADB0544` | `SequenceExhausted` | Next value would pass `MAXVALUE`. | Raise the limit: `ALTER SEQUENCE name MAXVALUE n` or `NO MAXVALUE`. | No† |
 | `CADB0545` | `InvalidSequenceDefinition` | Non-positive increment, `CACHE` < 1, `MAXVALUE` < `MINVALUE`, or `START` out of range. | Fix the definition. | No† |
 | `CADB0546` | `SequenceValueNotYetDefined` | `currval`/`lastval` before this transaction drew a value. | Call `nextval` first. | No† |
-| `CADB0547` | `SequenceCallNotAllowedHere` | Sequence call where the draw count is unknowable, such as filters or joins. | Move the call. | No† |
+| `CADB0547` | `SequenceCallNotAllowedHere` | Sequence call where the draw count is unknowable, such as filters or joins. Also a sequence call in a nested `SELECT` without `FROM`, or in a filtered one unless the filter drops the row first. | Move the call. | No† |
 | `CADB0548` | `SequenceInUse` | Owned by an identity column, or a default depends on it. | Drop or change the dependent first. | No† |
 | `CADB0549` | `SpillLimitExceeded` | Spill would exceed `spill_max_total_bytes` on the node. Nothing kept. HTTP 507. | Let other queries finish, raise the limit, or reduce the spill. | After fix† |
 | `CADB0550` | `ReturningResultTooLarge` | `RETURNING` rows do not fit in one gRPC non-query reply. Rolled back. | Use a streaming query endpoint, or the count-only flag. | No† |
@@ -221,3 +221,23 @@ value comes from the code's documented meaning.
 | `CADB0834` | `ExtensionNotLoadedOnNode` | A statement uses an installed extension that this node does not load in that build. HTTP 503. | Deploy the same file on every node. | After fix† |
 | `CADB0835` | `ExtensionClusterMismatch` | A live node does not load the target build for an install or update. The message names the nodes. HTTP 409. | Deploy the file there and restart them. Run it again. | After fix† |
 | `CADB0836` | `TriggerRowMappingInvalid` | A typed trigger's row class does not fit the table. The message lists the problems. HTTP 400. | Fix the row class or the table. | No† |
+| `CADB0837` | `StorageCorrupted` | The storage engine (RocksDB or Solarium) detected damage and stopped serving that store. HTTP 500, gRPC `DATA_LOSS`. The node reports the fault in `GET /v1/cluster/health`. | Never treat it as an empty result. Keep the node out of service. Recover from replicas or a backup. See `observability.md`. | Operator |
+
+### Inline C# functions and triggers
+
+These cover `CREATE FUNCTION ... LANGUAGE csharp` and `CREATE TRIGGER ...
+LANGUAGE csharp`. Compile and policy errors name the source positions where they
+can. For writing or fixing inline code, use the `camusdb-csharp-extensions`
+skill.
+
+| Code | Name | Meaning | Typical fix | Retry |
+| --- | --- | --- | --- | --- |
+| `CADB0838` | `InlineFunctionCompileFailed` | Compilation failed, or passed its deadline (`inline_function_compile_timeout_ms`, 10 s). The message gives line and column. HTTP 400. | Fix the C# body. | No† |
+| `CADB0839` | `InlineFunctionRefused` | The source or signature uses a construct outside the allowed subset: files, network, reflection, threads, async in a function, clock or `Random` in a function, a regex with no timeout, an unsupported type. The message lists each construct and position. HTTP 400. | Rewrite with allowed APIs. | No† |
+| `CADB0840` | `InlineFunctionBudgetExceeded` | A call or trigger fire passed its time (1 s), allocation (16 MiB), array (1,048,576 elements), or stack budget. HTTP 400. | Fix the body or the input, or raise the `inline_function_*` budget. | No† |
+| `CADB0841` | `InlineFunctionsDisabled` | `inline_functions_enabled` or `inline_triggers_enabled` is off (the default), or this server build has no compiler. HTTP 400. | Ask the operator to enable it on every node and restart. | No† |
+| `CADB0842` | `FunctionAlreadyExists` | The function exists, or its name collides with a built-in or an extension member. HTTP 409. | Pick another name, or use `CREATE OR REPLACE`. | No† |
+| `CADB0843` | `FunctionNotFound` | `DROP`, `ALTER`, or `SHOW CREATE FUNCTION` names a missing inline function. HTTP 404. | Fix the name. | No† |
+| `CADB0844` | `FunctionHasDependents` | A view, materialized view, or `CHECK` calls the function, so a drop or a signature change is refused. HTTP 409. | Drop or change the dependents first. | No† |
+| `CADB0845` | `InlineFunctionUnavailableOnNode` | This node cannot compile a required function or trigger. Also a trigger body that still references a dropped column or function. HTTP 503. | Upgrade every node to the same build. Drop and recreate a trigger with a stale body. | After fix† |
+| `CADB0846` | `TriggerOwnerMissing` | The owner account of an inline trigger no longer exists, so its SQL cannot run. A new account with the same name does not inherit it. HTTP 403. | Drop and recreate the trigger as an existing user. | No† |

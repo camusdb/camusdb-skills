@@ -1,6 +1,6 @@
 {
   "name": "camusdb",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Skills that help coding agents design schemas, write SQL, tune queries, handle transactions, and operate CamusDB.",
   "author": {
     "name": "Andres Gutierrez",

@@ -25,7 +25,9 @@ Follow these steps in order.
 6. Encode vectors in the client as packed little-endian float32. Read
    [references/client-encoding.md](references/client-encoding.md) for .NET,
    EF Core, Dapper, TypeScript, REST, gRPC and SQL hex.
-7. Send the query vector as a bind parameter, never as a literal.
+7. Send the query vector as a bind parameter, never as a literal. Pack it with the driver helper:
+   `CamusVector.ToBytes` (.NET), `CamusValue.Vector` (Dapper), `camus.vector` (TypeScript).
+   Python has no helper; bind packed float32 `bytes`.
 8. Write `ORDER BY <metric>(col, @q) [DESC] LIMIT k`. Add a selective `WHERE`.
 9. Run `EXPLAIN` and confirm a `topk` node, not a `sort` node.
 10. Estimate the cost from row count × dimension. Read
@@ -210,6 +212,8 @@ A `sort` row means the bound did not apply. CamusDB keeps the full sort when:
 6. The value of `k` barely matters. `LIMIT 10` and `LIMIT 100` cost the same.
 7. Send the vector as a parameter. The statement text then stays constant, and a
    repeat skips the parse. The plan cache is off by default, so expect no shared plan.
+   The .NET and TypeScript drivers prepare repeated statements automatically; keep
+   supplying named parameters.
 
 ## Errors
 

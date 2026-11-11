@@ -32,6 +32,9 @@ The planner picks one of six scans:
 3. Point lookup on a unique index (`index-lookup`).
 4. Range scan on an index (`index-range-scan`).
 5. `IN`-list probes (`index-in-list`), when repeated probes beat a wider scan.
+   A constant list (literals and parameters) can be hashed once and used for
+   probes. A list with a column, such as `IN (preferred_status, 'pending')`, is
+   evaluated per row and is not converted into an index seek.
 6. GIN scan for a JSONB predicate (`gin-scan`).
 
 ### Heuristic scoring
@@ -324,31 +327,66 @@ The search then prices probes at the named keys' real share of the fact column.
 
 | Shape | Plan |
 | --- | --- |
-| `x IN (SELECT key FROM t)`, indexed inner column | `semi-join` with index probes |
-| `x NOT IN (SELECT key FROM t)`, indexed `NOT NULL` inner column | `anti-join` |
+| Uncorrelated `x IN (SELECT key FROM t)`, indexed inner column | `semi-join` with index probes |
+| Uncorrelated `x NOT IN (SELECT key FROM t)`, indexed `NOT NULL` inner column | `anti-join` |
 | Same, nullable inner column | `null-aware-anti-join` |
 | Inner column without an index | Subquery materialized; no join node |
-| Correlated `EXISTS` with an index on the correlated equality columns | Indexed seek per outer row |
-| Correlated `EXISTS` without such an index | Full inner scan per outer row |
+| Simple one-table correlated `EXISTS`, index on the correlated equality columns | Indexed seek per outer row; the full inner predicate runs after the seek |
+| Same, without such an index | Full inner scan per outer row |
+| Other correlated scalar, `EXISTS`, `IN`/`NOT IN` or quantified body | Prepared once, then run per outer row through the full query pipeline (joins, aggregation) |
 | Uncorrelated subquery of any kind, in any expression position | Evaluated once, result folded into the outer plan |
 | Derived table in `FROM` | `derived-table-scan`, materialized once |
 
 Position rules:
 
-- Uncorrelated subqueries run in the select list, `HAVING`, `JOIN ON`, `CASE`,
-  `BETWEEN` bounds and function arguments. `UPDATE`, `DELETE`, `INSERT VALUES` and
-  `ON CONFLICT DO UPDATE` accept them too.
-- Subqueries inside a derived table and inside a set-operation operand go through the
-  same pipeline.
-- A correlated `EXISTS` works only in the `WHERE` of a `SELECT`, at any depth.
-  Elsewhere it fails with `CADB0533`.
-- A correlated `IN`, `NOT IN` or quantified comparison is refused everywhere. A
-  correlated scalar subquery is refused as an unknown alias.
-- `ORDER BY` and `GROUP BY` refuse a subquery with `CADB0400`.
-- In a join, a `WHERE` conjunct with a correlated `EXISTS` is not pushed to one table's
-  scan. It runs after the join, so it does not narrow a join input.
+| Position | Supported forms |
+| --- | --- |
+| `SELECT` `WHERE`; `SELECT` list without grouping, aggregates or window functions | Scalar, `EXISTS`, `IN`/`NOT IN`, quantified. Correlated or uncorrelated. |
+| `UPDATE ... SET` and `WHERE`, `DELETE ... WHERE` | The same forms. The outer scope is the target row. |
+| `HAVING`, `JOIN ON`, `INSERT VALUES`, `ON CONFLICT DO UPDATE`, a grouped, aggregate or windowed select list | Uncorrelated only. A correlated form fails with `CADB0533`. |
+| `ORDER BY`, `GROUP BY` | No subquery. Fails with `CADB0400`. |
+
+- Uncorrelated subqueries also run in `CASE`, `BETWEEN` bounds and function
+  arguments, inside a derived table, a set-operation operand and a view body.
+- A correlated scalar subquery returns `NULL` for no rows and fails for more than
+  one row.
+- A name resolves in the nearest query first, then in enclosing queries. An
+  inner column can hide an outer one. Qualify columns.
+- In `UPDATE` and `DELETE`, correlated bodies read at the statement timestamp.
+  They do not see changes made earlier by the same statement.
+- The semi-join and anti-join rewrites apply to eligible uncorrelated forms
+  only. A correlated `IN` runs against each outer row.
+- An outer name inside a table-function argument is not supported.
+- In a join, correlation is evaluated where all referenced outer aliases are
+  available.
 - A semi-join evaluates its inner `WHERE` per probe, in the subquery's own name scope.
   It can qualify a column with the inner alias.
+
+### Per-statement result reuse
+
+Within one statement, a bounded cache can reuse a correlated subquery result
+when the same outer values recur. This cuts repeated work in joins.
+
+- The cache is not shared across executions.
+- Volatile bodies, some references through enclosing query levels, and the
+  simple indexed `EXISTS` path bypass it.
+- Index the useful inner predicates and check the plan. Do not assume that every
+  repeated body is cached.
+
+### EXISTS and NOT IN details
+
+- An `EXISTS` body discards its select list, `DISTINCT`, `GROUP BY` and
+  `ORDER BY`. `EXISTS (SELECT 1 / 0 FROM posts)` does not divide by zero.
+  Unknown names and known type errors in those clauses still fail.
+- Aggregates, `HAVING`, `OFFSET` and `LIMIT` keep their meaning. `LIMIT 0` is
+  false and reads no rows. A negative `LIMIT` or `OFFSET` is an error.
+- A correlated `EXISTS` body can use joins, views, derived tables, set
+  operations, aggregates, window functions and nested subqueries. It can omit
+  `FROM` and read outer values only.
+- An empty inner result makes `NOT IN` true, even for a `NULL` outer value. The
+  inner `WHERE` decides whether the result is empty.
+- A correlated subquery's value error is raised only when the expression uses
+  the value. An unused `CASE` branch or `COALESCE` fallback can skip it.
 
 Example rewrite target:
 

@@ -2,6 +2,8 @@
 
 Read this file before you build a gRPC client from the proto, or debug the connector's gRPC transport.
 The `camusdb` connector already implements this protocol. Set `protocol: 'grpc'` instead of writing your own when you use Node.js.
+The docs call this page the gRPC protocol reference, for driver authors, custom clients, and transport
+diagnostics. The .NET and TypeScript drivers support gRPC; Python uses REST.
 Source docs: https://camusdb.github.io/docs/grpc-api
 
 ## Basics
@@ -37,6 +39,7 @@ Fields: `database`, `sql`, `parameters` (`map<string, Value>`), `txn_handle`, `i
 
 ### Causal tokens
 
+- The .NET and TypeScript gRPC clients carry causal tokens for you. These rules are for a custom client.
 - `NonQueryReply`, `DdlReply`, `CommitReply`, and `QueryComplete` carry a token. The `TxnHandle` from `StartTransaction` carries none.
 - Send all three parts (`n`, `l`, `c`) on the next request that takes a token. Do not drop `n`.
 - An autocommit query reads at a timestamp at least this token.
@@ -52,7 +55,7 @@ Fields: `database`, `sql`, `parameters` (`map<string, Value>`), `txn_handle`, `i
 | NULL | `null_value` | typed NULL sentinel |
 | ID / OID | `id_value` | 24 lowercase hex characters |
 | INT64 | `int64_value` | signed 64-bit |
-| STRING | `string_value` | UTF-8 |
+| STRING | `string_value` | UTF-8. A Protobuf library can replace a lone surrogate half with U+FFFD before it sends; the server cannot detect that. Validate text before encoding. |
 | BOOL | `bool_value` | boolean |
 | FLOAT64 | `float64_value` | double |
 | FLOAT32 | `float32_value` | float |

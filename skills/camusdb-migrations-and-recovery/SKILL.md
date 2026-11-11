@@ -1,6 +1,6 @@
 ---
 name: camusdb-migrations-and-recovery
-description: Plans and runs safe CamusDB schema changes and recovers lost data. Covers online DDL (ALTER TABLE, CREATE INDEX, DROP INDEX, DeleteOnly/WriteOnly/Public states, backfill), migration rehearsal on a branch (CREATE DATABASE ... BRANCH FROM, SHOW BRANCHES, SHOW ANCESTORS), batched backfills under the 20,000-mutation limit, AS OF SYSTEM TIME recovery, SHOW ORPHAN TABLES, SHOW ORPHAN DATABASES and RELINK TO, TRUNCATE recovery, physical backups and PITR (/v1/backups, /v1/restore, camus-cli backup, pitr_bootstrap_from), camus-dump, logical dump and reimport across storage revisions, Solarium and key_range_sharding, and WAL crash recovery. Use when writing or applying a migration, after an accidental DROP, DELETE, UPDATE or TRUNCATE, when setting up backups or retention, or when you see CADB0506, CADB0530, CADB0534, CADB0537, CADB0539, CADB0510, CADB0503, CADB0600 or a CADB07xx backup error.
+description: Plans and runs safe CamusDB schema changes and recovers lost data. Covers online DDL (ALTER TABLE, CREATE INDEX, DROP INDEX, DeleteOnly/WriteOnly/Public states, backfill), migration rehearsal on a branch (CREATE DATABASE ... BRANCH FROM, SHOW BRANCHES, SHOW ANCESTORS), batched backfills under the 20,000-mutation limit, AS OF SYSTEM TIME recovery, SHOW ORPHAN TABLES, SHOW ORPHAN DATABASES and RELINK TO, TRUNCATE recovery, physical backups and PITR (/v1/backups, /v1/restore, camus-cli backup, pitr_bootstrap_from), camus-dump, logical dump and reimport across storage revisions, Solarium and key_range_sharding, and WAL crash recovery. Use when writing or applying a migration, after an accidental DROP, DELETE, UPDATE or TRUNCATE, when setting up backups or retention, before a server upgrade, or when you see CADB0506, CADB0530, CADB0534, CADB0537, CADB0539, CADB0510, CADB0503, CADB0600, CADB0837 StorageCorrupted or a CADB07xx backup error.
 ---
 
 # CamusDB migrations and recovery
@@ -99,8 +99,7 @@ Follow this checklist for any schema change on a database with data.
 10. **Verify the real database** with the checks from step 5. Run `ANALYZE` on
     tables whose shape or contents changed a lot.
 
-Branching is an alpha feature. Its APIs and storage formats can change between
-versions. Details: [references/branching.md](references/branching.md).
+Branch details: [references/branching.md](references/branching.md).
 
 ## Key rules for online DDL
 
@@ -209,7 +208,8 @@ whole table, use `TRUNCATE` instead of `DELETE`. It costs no mutations.
 
 `INSERT ... SELECT` and the row load of `CREATE TABLE ... AS SELECT` are user
 writes. They also obey the limit. For a large copy, run CTAS `WITH NO DATA`,
-then `INSERT ... SELECT` in `WHERE` or `LIMIT` slices.
+then `INSERT ... SELECT` in `WHERE` or `LIMIT` slices. The source can be a
+plain view.
 
 A copy out of a busy table depends on the isolation level and locking mode:
 
@@ -270,7 +270,22 @@ CREATE TABLE orders_recovered RELINK TO 'A0';
   [references/dump-and-reimport.md](references/dump-and-reimport.md).
 - **WAL recovery is automatic.** At startup, each partition replays its
   committed Raft log before it serves work. Uncommitted entries are dropped.
-  Never delete or edit the `kv` or `wal` directories under `data_dir`.
+  Never delete or edit the `kv` or `wal` directories under `data_dir`. Replay
+  assumes intact data: it does not repair damaged files.
+- **Detected storage damage** (`CADB0837 StorageCorrupted`) stops the store.
+  It is not retryable and is never an empty result. `GET /v1/cluster/health`
+  then returns HTTP 503. A replica that lost acknowledged log entries is
+  quarantined by default (`kahuna.raft_lost_acknowledged_entries_policy`). See
+  Recipe 6 in [references/recovery-playbook.md](references/recovery-playbook.md).
+
+## Upgrade a server
+
+An upgrade can change how stored objects behave. New `INT` and `SMALLINT`
+columns enforce their range, but old ones do not. Stored `LIKE` patterns take
+the new escape rules. Stored views and `CHECK`s keep their old operator
+grouping. Rehearse the upgrade on a branch, inspect `SHOW CREATE TABLE` and
+`SHOW CREATE VIEW`, and keep all nodes on one version when results must agree.
+Read [references/upgrade-behavior.md](references/upgrade-behavior.md) first.
 
 ## Choices you cannot change in place
 
@@ -305,11 +320,6 @@ Each of these needs a logical dump and reimport. See
   (`CADB0707`).
 - Using the backup API from a remote host with authentication off. The server
   accepts only loopback callers then. Others get `CADB0517`.
-- Restoring a physical backup with a different CamusDB storage revision. Use a
-  logical dump to cross revisions.
-- Changing `key_range_sharding` or `kahuna.storage` on a node with data. Use a
-  logical dump.
-- Starting a restored data root as a new cluster member without a seeded join.
 - Dropping an index first when you replace it on a live table. Create the new
   one, verify the plan, then drop the old one.
 - Forgetting that `camus-dump` does not export passwords or superuser status.
@@ -326,22 +336,14 @@ Each of these needs a logical dump and reimport. See
   when enabling backups, taking one, or restoring.
 - [references/dump-and-reimport.md](references/dump-and-reimport.md): read when
   moving data between servers or storage revisions.
+- [references/upgrade-behavior.md](references/upgrade-behavior.md): read before
+  a server upgrade, or when a stored view, `CHECK`, or column acts differently
+  after one.
 
-Public docs:
-https://camusdb.github.io/docs/sql-schema,
-https://camusdb.github.io/docs/sql-indexes,
-https://camusdb.github.io/docs/distributed-schema,
-https://camusdb.github.io/docs/database-branching,
-https://camusdb.github.io/docs/transaction-limits,
-https://camusdb.github.io/docs/time-travel-reads,
-https://camusdb.github.io/docs/insert-select-and-ctas,
-https://camusdb.github.io/docs/recover-dropped-objects,
-https://camusdb.github.io/docs/truncate-table,
-https://camusdb.github.io/docs/backup-and-restore,
-https://camusdb.github.io/docs/camus-dump,
-https://camusdb.github.io/docs/logical-dump-and-reimport,
-https://camusdb.github.io/docs/key-range-sharding,
-https://camusdb.github.io/docs/growing-a-one-node-cluster,
-https://camusdb.github.io/docs/configuration,
-https://camusdb.github.io/docs/wal-recovery,
-https://camusdb.github.io/docs/databases.
+Public docs, under `https://camusdb.github.io/docs/` (append the page name):
+`sql-schema`, `sql-indexes`, `distributed-schema`, `database-branching`,
+`transaction-limits`, `time-travel-reads`, `insert-select-and-ctas`,
+`recover-dropped-objects`, `truncate-table`, `backup-and-restore`, `camus-dump`,
+`logical-dump-and-reimport`, `key-range-sharding`, `growing-a-one-node-cluster`,
+`configuration`, `wal-recovery`, `cluster#check-storage-health`, `views`,
+`databases`.

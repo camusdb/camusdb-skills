@@ -1,10 +1,66 @@
 # Local cluster reference
 
-Sources: https://camusdb.github.io/docs/cluster,
-https://camusdb.github.io/docs/growing-a-one-node-cluster, https://camusdb.github.io/docs/caraxes,
+Sources: https://camusdb.github.io/docs/cluster, https://camusdb.github.io/docs/aspire,
+https://camusdb.github.io/docs/growing-a-one-node-cluster,
+https://camusdb.github.io/docs/key-range-sharding, https://camusdb.github.io/docs/caraxes,
 and the engine repository `docker/` folder and `README.md`.
 
-Cluster mode is still evolving. APIs and storage formats can change between versions.
+## Three nodes with .NET Aspire
+
+The easiest way to try a cluster or to develop an application against one. The AppHost starts
+three containers, configures peers and Raft certificates, creates your database, and passes the
+node endpoints to your service. It needs Docker and the .NET 10 SDK.
+
+```csharp
+var camus = builder.AddCamusDBCluster("camus", nodes: 3)
+    .WithDataVolume();
+var appDb = camus.AddDatabase("appdb");
+
+builder.AddProject<Projects.ApiService>("api")
+    .WithReference(appDb)
+    .WaitFor(appDb);
+```
+
+- The dashboard shows a cluster resource and the containers `camus-1`, `camus-2`, and `camus-3`.
+- Each node gets its own data volume. `WithDataBindMount(path)` uses one subfolder per node, such
+  as `path/camus-1`.
+- The AppHost generates a cluster CA and node certificates on each run. Raft uses TLS on the
+  container network and does not publish its port. Client HTTP and gRPC stay plaintext, so this
+  setup is for local development only. All nodes run on your machine.
+- Readiness: each node checks `/v1/cluster/health`. On first startup, all nodes must be healthy
+  before the AppHost creates databases. After that, the cluster resource stays healthy while a
+  majority is healthy. Without a majority it is unhealthy. After all nodes stop, startup again
+  needs every node.
+- The connection string lists every node's endpoint. Cluster connection properties are `Uri`,
+  `GrpcUri`, and `Database`. There is no single `Host`, `Port`, or `GrpcPort`.
+- With gRPC, `BackupEndpoint` points to the first node's HTTP endpoint.
+- `WithProtocol(CamusDBProtocol.Grpc)` and `WithAuthentication()` also work on clusters.
+  Authentication shares the token key and node secret, and turns on mutual TLS between Raft peers.
+- Nodes default to the `dev` memory profile. Prefer an odd node count. `nodes: 1` runs in cluster
+  mode with no redundancy.
+
+Apply common image or environment settings to every node. Keep them the same on all nodes:
+
+```csharp
+builder.AddCamusDBCluster("camus", nodes: 3)
+    .ConfigureNodes(node => node
+        .WithImageTag("0.17.0")
+        .WithEnvironment("CAMUS_INITIAL_PARTITIONS", "8"));
+```
+
+The ready-to-run Notes example:
+
+```bash
+git clone https://github.com/camusdb/camusdb-aspire.git
+cd camusdb-aspire
+dotnet run --project examples/ClusterExample/ClusterExample.AppHost
+```
+
+Open the API's **Notes** URL after the resources are healthy. Stop `camus-3` and add a note: two
+nodes still form a majority. Stop a second node and the cluster becomes unhealthy. Stop the
+AppHost and wait for its containers to exit before you run it again, so two containers do not
+open the same node's data. In the repository playground, `--Playground:ClusterNodes=3` starts a
+cluster; the default `0` is standalone.
 
 ## Three nodes with Docker Compose
 
@@ -184,6 +240,43 @@ join_existing: true
 
 Read https://camusdb.github.io/docs/growing-a-one-node-cluster for the full steps.
 
+## Choose the number of nodes
+
+Three nodes is the smallest cluster that survives one node failure. CamusDB has no configured
+maximum. Size for the workload, and load test at the size you plan to run.
+
+| Cluster | Replicas per partition | Nodes that can fail | Result |
+| --- | --- | --- | --- |
+| 3 nodes, default | 3 | 1 | Smallest layout with no single point of failure. |
+| 5 nodes, default | 5 | 2 | Each node still stores all data. Each write waits for 3 of 5 replicas. |
+| 5 or more nodes, `replication_factor: 3` | 3 | 1. If 2 fail together, only partitions with 2 replicas on those nodes stop. | Each new node takes a share of the partitions. |
+
+- To survive more failures, add replicas. Keep the count odd: four tolerate one failure, like three.
+- To add capacity, add nodes and set a replication factor below the node count. With the default
+  full replication, a new node is one more copy of everything.
+
+```yaml
+kahuna:
+  replication_factor: 3
+  enable_placement_rebalancer: true
+  zone: rack-1
+```
+
+- `replication_factor`: replicas of each partition. On a cluster with full replication, the
+  rebalancer reduces existing partitions to that number. Without the rebalancer, they stay on
+  every node.
+- `enable_placement_rebalancer`: moves replicas to new nodes and repairs ranges that lost a
+  replica. Off by default.
+- `zone`: the rack or availability zone. CamusDB tries to spread each range's replicas across
+  zones. This is best effort; check with `SHOW RANGES`. Use three or more zones.
+- `initial_partitions` is fixed at creation and limits the spread. With factor 3, three partitions
+  have nine replicas, so a tenth node has no data to host. One table lives on one partition by
+  default, so more nodes do not help one busy table. See key-range sharding.
+- Put nodes on separate machines, and preferably separate racks or zones.
+- Give the application more than one way to reach the cluster: several endpoints in the
+  connection string, or a load balancer. A request that ran on the failed node can still fail.
+- New nodes join as learners, catch up, then become voters.
+
 ## Behavior to expect
 
 - Every node exposes the database API. A write is routed to the partition leader.
@@ -204,6 +297,40 @@ Content-Type: application/json
 
 `200` means the target became leader. `409` returns `status` and `reason`. With auth off, the
 route is loopback-only. With auth on, it needs a superuser.
+
+## Storage health
+
+`GET /v1/cluster/health` keeps a node with detected storage damage out of service.
+
+- A reported store or partition storage fault makes `ready` false, and the endpoint returns 503.
+  Inspect the body as well as the status.
+- `storageFault` holds the engine's fault message. `partitionStorageFaults` lists faults for
+  hosted partitions. The messages can include file paths. With auth on, only superusers see them.
+- A read that reports `CADB0837 StorageCorrupted` failed (HTTP 500, gRPC `DATA_LOSS`). It is not
+  retryable and is never an empty result. Detection covers RocksDB and Solarium.
+- The endpoint does not scan for integrity or repair storage.
+
+## Split a range manually
+
+Automatic splitting is the normal way. Use the manual split for a controlled point, such as a
+recovery test.
+
+```bash
+curl -X POST http://localhost:5095/v1/cluster/split-range \
+  -H 'Content-Type: application/json' \
+  -d '{"database":"shop","table":"orders","maxKeys":1000000}'
+```
+
+- The endpoint picks a median key that is not already a range start. There is no caller split key.
+- Omit `index` for rows, or name an index. `primary` and `<table>_pkey` name the primary index.
+- `maxKeys` defaults to 1,000,000 and must be at least 2. A larger key space is refused.
+- Hash-routed or unavailable range maps return `NoRange`.
+- With auth on, the caller must be a superuser. With auth off, loopback only.
+- 200 is a split, 409 a refused split, 400 invalid input. The body has `success`, `status`,
+  `reason`, `keySpace`, `splitKey`, `keysSeen`, `descriptorsBefore`, `newPartitionId`,
+  `leaderHint`, and `determinate`.
+- On `NotLeader`, use `leaderHint`. If `determinate` is false, re-read `SHOW RANGES` and compare
+  with `descriptorsBefore` before you try again.
 
 ## Caraxes (optional)
 

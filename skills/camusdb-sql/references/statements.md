@@ -11,7 +11,7 @@ columns, `ALTER TABLE`, `CREATE INDEX`, sequences) belongs to the
 
 | Type | Literal |
 | --- | --- |
-| `INT64` | `42`, `200_000`, `0xFF`; past the range fails with `CADB0420` |
+| `INT64` | `42`, `200_000`, `0xFF`; past the range fails with `CADB0420`. `SMALLINT` and `INT` columns check their narrower range. |
 | `NUMERIC` | `NUMERIC '0.1'` (typed); a bare decimal is a float in expressions |
 | `FLOAT64` | `3.14`, `1e10`, `CAST('NaN' AS float64)`; `1e400` fails with `CADB0421` |
 | `STRING` | `'hello'` or `"hello"`; `E'a\tb'` for escapes |
@@ -40,8 +40,30 @@ FROM source
 [LIMIT n | @p] [OFFSET m | @p]
 [FOR UPDATE [OF t] [NOWAIT | SKIP LOCKED]];
 
--- SELECT without FROM: projections, LIMIT, and OFFSET only
-SELECT expr [AS alias] [, ...] [LIMIT n] [OFFSET m];
+-- SELECT without FROM: one synthetic row
+SELECT expr [AS alias] [, ...] [WHERE condition] [LIMIT n] [OFFSET m];
+```
+
+`SELECT` without `FROM`:
+
+- `WHERE` keeps the row when the condition is `TRUE`. `FALSE` or `NULL` returns no
+  row, and the projection does not run. The condition must be boolean or `NULL`.
+- It refuses `*`, aggregates, `GROUP BY`, `HAVING`, and `ORDER BY`, also with `WHERE`.
+- With `WHERE`, it can be the source of `INSERT ... SELECT` or CTAS, and an
+  operand of a set operation. `EXPLAIN (ANALYZE)` works and shows a
+  `function-scan` of `*single_row*`. Without `WHERE`, `EXPLAIN (ANALYZE)` is refused.
+- It also works nested: as a scalar or `IN` subquery, a derived table, or a view
+  body. There it can read outer columns in a supported correlated position.
+- With `WHERE`, a sequence call fails with `CADB0547`, unless the filter drops the
+  row before the call runs: `SELECT nextval('s') WHERE FALSE` draws nothing. A
+  nested `SELECT` without `FROM` refuses a sequence call with `CADB0547`.
+- A constant division by zero still fails: `SELECT 1 / 0 WHERE FALSE` is an error.
+
+```sql
+SELECT 'seed' WHERE NOT EXISTS (SELECT 1 FROM accounts);
+SELECT (SELECT 1 WHERE FALSE);             -- NULL
+SELECT x FROM (SELECT 5 AS x) d;           -- 5
+SELECT u.id FROM app_users u WHERE EXISTS (SELECT 1 WHERE u.active = true);
 ```
 
 `source` is one of:
@@ -66,10 +88,11 @@ Predicates:
 ```sql
 x [NOT] BETWEEN lo AND hi
 x [NOT] IN (v1, @p, column_name)                 -- an expression item is a syntax error
-x [NOT] IN (SELECT one_column FROM ...)          -- not correlated
-[NOT] EXISTS (SELECT ... )                       -- correlated only in the WHERE of a SELECT
+x [NOT] IN (SELECT one_column FROM ...)          -- correlated or uncorrelated
+[NOT] EXISTS (SELECT ... )
 x op ANY | SOME | ALL (array_or_subquery)        -- op: = <> != < <= > >=
-x [NOT] LIKE p | x [NOT] ILIKE p | x ~ p | x ~* p | x !~ p | x !~* p
+x [NOT] LIKE p [ESCAPE e] | x [NOT] ILIKE p [ESCAPE e]
+x ~ p | x ~* p | x !~ p | x !~* p
 x IS NULL | x IS NOT NULL
 CASE WHEN c THEN r [...] [ELSE r] END
 CASE x WHEN v THEN r [...] [ELSE r] END
@@ -80,11 +103,61 @@ IF(c, a, b)
   parameters can become index seeks.
 - `HAVING` reads a group key, a select item, or an aggregate. A qualified key works,
   and so does `COUNT(*) IN (1, 2)`.
-- An uncorrelated subquery runs once, in any expression position and at any depth.
-  `ORDER BY` and `GROUP BY` refuse a subquery with `CADB0400`.
-- A correlated `EXISTS` outside the `WHERE` of a `SELECT` fails with `CADB0533`.
-- A correlated `IN`, `NOT IN`, or quantified comparison is refused. A correlated
-  scalar subquery fails as an unknown alias.
+- `WHERE`, `HAVING`, and `JOIN ON` need a boolean or `NULL` condition.
+- `LIKE` rules, `ESCAPE`, and operator precedence are in
+  [expressions.md](expressions.md).
+
+### Subqueries
+
+An uncorrelated subquery does not read the outer row. It runs once, before the
+outer rows are read. A correlated subquery reads an outer column and runs for
+each outer row.
+
+| Position | Supported subqueries |
+| --- | --- |
+| `SELECT` list (no grouping, aggregates, or window functions), `SELECT ... WHERE` | Scalar, `EXISTS`, `IN`/`NOT IN`, quantified. Correlated or uncorrelated. |
+| `UPDATE ... SET`/`WHERE`, `DELETE ... WHERE` | The same forms. The outer scope is the target row. |
+| `HAVING`, `JOIN ON`, `INSERT ... VALUES`, `ON CONFLICT DO UPDATE` | Uncorrelated forms only. |
+| `GROUP BY`, `ORDER BY` | Refused with `CADB0400`. |
+
+- The rules also apply inside a `CASE` branch, a function argument, a comparison,
+  an `IS NULL` test, or a `BETWEEN` bound. Limits on `CHECK` and `RETURNING` stay.
+- A correlated subquery in `HAVING`, `JOIN ON`, `ON CONFLICT DO UPDATE`, or a
+  grouped, aggregate, or windowed select list fails with `CADB0533`.
+- A scalar subquery gives `NULL` for zero rows. More than one row is an error. It
+  takes its inner output name. Alias it anyway for callers and stored definitions.
+- `IN` and `NOT IN` need a one-column subquery. A multi-column one is refused.
+- An empty inner result makes `NOT IN` true, even for a `NULL` outer value. One
+  `NULL` in a non-empty result makes every non-match unknown. Prefer `NOT EXISTS`.
+- A name resolves in the nearest query first, then in the enclosing queries. An
+  inner column or alias can hide an outer name. Qualify columns.
+- In `UPDATE` and `DELETE`, a correlated body reads at the statement timestamp. It
+  does not see changes made earlier by the same statement.
+- A correlated value error is raised only when the expression uses that value. An
+  unused `CASE` branch or `COALESCE` fallback can skip it. Name and known type
+  errors still fail before rows are read.
+- An `EXISTS` body drops its select list, `DISTINCT`, `GROUP BY`, and `ORDER BY`:
+  `EXISTS (SELECT 1 / 0 FROM posts)` does not divide. Unknown names and known type
+  mistakes there still fail. Aggregates, `HAVING`, `OFFSET`, and `LIMIT 0` keep
+  their meaning. `LIMIT 0` is false without a read.
+- A correlated `EXISTS` body can use joins, views, derived tables, set operations,
+  aggregates, `GROUP BY`, `HAVING`, window functions, `OFFSET`, and nested
+  subqueries. It can omit `FROM` and read only outer values.
+- An outer name inside a table-function argument is not supported.
+- A simple one-table `EXISTS` can seek an index on the correlated columns. Other
+  bodies run the full query pipeline. A result can be reused for repeated outer
+  values within one statement. See `camusdb-query-performance`.
+
+```sql
+SELECT u.id,
+       (SELECT COUNT(*) FROM posts p WHERE p.user_id = u.id) AS post_count,
+       EXISTS (SELECT 1 FROM posts p WHERE p.user_id = u.id) AS has_posts
+FROM app_users u;
+
+UPDATE app_users
+SET post_count = (SELECT COUNT(*) FROM posts p WHERE p.user_id = app_users.id)
+WHERE active = true;
+```
 
 `AS OF SYSTEM TIME` reads a past snapshot. A plain read with it runs in
 autocommit only. It applies to every join and subquery of the statement. See
@@ -172,7 +245,7 @@ The arbiter is the unique index that decides a conflict:
   proposed row, after defaults, coercion, and `BEFORE INSERT` triggers.
 - Every `SET` reads the stored row before the update, so `SET a = b, b = a` swaps.
 - `SET` cannot assign a primary-key column.
-- An uncorrelated subquery runs once. A correlated subquery is refused.
+- An uncorrelated subquery runs once. A correlated subquery is refused (`CADB0533`).
 - `DO UPDATE` fails with `CADB0400` when two proposed rows reach one stored row.
 - `UPSERT` sets each listed non-key column to `excluded`. An unlisted column keeps its
   stored value on update, and gets its default on insert.
@@ -196,13 +269,20 @@ CREATE TABLE [IF NOT EXISTS] new_t AS SELECT ... [WITH DATA | WITH NO DATA];
 ```
 
 - Columns match by position.
+- The source is an ordinary `SELECT`. It can read a plain view, also for CTAS
+  `WITH NO DATA`. Reading a view does not make the view writable.
+- A scalar subquery keeps its declared type even when its value is `NULL`. So
+  `SELECT (SELECT MAX(amount) FROM payments) AS largest_payment` makes a typed column
+  over an empty table. An untyped `SELECT NULL AS x` is still refused.
 - `WITH DATA` is the default. `IF NOT EXISTS` skips the query when the table exists.
 - `INSERT INTO t SELECT ... FROM t` terminates; the source is read first.
 - CTAS copies the result shape only: no index, constraint, default, or comment.
 - CTAS adds a leading key `id OID NOT NULL DEFAULT gen_id()`. If the query has an
   `id` column, the key becomes `id2`, then `id3`.
 - In CTAS, alias every expression, cast a bare `NULL` (`CAST(NULL AS INT64) AS x`),
-  and list columns instead of `*` over a join.
+  and list columns instead of `*` over a join. A scalar subquery can take its inner
+  name, but an expression such as `MAX` inside it still needs an alias.
+- CTAS makes `INT64` integer columns, also from a `SMALLINT` or `INT` source.
 - CTAS commits the table before the rows. A failed load drops the table again. If
   that drop fails, an empty table stays.
 - A source with `AS OF SYSTEM TIME` copies historical rows into the present. It also
@@ -239,6 +319,12 @@ SHOW CREATE VIEW v;
 - A body can be a set operation. A subquery in the body's `WHERE` reads with the
   owner's privileges. A set operation deeper in the body cannot use `*`.
 - Every output column needs a name. A body may not mix `*` with other columns.
+- `CREATE VIEW` binds the body without running it or its subqueries.
+  `CREATE VIEW deferred AS SELECT (SELECT 1 / 0) AS x` succeeds, and a read of it
+  fails. Unknown names and known type mistakes still fail at creation.
+- A body can be a `SELECT` without `FROM`: `CREATE VIEW readiness AS SELECT 'ready' AS status`.
+- A view can be the source of CTAS, `INSERT ... SELECT`, or a materialized view. It
+  reads with the rules of an ordinary `SELECT`.
 - A view runs with its owner's privileges. Every view is read-only (`CADB0525`).
 - `DROP TABLE` and `DROP COLUMN` fail while a view depends on them (`CADB0530`).
   `DROP VIEW ... CASCADE` exists. `DROP TABLE ... CASCADE` does not.
@@ -258,6 +344,9 @@ CREATE INDEX mv_idx ON mv (col);
 - `WITH NO DATA` makes reads fail with `CADB0531` until a refresh. `CONCURRENTLY`
   fails with `CADB0533`.
 - A materialized view gets a generated `id` key. You can index it.
+- The body can read a plain view. A scalar-subquery column keeps its declared type
+  when the subquery has no value. The definition binds without running subqueries.
+  The population step then runs the query, unless `WITH NO DATA` is given.
 - A refresh rebuilds beside the live copy and swaps atomically. Readers never block.
 - One refresh at a time per view, cluster-wide. A second one fails with `CADB0532`.
 - The rebuild writes `materialized_view_refresh_chunk_rows` rows per
@@ -382,15 +471,18 @@ unused handles.
 | `CADB0010` | `DatabaseDoesntExist` | Unknown database, or no grant on it. |
 | `CADB0011` | `TableDoesntExist` | Unknown table. |
 | `CADB0302` | `ValueTooLong` | Value exceeds `STRING(N)` or `BYTES(N)`. |
-| `CADB0400` | `InvalidInput` | Bad shape: CTAS projection, `INSERT ... SELECT` count, bad cast, bad regex, `RETURNING` aggregate. A comparison across types with no rule. No common type in `CASE`, `COALESCE`, `IFNULL`, `IF`, or a set operation. A window call in a bad clause. |
+| `CADB0303` | `CheckConstraintViolation` | A type error while an existing `CHECK` runs rejects the write. A new `CHECK` with a known type error fails at definition. |
+| `CADB0400` | `InvalidInput` | Bad shape: CTAS projection, `INSERT ... SELECT` count, bad cast, bad regex, `RETURNING` aggregate. A comparison across types with no rule. No common type in `CASE`, `COALESCE`, `IFNULL`, `IF`, or a set operation. A window call in a bad clause. A wrong argument count. A non-boolean `WHERE`, `HAVING`, or `JOIN ON`. A constant division by zero. A negative `LIMIT` or `OFFSET`. An ambiguous `ORDER BY` name. A bad `LIKE` escape. A lone surrogate half in a string parameter. Malformed JSON on a SQL endpoint. |
+| `CADB0401` | `UnknownType` | A known invalid assignment, refused before any row is read. |
 | `CADB0403` | `DuplicateColumn` | A repeated column in `UPDATE ... SET`, an `INSERT` target list, or `ON CONFLICT DO UPDATE`. |
 | `CADB0404` | `UnknownColumn` | Unknown column name. |
-| `CADB0406` | `SqlSyntaxError` | The parser cannot parse the text. |
+| `CADB0406` | `SqlSyntaxError` | The parser cannot parse the text. Also an unknown character, a non-SQL white space, a second statement in one request, or a chain such as `a = b = c`. The message gives the line and column. |
+| `CADB0407` | `InvalidAstStmt` | An unknown function, refused before any row is read. |
 | `CADB0413` | `StatementTooDeeplyNested` | Parse tree deeper than 1,000 levels, or more than 64 nested set operations. |
 | `CADB0417` | `NumericValueOutOfRange` | `NUMERIC` overflow. |
 | `CADB0418` | `InvalidJsonText` | Text is not a valid `jsonb` document. |
 | `CADB0419` | `JsonNestingTooDeep` | A document nests deeper than 512 levels. |
-| `CADB0420` | `IntegerValueOutOfRange` | `INT64` arithmetic, `SUM`, a literal, or a cast past the range. |
+| `CADB0420` | `IntegerValueOutOfRange` | `INT64` arithmetic, `SUM`, a literal, or a cast past the range. A value outside a declared `SMALLINT` or `INT` range. |
 | `CADB0421` | `FloatValueOutOfRange` | Float overflow or underflow from finite values. |
 | `CADB0422` | `JsonbValueTooLarge` | A built `jsonb` aggregate exceeds 268,435,455 bytes. |
 | `CADB0506` | `TransactionMutationLimitExceeded` | More than 20,000 mutations by default. |
@@ -404,11 +496,11 @@ unused handles.
 | `CADB0530` | `DependentObjectsExist` | Drop or truncate blocked by a view or foreign key. |
 | `CADB0531` | `MaterializedViewNotPopulated` | Read of a `WITH NO DATA` materialized view. |
 | `CADB0532` | `RefreshAlreadyInProgress` | A second concurrent refresh. |
-| `CADB0533` | `FeatureNotSupported` | Parsed but unimplemented: `REFRESH ... CONCURRENTLY`, `FULL JOIN`, `FOR SHARE`, a correlated `EXISTS` outside the `WHERE` of a `SELECT`, `LATERAL`, or a set-returning function in the select list. |
+| `CADB0533` | `FeatureNotSupported` | Parsed but unimplemented: `REFRESH ... CONCURRENTLY`, `FULL JOIN`, `FOR SHARE`, a correlated subquery in `HAVING`, `JOIN ON`, `ON CONFLICT DO UPDATE`, or a grouped select list, `LATERAL`, or a set-returning function in the select list. |
 | `CADB0534` | `ConcurrentSchemaChange` | Lost a schema race. Retryable. |
 | `CADB0537` | `SnapshotPrecedesContentsGeneration` | `AS OF SYSTEM TIME` before the last `TRUNCATE`. |
 | `CADB0538` | `StatementNotAllowedInTransaction` | `TRUNCATE` inside an explicit transaction. |
-| `CADB0547` | `SequenceCallNotAllowedHere` | Sequence call in `RETURNING` or a similar place. |
+| `CADB0547` | `SequenceCallNotAllowedHere` | Sequence call in `RETURNING`, in a nested `SELECT` without `FROM`, or in a filtered one. |
 | `CADB0550` | `ReturningResultTooLarge` | `RETURNING` rows exceed one gRPC reply (4 MiB). |
 | `CADB0555` | `LockNotAvailable` | `SELECT ... FOR UPDATE NOWAIT` met a held row. |
 | `CADB0556` | `ResultSetTooLarge` | A buffered result passed `max_buffered_result_rows` or `max_buffered_result_bytes`. Stream or page it. |

@@ -47,6 +47,8 @@ await connection.CreateDatabaseAsync(ifNotExists: true);
 - REST is the default transport. The REST port in the docs examples is `5095`.
 - For gRPC, set `Protocol=grpc` and point `Endpoint` at the gRPC port (`5096` in the docs).
 - A comma-separated `Endpoint` is a pool. The driver rotates and skips a dead endpoint for 30 seconds.
+  The request that finds the dead node can still fail; rotation does not replay it. Aspire
+  `AddCamusDBCluster` gives a connection string that lists every node.
 - Add `User` and `Password` when the server enables authentication. Use `https://` outside loopback.
 - Log `builder.ToRedactedString()`, never `ToString()`. `ToString()` includes credentials.
 - For code that uses the abstract ADO.NET types, use `CamusDataSource` or `CamusProviderFactory.Instance`.
@@ -134,7 +136,8 @@ JsonElement payload = reader.GetFieldValue<JsonElement>(0);
 - A plain `string` binds as `STRING`. A `jsonb` column parses it when it is written.
 - `GetString` and `GetValue` return text. `GetFieldValue<T>` returns a `JsonDocument`, `JsonElement`, `JsonNode`, `JsonObject`, or `JsonArray`.
 - A list of documents fails with `CADB0400`. The server has no `ARRAY(JSONB)`. Bind one JSON array instead.
-- JSON `null` reads as the text `null`. SQL `NULL` reads as `DBNull`.
+- JSON `null` reads as the text `null`. SQL `NULL` reads as `DBNull`. This needs current driver and
+  server versions; older REST servers can return both as the same null.
 - Invalid JSON fails with `CADB0418`. Nesting deeper than 512 levels fails with `CADB0419`.
 
 ## Transactions and retries
@@ -172,6 +175,7 @@ await SerializableRetryHelper.ExecuteAutocommitAsync(async ct =>
 - The helper backoff is `min(20 ms * 2^attempt, 400 ms)` plus or minus 25 percent.
 - Keep side effects out of the retried body. It can run more than once.
 - Use `CamusTransactionOptions.Snapshot` for a consistent read-only view across statements.
+- Over gRPC, the driver carries causal tokens for you. Do not build or copy token fields.
 - Do not retry `CADB0506` (mutation limit). Split the work below 20,000 mutations.
 - Disposing an unfinished transaction rolls it back. A rollback failure during dispose is ignored.
 - `CADB0555` (`FOR UPDATE NOWAIT` met a held row) ends the transaction. `IsRetryable` returns false for it.

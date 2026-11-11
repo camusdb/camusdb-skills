@@ -1,6 +1,6 @@
 ---
 name: camusdb-query-performance
-description: Diagnoses and fixes slow CamusDB SQL queries. Guides the agent through SHOW STATEMENT STATS, SHOW SLOW QUERIES, SHOW QUERIES and SHOW INDEX USAGE, EXPLAIN and EXPLAIN (ANALYZE) plan reading (table-scan, index-range-scan, index-only=true, gin-scan, topk, window, union, lock_rows, hash-join, merge-join, index-nested-loop-join, estimate_trace, gather), SHOW STATISTICS FOR, ANALYZE TABLE and automatic analyze, CREATE INDEX with INCLUDE covering indexes, DROP INDEX, @{FORCE_INDEX=...}, {cache=..., ttl=..., strict} result-cache hints and EVICT CACHE, AS OF SYSTEM TIME historical reads, spill to disk, buffered result limits, distributed query execution, SHOW RANGES and key-range sharding, and SQL routing advice. Use when a CamusDB query is slow, a plan looks wrong, estimates differ from actual rows, a query does a full scan or spills, an index looks unused, or errors CADB0549, CADB0536, CADB0507 or CADB0556 appear.
+description: Diagnoses and fixes slow CamusDB SQL queries. Guides the agent through SHOW STATEMENT STATS, SHOW SLOW QUERIES, SHOW QUERIES and SHOW INDEX USAGE, EXPLAIN and EXPLAIN (ANALYZE) plan reading (table-scan, index-range-scan, index-only=true, gin-scan, topk, window, union, lock_rows, hash-join, merge-join, index-nested-loop-join, estimate_trace, gather), SHOW STATISTICS FOR, ANALYZE TABLE and automatic analyze, CREATE INDEX with INCLUDE covering indexes, DROP INDEX, @{FORCE_INDEX=...}, {cache=..., ttl=..., strict} result-cache hints and EVICT CACHE, AS OF SYSTEM TIME historical reads, correlated subqueries (EXISTS, IN, scalar) and semi-joins, spill to disk, buffered result limits, distributed query execution, SHOW RANGES and key-range sharding, and SQL routing advice. Use when a CamusDB query is slow, a plan looks wrong, estimates differ from actual rows, a query does a full scan or spills, an index looks unused, or errors CADB0549, CADB0536, CADB0507 or CADB0556 appear.
 ---
 
 # CamusDB query performance
@@ -176,9 +176,15 @@ columns of an `EXISTS`. Use qualified names in joins.
 
 - An uncorrelated subquery runs once and folds to its value, in every expression
   position and at any depth.
-- A correlated `EXISTS` works only in the `WHERE` of a `SELECT`. It runs per row.
-  Elsewhere it fails with `CADB0533`.
-- A correlated `IN` or `NOT IN` is refused. Rewrite it as a correlated `EXISTS`.
+- Correlated scalar, `EXISTS`, `IN`/`NOT IN` and quantified subqueries run per
+  outer row in `SELECT` `WHERE`, an ungrouped `SELECT` list, `UPDATE SET`/`WHERE`
+  and `DELETE WHERE`. A simple one-table `EXISTS` seeks an index on its
+  correlated columns. Other bodies use the full query pipeline.
+- A bounded per-statement cache can reuse a correlated result for repeated outer
+  values. Do not assume every body is cached. See
+  [references/planner-rules.md](references/planner-rules.md#subqueries).
+- A column in an `IN` list, such as `IN (preferred_status, 'pending')`, makes
+  the list per row. It is not an index seek.
 
 **Cache a repeated single-table read.**
 
@@ -309,8 +315,9 @@ routing advice.
 - Adding a cache hint to a join or inside `BEGIN ... COMMIT`. It has no effect.
 - Expecting `pg_stat_statements`. Use `SHOW STATEMENT STATS`.
 - Expecting `pg_stat_user_indexes`. Use `SHOW INDEX USAGE`.
-- Putting a correlated `EXISTS` in the select list, `HAVING` or `JOIN ON`. It fails
-  with `CADB0533`. A subquery in `ORDER BY` or `GROUP BY` fails with `CADB0400`.
+- Putting a correlated subquery in `HAVING`, `JOIN ON`, `ON CONFLICT DO UPDATE`
+  or a grouped, aggregate or windowed select list. It fails with `CADB0533`. A
+  subquery in `ORDER BY` or `GROUP BY` fails with `CADB0400`.
 - Writing `COUNT(DISTINCT x)`, `FULL OUTER JOIN`, `NATURAL JOIN` or
   `JOIN ... USING`. These are not supported. Rewrite the query.
 - Expecting `NOT IN (1, 2, 3)` to probe an index. A `NOT IN` value list stays a
@@ -332,19 +339,9 @@ routing advice.
   `{cache=...}` or using `EVICT CACHE`.
 - [references/distributed-execution.md](references/distributed-execution.md):
   read for clusters, key-range sharding, `SHOW RANGES` and routing advice.
-- Public docs:
-  - https://camusdb.github.io/docs/explain
-  - https://camusdb.github.io/docs/query-planning
-  - https://camusdb.github.io/docs/query-planner-internals
-  - https://camusdb.github.io/docs/show-statistics
-  - https://camusdb.github.io/docs/automatic-analyze
-  - https://camusdb.github.io/docs/sql-indexes
-  - https://camusdb.github.io/docs/query-result-cache
-  - https://camusdb.github.io/docs/spill-to-disk
-  - https://camusdb.github.io/docs/query-activity
-  - https://camusdb.github.io/docs/slow-query-log
-  - https://camusdb.github.io/docs/statement-stats
-  - https://camusdb.github.io/docs/index-usage
-  - https://camusdb.github.io/docs/json
-  - https://camusdb.github.io/docs/best-practices
-  - https://camusdb.github.io/docs/time-travel-reads
+- Public docs, under `https://camusdb.github.io/docs/`: `explain`,
+  `query-planning`, `query-planner-internals`, `show-statistics`,
+  `automatic-analyze`, `sql-indexes`, `query-result-cache`, `spill-to-disk`,
+  `query-activity`, `slow-query-log`, `statement-stats`, `index-usage`, `json`,
+  `best-practices`, `time-travel-reads`, `joins-and-subqueries`,
+  `sql-expression-syntax`, `sql-fromless-select`, `distributed-queries`.

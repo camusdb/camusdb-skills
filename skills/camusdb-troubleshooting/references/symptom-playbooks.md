@@ -24,6 +24,9 @@ error code. Each playbook lists checks in order, then fixes.
 17. Result too large (`CADB0556`)
 18. Too many open transactions (`CADB0558`)
 19. Node refuses to start with `CADB0600` routing mode
+20. A statement fails with `CADB0400` after an upgrade
+21. Syntax error at an invisible character (`CADB0406`)
+22. Detected storage damage (`CADB0837`)
 
 ## 1. Conflict storm (`CADB0502`)
 
@@ -245,8 +248,13 @@ changes no row.
   error.
 - Under `READ COMMITTED`, a second statement can see different rows and phantoms.
   One `SELECT` reads one snapshot in a pessimistic transaction.
-- A read at a snapshot can miss a commit from a node with a later clock. Pass the
-  causal token of that commit.
+- A read at a snapshot can miss a commit from a node with a later clock. The .NET
+  and TypeScript gRPC clients carry the causal token for you. Python does not
+  track causal tokens. A custom client passes the token of that commit.
+- After an upgrade, a stored `LIKE` pattern in a view uses the new rules: `_`
+  matches one character and a backslash escapes. Escape literal underscores.
+- An unaliased expression column is named by its zero-based position in the
+  select list, not by the function name. Alias computed columns.
 - `LIKE` in `SHOW` statements is case-sensitive. `LIKE 'TTL_%'` matches nothing.
 
 ## 14. Statement refused with `CADB0824` after an earlier error
@@ -271,7 +279,7 @@ Fixes:
 
 - Roll back and start a new transaction. Replay it if the first error is retryable.
 - Replace the caught duplicate key with `INSERT ... ON CONFLICT` or `UPSERT INTO`.
-- See the `camusdb-transactions` skill for the retry loop.
+- See the `camusdb-transactions` skill for the driver retry helpers.
 
 ## 15. `UPDATE` or `DELETE` now fails with `CADB0400` on a type mismatch
 
@@ -286,7 +294,8 @@ No matching signature for operator = for argument types: Integer64, String
   with `INT64`, `BYTES` with `STRING`, and `NUMERIC` with `STRING`.
 - The rule covers `IN`, `BETWEEN`, simple `CASE`, `JOIN ... ON`, `HAVING`, and typed
   parameters. `1 IN (1, 'a')` fails even though an item matches.
-- The check runs when values compare. A predicate over an empty table raises nothing.
+- Known incompatible types fail before any row is read, even on an empty table.
+  Types known only from a parameter's value are checked when the value compares.
 - A `STRING` against `UUID`, `ID`, or `JSONB` that does not parse is still a non-match.
 - `CASE`, `COALESCE`, `IFNULL`, and `IF` need one result type. Other pairs give
   `CADB0400` when the statement is bound.
@@ -304,11 +313,19 @@ statement stores nothing. `CADB0421` is the same rule for floats.
 
 - Checked: `+`, `-`, `*`, `/`, unary minus, integer literals, conversions to
   `INT64`, and the `SUM` total. Only the final `SUM` total is checked.
+- A new `SMALLINT` column accepts -32768 to 32767. A new `INT` or `INTEGER` column
+  accepts the signed 32-bit range. A write, cast, default, or sequence value
+  outside it fails with `CADB0420`. Columns created before this rule keep the
+  full `INT64` range.
+- A float cast to an integer rounds half away from zero, then checks the range.
+  NaN and infinity fail with `CADB0420`.
+- `exp` overflow, or underflow to zero, fails with `CADB0421`.
 - `AVG` of `INT64` divides the exact total and never overflows.
 
 Fixes:
 
 - Use `NUMERIC` for a wider exact value: `SUM(CAST(x AS NUMERIC))`.
+- Declare `BIGINT` or `INT64` for a column whose values can pass 32 bits.
 - Find bad values if the total should fit. Inside an explicit transaction, the
   failure aborts the transaction.
 
@@ -372,3 +389,75 @@ Docs:
 - https://camusdb.github.io/docs/distributed-schema
 - https://camusdb.github.io/docs/wal-recovery
 - https://camusdb.github.io/docs/connection-model
+
+## 20. A statement fails with `CADB0400` after an upgrade
+
+Newer builds check more mistakes before they read a row. The statement fails
+even on an empty table, under `LIMIT 0` or `WHERE FALSE`, or in an unused
+branch. Read the message, then match it:
+
+| Cause | Example | Fix |
+| --- | --- | --- |
+| A condition that is not boolean | `WHERE 1`, `WHERE 'true'` | `WHERE TRUE`, or a real comparison. |
+| A constant division by zero | `SELECT 1 / 0 WHERE FALSE` | Remove it. Guard a row divisor: `CASE WHEN q <> 0 THEN 1 / q END`. |
+| A negative `LIMIT` or `OFFSET` | `LIMIT -1`, or a negative `@limit` | Validate the value in the application. |
+| An ambiguous `ORDER BY` name | Two different output columns named `total` | Give unique aliases, or `ORDER BY 2`. |
+| A bare input column in a global aggregate's `ORDER BY` | `SELECT COUNT(*) FROM t ORDER BY id` | Order by an output alias or position, or remove it. |
+| Half of a surrogate pair in a string parameter | An emoji cut in half by the client | Fix the text at the application boundary. The message names the parameter and position. |
+| Malformed JSON body on a SQL endpoint | An escaped lone surrogate | Fix the client encoder. The message gives the JSON path and byte position. |
+| A bad `LIKE` escape | `ESCAPE 'ab'`, or a pattern that ends with its escape character | Use a one-character `ESCAPE`. Escape or remove the trailing character. |
+| A wrong argument count | `substring(s)` | Fix the call. An unknown function gives `CADB0407`. |
+
+These are not retryable. A gRPC client can replace a surrogate half with U+FFFD
+before it sends, and the server cannot detect that change. Validate text before
+you encode it.
+
+`COALESCE`, `IFNULL`, and `NVL` now stop at the first value that is not NULL:
+`COALESCE(1, 1 / 0)` returns 1. A proven unused branch is skipped, but a
+row-dependent condition cannot hide a constant division error. A known type
+mismatch still fails: `COALESCE(1, upper('a'))` is an error.
+
+## 21. Syntax error at an invisible character (`CADB0406`)
+
+The parser refuses an unknown character outside a literal, quoted identifier,
+or comment. The message gives the line and column.
+
+Checks:
+
+1. Go to the line and column in the message.
+2. Look for a non-breaking space (U+00A0), a byte-order mark (U+FEFF), a stray
+   backslash, or a bare `$`. SQL copied from a web page or a document often has
+   them.
+3. Look for a raw line break or tab inside a string literal or quoted identifier.
+4. Look for a second statement in the same request. A request holds one
+   statement. Repeated trailing semicolons are allowed.
+
+Fixes:
+
+- Retype the whitespace as plain spaces.
+- Use an escape string for a line break: `E'line\nnext'`.
+- Split a script into one request per statement. A client that runs scripts
+  sends each statement as its own request.
+- Replace a comparison chain `a = b = c` with `a = b AND b = c`.
+
+## 22. Detected storage damage (`CADB0837`)
+
+A RocksDB or Solarium store that detects damage stops serving data. The node
+gives up leadership and does not campaign.
+
+Checks:
+
+1. `GET /v1/cluster/health` on each node. A storage fault makes `ready` false
+   and returns HTTP 503. Read `storageFault` and `partitionStorageFaults` in the
+   body. With authentication on, only a superuser sees these details.
+2. Check the log for a Critical message about lost acknowledged log entries. By
+   default (`kahuna.raft_lost_acknowledged_entries_policy: quarantine`) such a
+   replica does not vote or campaign until its leader repairs it.
+
+Fixes:
+
+- Never treat `CADB0837` as an empty result, and do not retry it as a conflict.
+- Keep the node out of service. Let the surviving replicas serve the data, or
+  restore a backup. See the `camusdb-migrations-and-recovery` skill.
+- The endpoint does not scan for damage or repair it. SQLite has no page
+  checksums, so detection there is weaker.

@@ -2,6 +2,7 @@
 
 Sources:
 https://camusdb.github.io/docs/configuration,
+https://camusdb.github.io/docs/settings-reference,
 https://camusdb.github.io/docs/key-range-sharding,
 https://camusdb.github.io/docs/runtime-cluster-settings,
 https://camusdb.github.io/docs/sql-authentication,
@@ -138,6 +139,47 @@ kahuna:
 - A backup bootstrap (`pitr_bootstrap_from`) still needs RocksDB for the store and the Raft log.
 - `io_uring` stops the node from starting where the kernel cannot create a ring.
 
+### Storage damage and lost log entries
+
+- With RocksDB or Solarium, a store that detects damage stops serving data. The node gives up
+  leadership and does not run for leader. It does not rewrite the damaged files.
+- A read that reports `CADB0837 StorageCorrupted` failed. It did not find zero rows. Do not retry
+  it as a transaction conflict. Monitor with `GET /v1/cluster/health` (see `local-cluster.md`).
+- SQLite has no page checksums, and its WAL replay can stop at a damaged frame. Its Raft metadata
+  uses `synchronous=NORMAL` whatever `kahuna.wal_sync_writes` says.
+- A healthy endpoint alone does not prove that every stored byte is intact.
+
+`kahuna.raft_lost_acknowledged_entries_policy` (restart only) controls a replica that finds,
+after a restart, that it lost log entries it had acknowledged:
+
+| Value | Behavior |
+| --- | --- |
+| `quarantine` (default) | The replica does not vote or campaign until its leader repairs it. With one replica there is no peer to repair from: the partition stays leaderless and logs a Critical message. |
+| `accept_and_log` | Accepts and logs the loss, and turns off this safety fence. It does not restore entries. With one replica the loss is permanent. |
+
+The policy is separate from repairing damaged storage or restoring a backup.
+
+## Inline C# functions and triggers
+
+Both creation features are off by default. Turn each on separately:
+
+```yaml
+inline_functions_enabled: true
+inline_triggers_enabled: true
+```
+
+- Restart after a change. Use the same value on every node (cluster scope).
+- Turning a feature off blocks new definitions only. Existing functions still run, and existing
+  triggers still fire.
+- Budget keys (all restart only): `inline_function_call_timeout_ms` (`1000`),
+  `inline_function_allocation_limit_bytes` (16 MiB), `inline_function_array_limit` (`1048576`),
+  `inline_function_source_limit_bytes` (`65536`), `inline_function_compile_timeout_ms` (`10000`,
+  node), `inline_function_compile_concurrency` (`2`, node), `max_inline_functions_per_database`
+  (`256`).
+- Inline bodies run inside the server process. Configure a process heap hard limit as the memory
+  backstop.
+- Use the `camusdb-csharp-extensions` skill for the SQL and the C# rules.
+
 ## Request resource limits
 
 These limits bound what one client request can cost a node. A value of `0` or less disables a limit.
@@ -168,7 +210,8 @@ SHOW VARIABLES LIKE 'slow_query_%';
 
 Columns: `variable`, `value`, `type`, `default`, `source`, `mutability`, `scope`.
 `source` is `default`, `config`, `env`, `cli`, or `cluster`. Secrets render as `********`.
-The `LIKE` match is case-sensitive; names are lowercase.
+The `LIKE` match is case-sensitive; names are lowercase. It uses the query wildcards and escapes:
+`_` matches one character, so write `SHOW VARIABLES LIKE 'ttl\_%'` for a literal underscore.
 
 ## Runtime cluster settings
 
@@ -293,7 +336,8 @@ use the `CamusAuth` service and the `authorization` metadata key.
 Startup fails with `InvalidConfig` for: unknown `mode`, unknown `memory_profile`, a port
 outside 1 to 65535, `http_peers` count different from `peers` count, a `peers` entry equal to
 the node's own `raft_host:raft_port`, an unknown `kahuna` key, an invalid
-`kahuna.solarium_environment`, and other invariant breaks listed in the configuration docs.
+`kahuna.solarium_environment`, an invalid `kahuna.raft_lost_acknowledged_entries_policy`
+(expected `quarantine` or `accept_and_log`), and other invariant breaks listed in the configuration docs.
 
 Two more checks refuse the start with the same code (`CADB0600`): a `key_range_sharding` value that
 disagrees with the recorded mode, and auth on with peers and no mutual TLS.

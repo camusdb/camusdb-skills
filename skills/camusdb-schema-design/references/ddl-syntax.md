@@ -319,11 +319,32 @@ Rejected with `CADB0400`: a subquery, an aggregate, a volatile function
 (`now()`, `gen_id()`, `gen_uuid_v4()`, `gen_uuid_v7()`), an unknown column, and
 a malformed literal regex pattern.
 
+`CREATE TABLE` and `ADD CONSTRAINT` also reject these before any row is scanned:
+
+- A condition that is not boolean, such as `CHECK (qty)` or `CHECK (1)`.
+- An unknown function (`CADB0407`) or a wrong argument count.
+- A known operand-type mismatch, such as a `STRING` column compared with a number.
+
+Existing stored checks are not validated again when they load.
+
 A check whose result is `NULL` passes. Combine it with `NOT NULL`.
 
-A comparison between types with no rule, such as a `STRING` column and a number,
-rejects the row at write time with `CADB0303`. Write a `CAST`. See
+A type error found only while an existing check runs rejects the row with
+`CADB0303`. Write a `CAST`. See
 [data-types.md](data-types.md#comparing-different-types).
+
+Stored checks after an upgrade:
+
+- A `LIKE` or `ILIKE` pattern in a check takes the new matching rules at its
+  next evaluation. Older builds treated `_` and a backslash as literals. Now
+  `_` matches one code point and a backslash escapes the next character. A
+  check can then reject a value that it accepted before. Escape literal `_` and
+  `\` in stored patterns: `CHECK (code LIKE 'A\_%')`.
+- A stored check keeps its old operator grouping, because its saved SQL has
+  parentheses. Read `SHOW CREATE TABLE`. Recreate the check to get the new
+  PostgreSQL precedence.
+- A float-to-integer cast in a check uses half-away-from-zero rounding for new
+  writes.
 
 ## Foreign keys
 
@@ -378,7 +399,16 @@ SHOW CREATE SEQUENCE order_no;
 
 - A sequence shares the name space of tables and views (`CADB0542`).
 - `nextval` works in `INSERT ... VALUES`, in column defaults used by `INSERT`,
-  and in a `SELECT` without `FROM`. Elsewhere it fails with `CADB0547`.
+  and in a top-level `SELECT` without `FROM`. Elsewhere it fails with
+  `CADB0547`. A `SELECT` without `FROM` that is nested in another statement
+  refuses it. With `WHERE`, it is refused unless the filter drops the row
+  before the call runs.
+- `COALESCE`, `IFNULL`, and `NVL` stop at the first non-`NULL` value.
+  `COALESCE(1, nextval('s'))` does not advance `s`. A call that the statement
+  cannot prove unreachable can reserve a value that is never used.
+- `SERIAL` and `BIGSERIAL` are both 64-bit, unlike PostgreSQL `SERIAL`.
+- A sequence on a `SMALLINT` or `INT` column keeps its own bounds. A value
+  outside the column range fails the write with `CADB0420`.
 - An identity sequence is owned by its column. `DROP SEQUENCE` on it fails
   with `CADB0548`.
 - `TRUNCATE ... RESTART IDENTITY` restarts owned sequences only.

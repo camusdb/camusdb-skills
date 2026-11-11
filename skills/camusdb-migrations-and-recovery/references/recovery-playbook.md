@@ -4,7 +4,9 @@ Sources: https://camusdb.github.io/docs/time-travel-reads,
 https://camusdb.github.io/docs/insert-select-and-ctas,
 https://camusdb.github.io/docs/recover-dropped-objects,
 https://camusdb.github.io/docs/truncate-table,
-https://camusdb.github.io/docs/configuration
+https://camusdb.github.io/docs/configuration,
+https://camusdb.github.io/docs/cluster#check-storage-health,
+https://camusdb.github.io/docs/wal-recovery
 
 Before any recovery: stop the process that caused the damage. Then ask the user
 to confirm the target time, the affected tables, and the recovery name.
@@ -190,6 +192,48 @@ it, then copy the needed data back with `camus-dump` and `camus-cli`. See
 [backup-and-restore.md](backup-and-restore.md) and
 [dump-and-reimport.md](dump-and-reimport.md).
 
+## Recipe 6: detected storage damage
+
+With RocksDB or Solarium, a store that detects damage stops serving data. The
+node gives up leadership and does not campaign. It does not rewrite the damaged
+files.
+
+- A read that reports `CADB0837 StorageCorrupted` failed. It did not find zero
+  rows. It returns HTTP 500 or gRPC `DATA_LOSS`. Do not retry it as a
+  transaction conflict.
+- `GET /v1/cluster/health` returns HTTP 503 and `ready: false` when the node
+  reports a store or partition storage fault. Read the body too: `storageFault`
+  has the engine's message, and `partitionStorageFaults` lists hosted
+  partitions. The messages can contain file paths. With authentication on,
+  only a superuser sees these details.
+- The endpoint does not scan for damage and does not repair it. A healthy
+  endpoint does not prove that every stored byte is intact.
+- Keep the damaged node out of service. Recover from the surviving replicas, or
+  restore a [backup](backup-and-restore.md).
+
+After a restart, `kahuna.raft_lost_acknowledged_entries_policy` decides what a
+replica does when it finds that it lost log entries it acknowledged:
+
+| Value | Behavior |
+| --- | --- |
+| `quarantine` (default) | The replica does not vote or campaign until its leader repairs it. With one replica there is no peer to repair from, so the partition stays leaderless and logs a Critical message. |
+| `accept_and_log` | Accepts and logs the loss. This turns off the safety fence. It does not restore the entries. With one replica, the loss is permanent. |
+
+A policy change needs a restart. An invalid value fails startup with
+`InvalidConfig`. The policy does not repair damaged storage or restore a backup.
+
+Backend limits:
+
+- SQLite has no page checksums. Its WAL replay can stop at a damaged frame.
+- SQLite Raft metadata uses `synchronous=NORMAL`, whatever `kahuna.wal_sync_writes` says.
+
+To test recovery after a range split at a known point, call
+`POST /v1/cluster/split-range` with `database`, `table`, optional `index`, and
+`maxKeys` (default 1,000,000). The endpoint chooses the median key. With
+authentication on, the caller must be a superuser. With it off, the endpoint
+accepts loopback calls only. Automatic splits stay the normal way to handle growth. See
+https://camusdb.github.io/docs/key-range-sharding#split-a-range-manually.
+
 ## Preventive habits
 
 - Use plain `DROP` first. Use `FORCE` later, only when nobody needs the data.
@@ -209,3 +253,4 @@ it, then copy the needed data back with `camus-dump` and `camus-cli`. See
 | `CADB0530` | `DependentObjectsExist` | `TRUNCATE` or `DROP` of a referenced parent. |
 | `CADB0534` | `ConcurrentSchemaChange` | Lost a race with another truncate. Retryable. |
 | `CADB0517` | `InsufficientPrivilege` | `TRUNCATE` needs both `DELETE` and `DROP` on the table. |
+| `CADB0837` | `StorageCorrupted` | The store reports damage. Not retryable. Never read it as an empty result. |

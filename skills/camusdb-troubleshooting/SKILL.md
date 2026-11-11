@@ -1,6 +1,6 @@
 ---
 name: camusdb-troubleshooting
-description: Diagnoses CamusDB errors and runtime problems. Explains the cause, the fix, and the retry rule for any CADBxxxx error code, such as CADB0502 TransactionConflict, CADB0504, CADB0509, CADB0506, CADB0503, CADB0536, CADB0549, CADB0555, CADB0556, CADB0558, CADB0824 TransactionRollbackOnly, CADB0420, CADB0600, or CADB0517. Guides diagnosis of slow, stuck, or overloaded workloads with SHOW QUERIES, SHOW CLUSTER QUERIES, SHOW CONNECTIONS, CANCEL QUERY, SHOW SLOW QUERIES, SHOW STATEMENT STATS, SHOW INDEX USAGE, SHOW ENGINE STATS, SHOW VARIABLES, Prometheus and OpenTelemetry diagnostics, and the operator dashboard. Use when a user pastes a CamusDB error, an HTTP "status":"failed" body, a gRPC camus-error-code trailer, or a Kommander "Slow dispatch" warning, or reports latency spikes, hung queries, conflict storms, refused writes, or nodes that disagree.
+description: Diagnoses CamusDB errors and runtime problems. Explains the cause, the fix, and the retry rule for any CADBxxxx error code, such as CADB0502 TransactionConflict, CADB0504, CADB0509, CADB0506, CADB0503, CADB0536, CADB0549, CADB0555, CADB0556, CADB0558, CADB0824 TransactionRollbackOnly, CADB0400, CADB0406, CADB0420, CADB0421, CADB0600, CADB0517, CADB0837 StorageCorrupted, or inline C# codes CADB0838 to CADB0846. Guides diagnosis of slow, stuck, or overloaded workloads with SHOW QUERIES, SHOW CLUSTER QUERIES, SHOW CONNECTIONS, CANCEL QUERY, SHOW SLOW QUERIES, SHOW STATEMENT STATS, SHOW INDEX USAGE, SHOW ENGINE STATS, SHOW VARIABLES, /v1/cluster/health storage faults, Prometheus and OpenTelemetry diagnostics, and the operator dashboard. Use when a user pastes a CamusDB error, an HTTP "status":"failed" body, a gRPC camus-error-code trailer, or a Kommander "Slow dispatch" warning, or reports latency spikes, hung queries, conflict storms, refused writes, statements that fail after an upgrade, or nodes that disagree.
 ---
 
 # CamusDB troubleshooting
@@ -38,7 +38,7 @@ skill. For writing retry code, use the `camusdb-transactions` skill.
 | HTTP streaming | The last trailer line, possibly after HTTP `200` |
 | gRPC unary or streaming | The `camus-error-code` trailer |
 | gRPC batch | The `BatchError` message of the operation |
-| .NET driver | `CamusException.Code` |
+| Drivers | The exception or error object: .NET `CamusException.Code`; TypeScript and Python expose the code too |
 | Slow query log | The `error_code` column of a failed entry |
 
 ## Code families
@@ -51,18 +51,18 @@ skill. For writing retry code, use the `camusdb-transactions` skill.
 | `CADB05xx` | Transactions, schema catch-up, prepared statements, auth, views, sequences, query cancel, row locks, node limits. |
 | `CADB06xx` | Configuration validation. |
 | `CADB07xx` | Backup and point-in-time recovery. |
-| `CADB08xx` | C# extensions and triggers. Also `CADB0824`, an aborted transaction. |
+| `CADB08xx` | C# extensions, inline functions, and triggers. Also `CADB0824`, an aborted transaction, and `CADB0837`, detected storage damage. |
 
 ## Retry classes
 
 | Class | Codes | Action |
 | --- | --- | --- |
-| Replay | `CADB0502`, `CADB0504`, `CADB0505` | Roll back. Replay the whole transaction from `BEGIN`, with backoff. |
-| Finalize | `CADB0509` | Resend the same `COMMIT` or `ROLLBACK` for the same transaction id. Never replay. |
+| Replay | `CADB0502`, `CADB0504`, `CADB0505` | The driver retry helpers replay the whole callback, with backoff. A custom client replays from `BEGIN`. |
+| Finalize | `CADB0509` | The driver's commit or rollback resends the same finalize. If it still fails, resend it for the same transaction id. Never replay. |
 | Retry | `CADB0503`, `CADB0520` (after re-prepare), `CADB0532`, `CADB0534`, `CADB0535`, `CADB0558`, `CADB070A`, `CADB070D` | Retry after the condition clears. |
-| After fix | `CADB0516`, `CADB0518`, `CADB0536`, `CADB0817`, `CADB0834` | Fresh credentials, wait out the rate limit, free disk, or deploy the extension file. Then retry. |
+| After fix | `CADB0516`, `CADB0518`, `CADB0536`, `CADB0817`, `CADB0834`, `CADB0845` | Fresh credentials, wait out the rate limit, free disk, or deploy the extension file. Then retry. |
 | Fix first | `CADB0506`, `CADB0555`, `CADB0556`, `CADB0824`, and most `03xx`, `04xx`, `05xx` codes | Change the request, data, or schema. A retry fails again. |
-| Operator | `CADB0014`, `CADB0099`, `CADB0559`, `CADB0701`, `CADB0704`, `CADB0706`, `CADB070F` | Investigate. Collect logs. |
+| Operator | `CADB0014`, `CADB0099`, `CADB0559`, `CADB0701`, `CADB0704`, `CADB0706`, `CADB070F`, `CADB0837` | Investigate. Collect logs. Never retry `CADB0837` or read it as an empty result. |
 
 ## The most common errors
 
@@ -117,6 +117,22 @@ transactions.
 **`CADB0010 DatabaseDoesntExist`.** The database was never created, or the
 caller has no grant on it. Both cases return the same code on purpose.
 
+**`CADB0400 InvalidInput` before any row is read.** Newer builds refuse a
+non-boolean `WHERE` (`WHERE 1`), a constant division by zero, a negative `LIMIT`
+or `OFFSET`, an ambiguous `ORDER BY` name, and half of a surrogate pair in a
+string parameter. The statement fails even on an empty table. Fix the SQL.
+
+**`CADB0406 SqlSyntaxError` at an odd position.** An unknown or invisible
+character, such as a non-breaking space, or a second statement in one request.
+The message gives the line and column.
+
+**`CADB0837 StorageCorrupted`.** The store detected damage and stopped. Not
+retryable. Check `GET /v1/cluster/health` and keep the node out of service.
+
+**`CADB0838` to `CADB0846`.** Inline C# function or trigger errors: compile
+failure, refused construct, budget, feature off, or a missing owner. See the
+`camusdb-csharp-extensions` skill.
+
 **`CADB0538 StatementNotAllowedInTransaction`.** `TRUNCATE`, `ALTER TABLE ...
 REWRITE STORAGE`, or `ALTER SEQUENCE ... RESTART` ran inside `BEGIN`. The refusal
 aborts the transaction. Roll back, then run it in autocommit.
@@ -144,6 +160,9 @@ aborts the transaction. Roll back, then run it in autocommit.
 | Result too large, `CADB0556` | Transport, `LIMIT` | 17 |
 | Too many open transactions, `CADB0558` | `SHOW CONNECTIONS`, `idle_ms` | 18 |
 | Node refuses to start, `CADB0600` routing mode | `key_range_sharding` setting | 19 |
+| Statement fails with `CADB0400` after an upgrade | The message and the SQL | 20 |
+| `CADB0406` at an invisible character | The line and column in the message | 21 |
+| `CADB0837`, or health endpoint returns 503 | `GET /v1/cluster/health` body | 22 |
 
 ## Observability tools
 
@@ -167,7 +186,7 @@ SHOW INDEX USAGE FROM orders;
 SHOW ENGINE STATS LIKE 'raft.wal%';
 
 -- Effective configuration and where each value came from
-SHOW VARIABLES LIKE 'slow_query%';
+SHOW VARIABLES LIKE 'slow\_query%';
 ```
 
 Rules for reading them:
@@ -183,7 +202,8 @@ Rules for reading them:
 - An idle explicit transaction is not in `SHOW QUERIES`. Find its connection in
   `SHOW CONNECTIONS` by a large `idle_ms`.
 - Only reads are cancellable. There is no `KILL CONNECTION`.
-- `LIKE` in these statements is case-sensitive. Names are lowercase.
+- `LIKE` in these statements is case-sensitive. Names are lowercase. `_` matches
+  one character. Escape it for a literal underscore: `'ttl\_%'`.
 - The operator dashboard is on the node's HTTP port. It is read-only and keeps
   no history.
 - For history and alerts, enable the `diagnostics:` section (Prometheus at
@@ -242,7 +262,7 @@ Read these files when the task needs the detail:
 - [references/error-codes.md](references/error-codes.md): every code with name,
   meaning, fix, and retry class. Read it for any `CADBxxxx` code.
 - [references/symptom-playbooks.md](references/symptom-playbooks.md): ordered
-  checks and fixes for 19 symptoms.
+  checks and fixes for 22 symptoms.
 - [references/observability.md](references/observability.md): columns,
   metrics, settings, and permissions of each tool.
 
@@ -262,3 +282,7 @@ Public docs:
 - https://camusdb.github.io/docs/serializable-retries
 - https://camusdb.github.io/docs/sql-transactions#failed-statements
 - https://camusdb.github.io/docs/transaction-limits
+- https://camusdb.github.io/docs/data-types#errors-before-reading-rows
+- https://camusdb.github.io/docs/sql-expression-syntax
+- https://camusdb.github.io/docs/cluster#check-storage-health
+- https://camusdb.github.io/docs/csharp-extensions

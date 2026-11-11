@@ -16,14 +16,16 @@ https://camusdb.github.io/docs/error-codes.
 | Lifetime of a serializable read-write transaction | 1 hour | - | `CADB0505` |
 | Columns per index, key plus `INCLUDE` | 32 | `max_index_columns` | `CADB0408` |
 | `INCLUDE` payload per index entry | 4 KiB | `max_index_include_tuple_bytes` | - |
-| Bare `STRING` length | 2,621,440 characters | - | `CADB0302` |
+| Bare `STRING` length | 2,621,440 code points | - | `CADB0302` |
 | Bare `BYTES` length | 10,485,760 bytes | - | `CADB0302` |
 | Out-of-line threshold | 2048 bytes | `large_value_threshold_bytes` | - |
 | Minimum compression saving | 12 percent | `large_value_compression_min_saving_percent` | - |
 | Rows per `REWRITE STORAGE` batch | 200 | `large_value_rewrite_batch_rows` | - |
 | Comment length | 65,535 characters | - | `CADB0511` |
 | `NUMERIC` | Precision 38, scale 9 | - | `CADB0417` |
-| `INT64` range | 64-bit signed | - | `CADB0420` |
+| `INT64`, `BIGINT` range | 64-bit signed | - | `CADB0420` |
+| `INT`, `INTEGER` range | -2147483648 to 2147483647 | - | `CADB0420` |
+| `SMALLINT` range | -32768 to 32767 | - | `CADB0420` |
 | `JSONB` nesting depth | 512 levels | Fixed | `CADB0419` |
 | `jsonb_agg`, `jsonb_object_agg` result | 268,435,455 bytes | - | `CADB0422` |
 
@@ -68,14 +70,15 @@ exempt. `TRUNCATE` counts no mutations.
 | `CADB0300` | `DuplicateUniqueKeyValue` | Duplicate key, or unique index backfill finds duplicates | Clean the data first. |
 | `CADB0301` | `NotNullViolation` | `NULL` into `NOT NULL`; `SET NOT NULL` or `ADD COLUMN ... NOT NULL` over rows without a value | Add a `DEFAULT`, or fill the column first. |
 | `CADB0302` | `ValueTooLong` | Value longer than `STRING(N)` or `BYTES(N)` | Raise the bound or shorten the value. CamusDB never truncates. |
-| `CADB0303` | `CheckConstraintViolation` | Row or existing data violates a `CHECK`; a `CHECK` compares types with no rule | Fix the data or the rule. Write a `CAST`. |
+| `CADB0303` | `CheckConstraintViolation` | Row or existing data violates a `CHECK`; an existing `CHECK` hits a type error at evaluation | Fix the data or the rule. Write a `CAST`. |
 | `CADB0304` | `ForeignKeyViolation` | Child has no parent; `ADD CONSTRAINT` finds an orphan | Insert the parent first. |
 | `CADB0305` | `ForeignKeyRestrictDelete` | Delete of a referenced parent | Delete the children first. |
 | `CADB0306` | `ForeignKeyRestrictUpdate` | Update of a referenced parent key | Update the children first, or keep keys immutable. |
-| `CADB0400` | `InvalidInput` | No primary key; `DESC` on `STRING`/`BYTES`; invalid `CHECK`; invalid TTL setting; bad default; bare `DROP INDEX name`; `JSONB` as an ordered key; wrong GIN index shape; comparison of types with no rule | Fix the DDL or the statement. |
+| `CADB0400` | `InvalidInput` | No primary key; `DESC` on `STRING`/`BYTES`; invalid `CHECK`, including a non-boolean condition or a wrong argument count; invalid TTL setting; bad default; bare `DROP INDEX name`; `JSONB` as an ordered key; wrong GIN index shape; comparison of types with no rule; a lone UTF-16 surrogate half in a string parameter or row write; a constant division by zero | Fix the DDL or the statement. |
 | `CADB0403` | `DuplicateColumn` | Same column twice, or rename to an existing column | Rename. |
 | `CADB0404` | `UnknownColumn` | Reference to a missing column | Check the name. |
-| `CADB0406` | `SqlSyntaxError` | Syntax from another database | See [ddl-syntax.md](ddl-syntax.md). |
+| `CADB0406` | `SqlSyntaxError` | Syntax from another database; an unknown character, a non-breaking space, or a byte-order mark outside a literal (the message gives line and column) | See [ddl-syntax.md](ddl-syntax.md). Check copied SQL for invisible characters. |
+| `CADB0407` | `InvalidAstStmt` | Unknown function, for example in a new `CHECK` | Check the function name. |
 | `CADB0408` | `SchemaLimitExceeded` | Index over 32 columns; name or count limit | Reduce the schema object. |
 | `CADB0414` | `ColumnStorageNotApplicable` | `STORAGE` on a fixed-width type | Remove the clause. |
 | `CADB0415` | `InvalidForeignKeyDefinition` | Bad target, type mismatch, view, other database | Reference a primary key or unique index. |
@@ -83,7 +86,7 @@ exempt. `TRUNCATE` counts no mutations.
 | `CADB0417` | `NumericValueOutOfRange` | `NUMERIC` overflow | Check the value range. |
 | `CADB0418` | `InvalidJsonText` | Text written to `JSONB` is not valid JSON | Fix the text. Use `STRING` if it is not always JSON. |
 | `CADB0419` | `JsonNestingTooDeep` | Document nested deeper than 512 levels | Flatten the document. |
-| `CADB0420` | `IntegerValueOutOfRange` | `INT64` overflow, or a cast of `NaN` or an infinity to `INT64` | Use `NUMERIC` for a wider exact value. |
+| `CADB0420` | `IntegerValueOutOfRange` | `INT64` overflow; a value outside a `SMALLINT` or `INT` column range; a sequence value too large for a narrow column; a cast of `NaN`, an infinity, or an out-of-range value to an integer | Use `BIGINT` or `INT64` for the column, or `NUMERIC` for a wider exact value. |
 | `CADB0421` | `FloatValueOutOfRange` | Finite float overflow or underflow | Check the value range. |
 | `CADB0422` | `JsonbValueTooLarge` | `jsonb_agg` or `jsonb_object_agg` result too large | Reduce the group. |
 | `CADB0502` | `TransactionConflict` | Hot row, foreign-key lock, storage rewrite | Retry from `BEGIN`. Remove the hot row. |
@@ -95,7 +98,7 @@ exempt. `TRUNCATE` counts no mutations.
 | `CADB0533` | `FeatureNotSupported` | `CASCADE`, `SET NULL`, `DEFERRABLE`, `MATCH FULL`, TTL parent | Use a supported form. |
 | `CADB0542` | `SequenceAlreadyExists` | Sequence name taken by a sequence, table, or view | Rename. |
 | `CADB0545` | `InvalidSequenceDefinition` | Non-positive increment, `CACHE` below 1, `MAXVALUE` below `MINVALUE` | Fix the options. |
-| `CADB0547` | `SequenceCallNotAllowedHere` | `nextval` outside `INSERT`, defaults, or `SELECT` without `FROM` | Move the call. |
+| `CADB0547` | `SequenceCallNotAllowedHere` | `nextval` outside `INSERT`, defaults, or a top-level `SELECT` without `FROM` | Move the call. |
 | `CADB0548` | `SequenceDependencyExists` | Drop of an owned or used sequence | Drop the column or the default first. |
 | `CADB0559` | `JsonbValueCorrupt` | A stored `JSONB` cell does not decode | Damaged data, or a value from a newer build. Check the server version. |
 | `CADB0600` | `InvalidConfig` | A node set to the other routing mode refuses to start | Keep the recorded mode. Dump and reimport into a new cluster to move. |

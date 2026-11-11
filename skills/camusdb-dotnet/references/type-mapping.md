@@ -10,7 +10,7 @@ Source docs: https://camusdb.github.io/docs/dotnet-driver#data-types and https:/
 | `OID`, `OBJECT_ID` | `Id` (1) | `string`, `Guid`, `CamusObjectIdValue` | `GetString` |
 | `UUID`, `GUID` | `Uuid` (11) | `Guid`, canonical UUID `string` | `GetGuid` |
 | `STRING`, `STRING(N)` | `String` (3) | `string` | `GetString` |
-| `INT64`, `INT`, `INTEGER` | `Integer64` (2) | `short`, `int`, `long` | `GetInt64` |
+| `INT64`, `BIGINT`, `INT`, `INTEGER`, `SMALLINT` | `Integer64` (2) | `short`, `int`, `long` | `GetInt64` |
 | `NUMERIC`, `DECIMAL` | `Numeric` (12) | `decimal`, decimal text `string`, integers | `GetDecimal`, `GetString` |
 | `FLOAT64` | `Float64` (5) | `double`, `decimal` | `GetDouble` |
 | `FLOAT32`, `REAL` | `Float32` (6) | `float` | `GetFloat` |
@@ -23,6 +23,13 @@ Source docs: https://camusdb.github.io/docs/dotnet-driver#data-types and https:/
 | `NULL` | `Null` (0) | `null`, `DBNull.Value` | `IsDBNull` |
 
 ## Rules per type
+
+### Integers
+
+- All integer declarations share `ColumnType.Integer64` and the same wire values.
+- The server enforces the declared column range: `SMALLINT` -32768 to 32767, `INT` and `INTEGER`
+  32-bit, `INT64` and `BIGINT` 64-bit. A value outside the range fails with `CADB0420`.
+- Columns created before this rule keep the full `INT64` range.
 
 ### OID
 

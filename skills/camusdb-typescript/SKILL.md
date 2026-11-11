@@ -8,7 +8,8 @@ description: Writes and reviews TypeScript or JavaScript (Node.js) code that use
 CamusDB is a distributed NewSQL database. Its default isolation is Serializable.
 A conflicting transaction aborts, and the client must replay it.
 This skill helps you write correct Node.js code with the `camusdb` connector.
-It also covers the raw REST/JSON API and the gRPC API for other languages.
+It also covers the HTTP/JSON and gRPC protocol references, for custom clients in languages
+without a driver, health probes, and diagnostics.
 
 - npm package: `camusdb` (ESM only, TypeScript declarations included).
 - Node.js: `^20.19.0` or `>=22.12.0`.
@@ -17,7 +18,8 @@ It also covers the raw REST/JSON API and the gRPC API for other languages.
 
 ## Workflow
 
-1. Pick the path. Use `camusdb` in Node.js. Use the HTTP API from other languages or shell scripts.
+1. Pick the path. Use `camusdb` in Node.js, also for scripts and automation jobs. Use the .NET or
+   Python driver in those languages. Use the raw protocol only in a language without a driver.
 2. Configure `endpoint` and `database`. Use the REST port unless you set `protocol: 'grpc'`.
 3. Create the database explicitly with `client.createDatabase(name, { ifNotExists: true })`.
 4. Bind every value as a named parameter (`@name`). Use `camus.*` helpers for OID, UUID, NUMERIC, JSONB text, and empty arrays.
@@ -261,7 +263,9 @@ try {
 
 ## Raw HTTP API
 
-Every other language can use REST with JSON. All bodies use camel case.
+The HTTP API is a protocol reference for driver authors, custom clients in languages without a
+driver, health probes, and endpoint diagnostics. Application code uses a driver. All bodies use
+camel case.
 
 ```bash
 curl -s -X POST http://localhost:5095/execute-sql-query \
@@ -275,6 +279,8 @@ curl -s -X POST http://localhost:5095/execute-sql-query \
 - Explicit transactions use `/start-transaction`, then pass `txnIdPT` and `txnIdCounter` on each request.
 - With authentication on, `POST /login` returns a bearer token. Send `Authorization: Bearer <token>`.
 - `/update` and `/delete` refuse a request with no filter (`CADB0400`, HTTP 400).
+- The SQL query, streaming-query, non-query, and DDL endpoints return `CADB0400` for malformed JSON,
+  including an escaped lone surrogate half. The message gives the JSON path and byte position.
 - A repeated key in the `values` of `/insert` or `/update` fails with `CADB0403`, HTTP 400.
 
 Read [references/http-api.md](references/http-api.md) before you write any raw HTTP client.
@@ -302,6 +308,7 @@ Read [references/grpc-api.md](references/grpc-api.md) before you build a gRPC cl
 - Sending credentials over remote `http://`. Use `https://`; the connector refuses otherwise.
 - Calling `client.login()` against a server with authentication off. It fails.
 - Reading HTTP query `rows` as objects keyed by column. Rows are positional arrays aligned to `columns`.
+- Copying causal tokens by hand in connector code. The gRPC transport carries them for you.
 - Dropping `causalToken` between raw HTTP requests. In a cluster, send it on the next autocommit query or `/start-transaction`.
 - Sending `causalToken` on a statement of an explicit transaction. A transaction takes its floor once, at start.
 - Running `TRUNCATE` inside a transaction. The server rejects it (`CADB0538`).

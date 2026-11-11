@@ -10,6 +10,23 @@ https://camusdb.github.io/docs/workload-utility
 A browser workspace: schema browser, Monaco SQL editor, result grid, row editing, CSV/JSON
 export, `EXPLAIN` flow view, engine stats, variables, and backup controls.
 
+Install it as a .NET tool (needs .NET 10):
+
+```bash
+dotnet tool install -g CamusDB.WebConsole
+camusdb-webconsole --endpoint http://localhost:5095 --database demo
+dotnet tool update -g CamusDB.WebConsole
+```
+
+- It listens on `http://127.0.0.1:5164` and opens the browser. Run a statement with
+  Ctrl/Cmd+Enter; **Run script** (Alt+X) runs several statements in order.
+- Options: `--endpoint` (default `http://localhost:5095`), `--database`, `--protocol rest|grpc`,
+  `--user`, `--port` (`0` for a free port), `--no-browser`.
+- There is no password option. Use Configure or `CamusDB__Password`.
+- It binds to loopback. `--urls` overrides the address and turns off the automatic browser.
+
+Or run the Docker image:
+
 ```bash
 docker run --rm -p 8080:8080 \
   -e CamusDB__Endpoint=http://host.docker.internal:5095 \
@@ -61,13 +78,21 @@ URL: https://camusdb.github.io/playground/. The tutorial page also embeds a SQL 
 - The real engine, compiled to WebAssembly, runs inside the browser tab. No SQL or data leaves the tab.
 - It starts four engines, with eight partitions and replication factor three.
 - **+** adds a node and **−** removes one gracefully. It supports four to nine nodes.
-- **Simulate node failure** stops an engine. **Restart node** brings back an empty engine that
-  catches up. You cannot stop a node if that would lose the majority.
+- **Simulate node failure** stops a server. You can stop several servers. A partition that keeps
+  a majority of its replicas elects a new leader within seconds, and the playground retries
+  statements during the election. A partition without a majority cannot serve reads or commit
+  writes; a statement that needs it fails after about 15 seconds. Other partitions stay available.
+- **Restart node** brings back an empty server that catches up from surviving peers. Use
+  **Reset data center** if the cluster cannot recover.
+- A stopped server cannot run queries. The console offers to switch to a running server or to
+  restart the stopped one.
+- Adding or removing servers, including automatic scaling, waits until all servers are running
+  voters. Three replicas tolerate one unavailable replica per partition.
 - Data lives in memory. Reload or **Reset data center** starts over.
 - Queries use the `playground` database, with a sample library of books and authors.
 - Each statement autocommits. A script stops at the first error.
 - There is no `USE` statement.
-- No backups, no C# extensions, and no features that need external files.
+- No backups, no C# extensions, no inline C# compiler, and no features that need external files.
 
 ```sql
 CREATE DATABASE lab;

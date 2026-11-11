@@ -3,9 +3,6 @@
 Source: https://camusdb.github.io/docs/database-branching and
 https://camusdb.github.io/docs/databases
 
-Branching is an alpha feature. Its APIs and storage formats can change between
-versions.
-
 ## What a branch is
 
 A branch is an isolated, copy-on-write clone of a database at a point in time.

@@ -47,14 +47,14 @@ Give each fix as CamusDB SQL. Quote the exact error code when an item is an
 | A7 | Valid foreign-key target | Target is not exactly the parent primary key or a unique index; types differ; target is a view or in another database | Fix the target. Otherwise `CADB0415`. |
 | A8 | TTL and foreign keys apart | A TTL table is a foreign-key parent, in either order | Drop TTL or the foreign key. Otherwise `CADB0533`. |
 | A9 | `STORAGE` on variable-length types only | `STORAGE` on a type other than `STRING`, `BYTES`, `JSONB`, `ARRAY` | Remove it. Otherwise `CADB0414`. |
-| A10 | Valid `CHECK` | Subquery, aggregate, `now()`, `gen_id()`, `gen_uuid_v4()`, `gen_uuid_v7()`, unknown column; a named column-level check | Rewrite as a deterministic one-row predicate. Name it at table level. |
+| A10 | Valid `CHECK` | Subquery, aggregate, `now()`, `gen_id()`, `gen_uuid_v4()`, `gen_uuid_v7()`, unknown column or function, wrong argument count, a non-boolean condition such as `CHECK (qty)`, a known type mismatch; a named column-level check | Rewrite as a deterministic one-row boolean predicate. Name it at table level. New checks fail at definition time. |
 | A11 | Valid `INCLUDE` | `INCLUDE` on a primary key; a column in both key and `INCLUDE`; `ASC`/`DESC` in `INCLUDE` | Fix the list. |
 | A12 | Index size limits | More than 32 key plus `INCLUDE` columns; `INCLUDE` payload above 4 KiB | Trim the index. |
 | A13 | No foreign syntax | `STORING`, hash-sharded index, `INTERVAL`, `ttl_expire_after`, a five-field cron, an expression in `ttl_expiration_expression`, `CYCLE` on a sequence, negative `INCREMENT` | Use the CamusDB form in [ddl-syntax.md](ddl-syntax.md). |
 | A14 | Identifiers quoted correctly | Identifiers in double quotes | Use backticks. Double quotes make a string. |
 | A15 | Documented DDL forms only | A bare `DROP INDEX name`; `CONSTRAINT x UNIQUE (a, b)`; inline `INDEX name (...)`; a column type change | Use `DROP INDEX name ON t` or `DROP INDEX t.name`, `UNIQUE KEY`, `KEY`. For a type change, add a new column, copy in batches, then drop the old one. |
 | A16 | Valid defaults | A function default with arguments; a type mismatch such as `gen_id()` on `UUID`; a string default longer than the column bound | Fix the default. |
-| A17 | `nextval` placement | `nextval` in `UPDATE ... SET`, a filter, a view body, or a `CHECK` | Use it only in `INSERT ... VALUES`, defaults, or `SELECT` without `FROM`. Otherwise `CADB0547`. |
+| A17 | `nextval` placement | `nextval` in `UPDATE ... SET`, a filter, a view body, a `CHECK`, or a nested `SELECT` without `FROM` | Use it only in `INSERT ... VALUES`, defaults, or a top-level `SELECT` without `FROM`. Otherwise `CADB0547`. |
 | A18 | Safe `ADD COLUMN` | `ADD COLUMN ... NOT NULL` with no `DEFAULT` on a table with rows | Add a `DEFAULT`, or add nullable, fill, then `SET NOT NULL`. Otherwise `CADB0301`. |
 | A19 | Safe drops | `DROP COLUMN` of an indexed column; `DROP COLUMN`, `DROP TABLE`, or `TRUNCATE` that breaks a foreign key | Drop the index or constraint first. Otherwise `CADB0530`. |
 | A20 | Name collisions | Two names that differ only in case; a sequence named like a table or view; database `_system` or `information_schema` | Rename. |
@@ -63,6 +63,8 @@ Give each fix as CamusDB SQL. Quote the exact error code when an item is an
 | A23 | `JSONB` is not a key | `JSONB` column in a primary key, `UNIQUE`, ordered index key, or foreign key | Use a GIN index, or a typed column for the value. A key or an ordered index fails with `CADB0400`. |
 | A24 | Valid GIN index | GIN index on a non-`JSONB` column, on two columns, with `INCLUDE`, or with `DESC` | One `JSONB` column only. Otherwise `CADB0400`. |
 | A25 | No unsupported `JSONB` index | Expression index on `(doc ->> 'k')` | Not yet supported. Use a GIN index with `doc ->> 'k' = text`, or a typed column. |
+| A26 | Supported integer names | `INT16` or `INT32` | Use `SMALLINT`, `INT`, `BIGINT`, or `INT64`. |
+| A27 | No collation clause | `COLLATE ...` on a column or in a query | Remove it. Strings sort in binary UTF-16 order. Use `LOWER` for case-insensitive matches. |
 
 ## B. Hotspots and contention (HIGH)
 
@@ -85,11 +87,15 @@ Give each fix as CamusDB SQL. Quote the exact error code when an item is an
 | C4 | MEDIUM | Foreign key added safely | `ADD CONSTRAINT ... FOREIGN KEY` on a table with live writers | Quiesce writers, or run an orphan check after the migration. |
 | C5 | MEDIUM | TTL expiry is exact where needed | TTL table and the application relies on expired rows being gone | Filter `WHERE expires_at > NOW()` in reads. |
 | C6 | MEDIUM | Array length checks count empty arrays | `CHECK` on `array_length(col, 1)` | Use `cardinality(col)`. |
-| C7 | MEDIUM | Bounded text where a bound exists | Bare `STRING` for codes, emails, names | Use `STRING(N)`. Long values then fail with `CADB0302`. |
+| C7 | MEDIUM | Bounded text where a bound exists | Bare `STRING` for codes, emails, names | Use `STRING(N)`. `N` counts code points. Long values then fail with `CADB0302`. |
 | C8 | MEDIUM | CTAS output has its constraints | `CREATE TABLE ... AS SELECT` and nothing after | Add indexes, constraints, defaults, and comments with `ALTER TABLE`. |
 | C9 | HIGH | `CHECK` compares types with a rule | A `CHECK` compares a column with a value of another type that has no rule, such as `STRING` with a number | Write a `CAST`. Otherwise each write fails with `CADB0303`. |
-| C10 | MEDIUM | Float-to-`INT64` cast in a `CHECK` | A stored `CHECK` with `CAST(float AS INT64)` | It rounds half away from zero, for new writes only. Existing rows are not checked again. |
+| C10 | MEDIUM | Float-to-integer cast in a `CHECK` | A stored `CHECK` with `CAST(float AS INT64)`, `SMALLINT`, or `INT` | It rounds half away from zero, for new writes only. A narrow cast then checks the range. Existing rows are not checked again. |
 | C11 | MEDIUM | Float `UNIQUE` or `NaN` rules are expected | `UNIQUE` on a float column; a query that assumes `NaN` compares false | `-0` equals `0` in a `UNIQUE` index. `NaN = NaN` is true and sorts highest. |
+| C12 | HIGH | Integer width fits the values | `INT` or `INTEGER` for counters, ids, epoch milliseconds, or totals that can pass 2,147,483,647; `SMALLINT` for values that can pass 32,767; a sequence or identity on a narrow column | Use `BIGINT` or `INT64`. Otherwise writes fail with `CADB0420`. Columns made before the range rule keep the unbounded range and show as `INT64`. |
+| C13 | MEDIUM | `CHAR(N)` padding is not expected | Code that relies on PostgreSQL `CHAR` padding or trailing-space trimming | `CHAR(N)` is a maximum. `'ab'` differs from `'ab '`. Trim in the application. |
+| C14 | MEDIUM | Stored `LIKE` patterns escape literals | A `CHECK` with `LIKE` on a literal `_` or backslash, such as `LIKE 'A_%'` meant as `A_` | Escape it: `LIKE 'A\_%'`. Stored patterns use the new rules after an upgrade. |
+| C15 | LOW | Stored checks have the intended grouping | A check written for the old precedence, such as `a = b IS NULL` | Read `SHOW CREATE TABLE`. Recreate the check if the saved parentheses differ from the intent. |
 
 ## D. Cost (MEDIUM)
 

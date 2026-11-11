@@ -16,6 +16,10 @@ Spanner. Each row says what you might write, and what to write in CamusDB.
 | SQL `PREPARE p AS ...` / `EXECUTE p` | Not a SQL statement. Prepare through gRPC `BatchExecute`, REST `/prepare-sql-statement`, or a driver. |
 | `x - -5` written as `x --5` | `--` starts a comment. Put a space: `x - -5`. |
 | `0xFF_FF` | `0xFF` takes no digit separators. `65_535` is fine. |
+| A script with several statements in one request | One statement per request. Split the script. |
+| A raw tab or line break inside `'...'` | Refused. Write `E'a\tb'` or `E'line\nnext'`. |
+| Copied SQL with a non-breaking space or a byte-order mark | `CADB0406`. Replace it with a normal space. |
+| `$$ ... $$` dollar quotes for a string | Only for an inline C# body. See `camusdb-csharp-extensions`. |
 | `'{a,b}'` array text | `ARRAY['a', 'b']`. A `jsonb` path or key list does accept `'{a,b}'`. |
 | `ARRAY[1, 2.5]` | Cast to one type: `ARRAY[1.0, 2.5]` or `ARRAY[CAST(1 AS FLOAT64), 2.5]`. |
 
@@ -28,20 +32,27 @@ Spanner. Each row says what you might write, and what to write in CamusDB.
 | `COUNT(DISTINCT x)` | Not supported. `SELECT COUNT(*) FROM (SELECT DISTINCT x FROM t) d`. |
 | `SELECT DISTINCT a, COUNT(*) ... GROUP BY a` | Drop `DISTINCT`. A group is already distinct. |
 | `SELECT name, COUNT(*) FROM t` (MySQL loose group) | Add `GROUP BY name`. |
-| `SELECT 1 WHERE cond` | Add a `FROM` clause. Or `SELECT EXISTS (SELECT 1 FROM t WHERE cond)`. |
+| `SELECT 1 WHERE cond` | Supported. `FALSE` or `NULL` returns no row. `cond` must be boolean. |
+| `WHERE 1`, `WHERE 'true'`, `HAVING 1` (MySQL truthy values) | `CADB0400`. Write a boolean, such as `WHERE TRUE`. |
+| `SELECT COUNT(*) ... ORDER BY id` (global aggregate) | `CADB0400`. Order by an alias, an aggregate, or a position, or drop the `ORDER BY`. |
+| `LIMIT -1`, `OFFSET -1` | `CADB0400`. Counts are nonnegative. |
+| Unaliased `SELECT upper(name) FROM t` read as `upper` or `?column?` | The name is the zero-based position, such as `0`. Alias it. |
 | `SELECT COUNT(*)` without `FROM` | `SELECT (SELECT COUNT(*) FROM t)`. |
 | `FULL [OUTER] JOIN` | Not supported. |
 | `NATURAL JOIN`, `JOIN ... USING (id)` | `JOIN b ON b.id = a.id`. |
 | `a JOIN b ... RIGHT JOIN c` | Not supported when the left operand is a join. Put the preserved table first and use `LEFT JOIN`. |
 | `x IN (SELECT a, b FROM ...)` | Not supported. Use `EXISTS` with both equalities. |
-| Correlated `x IN (SELECT ... WHERE u.k = t.k)` | Not supported. Use a correlated `EXISTS`. |
-| Correlated subquery inside `= ANY (...)` | Not supported. Use `EXISTS`. |
+| Correlated `x IN (SELECT ... WHERE u.k = t.k)`, `= ANY (SELECT ...)` | Supported in a non-grouped select list, `SELECT ... WHERE`, `UPDATE ... SET`/`WHERE`, and `DELETE ... WHERE`. |
 | `x NOT IN (SELECT nullable_col ...)` | Legal, but one `NULL` drops every non-match. Prefer `NOT EXISTS`. |
 | `x IN (y + 1, CAST(z AS INT64))` | An expression item is a syntax error. Write `x = y + 1 OR x = CAST(z AS INT64)`. A column name alone is fine. |
+| `a = b = c` | `CADB0406`. Write `a = b AND b = c`. |
+| `name LIKE 'a\_%'`, `LIKE ... ESCAPE '#'` | Supported, as in PostgreSQL. `_` matches one code point. See [expressions.md](expressions.md). |
+| `COLLATE "C"`, a locale collation | Not supported. Strings sort in binary UTF-16 order. Use `lower` to ignore case. |
 | `WHERE int_col = '5'` (MySQL implicit conversion) | Fails with `CADB0400`. Write `int_col = 5` or `CAST(s AS INT64) = int_col`. |
 | `WHERE text_col = 5`, `bool_col = 1` | Fails with `CADB0400`. Cast one side. |
 | `CASE WHEN c THEN 1 ELSE '2' END` (PostgreSQL) | Fails with `CADB0400`. A quoted literal does not become a number. Cast it. |
-| Correlated subquery in the select list, `HAVING`, or `ON` | Refused. A correlated `EXISTS` works in the `WHERE` of a `SELECT` only. |
+| Correlated subquery in the select list | Supported when the select list has no grouping, aggregate, or window call. |
+| Correlated subquery in `HAVING`, `JOIN ON`, or `ON CONFLICT DO UPDATE` | `CADB0533`. Move it to `WHERE`, or join a derived table. |
 | `ORDER BY (SELECT ...)`, `GROUP BY (SELECT ...)` | Refused (`CADB0400`). |
 | `ORDER BY x NULLS FIRST`, `NULLS LAST` | Not supported. `NULL` sorts first ascending and last descending. PostgreSQL does the opposite by default. |
 | `WITH cte AS (...) SELECT ...` | Not supported. Use a derived table or a view. |
@@ -93,7 +104,7 @@ Spanner. Each row says what you might write, and what to write in CamusDB.
 | `TRUNCATE ... CASCADE` | Not supported. Truncate the child first or drop the foreign key. |
 | `BEGIN; TRUNCATE t; COMMIT;` | Rejected (`CADB0538`). Run `TRUNCATE` outside a transaction. |
 | `CREATE TABLE t AS SELECT a + 1 FROM s` | Alias it: `a + 1 AS a_next`. |
-| `CREATE TABLE t AS SELECT NULL AS x` | `CAST(NULL AS INT64) AS x`. |
+| `CREATE TABLE t AS SELECT NULL AS x` | `CAST(NULL AS INT64) AS x`. A typed scalar subquery such as `(SELECT MAX(a) FROM s) AS x` also works. |
 | `CREATE TABLE t AS SELECT * FROM a JOIN b ...` | List and alias each column. |
 | Expecting CTAS to copy the key and indexes | It copies the shape only and adds `id OID` as the key. |
 
@@ -132,14 +143,19 @@ Spanner. Each row says what you might write, and what to write in CamusDB.
 | You might write | In CamusDB |
 | --- | --- |
 | `NUMERIC(10, 2)`, `DECIMAL(10, 2)` | `NUMERIC` (fixed precision 38, scale 9). |
-| `x::text`, `x::int`, `x::double` | Supported. `CAST(x AS double)` too. |
+| `x::text`, `x::int`, `x::double` | Supported. `CAST(x AS double)` too. `x::int` checks the 32-bit range. |
+| `BIGINT`, `DOUBLE PRECISION` | Supported aliases of `INT64` and `FLOAT64`. `INT16` and `INT32` are not. |
+| `INT` or `SMALLINT` expecting a 64-bit range (old CamusDB) | New columns and casts check 32-bit and 16-bit ranges (`CADB0420`). Use `BIGINT` for wider values. |
+| `SERIAL` expecting 32 bits (PostgreSQL) | `SERIAL` and `BIGSERIAL` are both `INT64`. |
+| `CHAR(n)` expecting blank padding | No padding and no trim. `'ab'` differs from `'ab '`. |
 | `CAST(2.5 AS INT64)` expecting `2` (PostgreSQL float) | Gives `3`. A float rounds half away from zero. |
 | `CAST('2.5' AS INT64)` (MySQL) | Fails with `CADB0400`. A string must spell an integer. |
 | `9223372036854775807 + 1` expecting a wrap | Fails with `CADB0420`. Write a wider number as `NUMERIC '...'`. |
 | `1e308 * 10` expecting `Infinity` | Fails with `CADB0421`. `CAST('Infinity' AS float64)` is a value. |
 | `NaN <> NaN` (IEEE) | `NaN = NaN` is true, as in PostgreSQL. `NaN` sorts above every number. |
 | `x #-1` meaning XOR | `#-` is the `jsonb` path delete. Write `x # -1`. |
-| `a ^ b` | Not an operator. `a # b` for XOR, `power(a, b)` for a power. |
+| `a ^ b` (PostgreSQL power) | Supported, with PostgreSQL precedence. Returns `FLOAT64`. |
+| `a ^ b` (MySQL XOR) | Write `a # b`. |
 | `doc['key']`, `jsonpath`, `jsonb_path_query`, `@?`, `@@` | Not supported. Write `doc -> 'key'`. See [jsonb.md](jsonb.md). |
 | `jsonb_agg(x ORDER BY y)` | Not supported. |
 | `row_to_json`, `jsonb_to_record`, `jsonb_populate_record` | Not supported. |
@@ -159,10 +175,12 @@ Spanner. Each row says what you might write, and what to write in CamusDB.
 | `a \|\| b` as logical OR (MySQL) | `\|\|` is concatenation. Write `a OR b`. |
 | `NULLIF(a, b)` | Supported. The result has the type of `a`. |
 | `IF(c, a, b)` (MySQL) | Supported. It evaluates only the selected result. |
-| `IFNULL`, `NVL`, `COALESCE` | All supported. All arguments need a common type. `COALESCE(1, 'a')` fails. |
+| `IFNULL`, `NVL`, `COALESCE` | All supported. They stop at the first non-`NULL` value. All arguments need a common type, even unused: `COALESCE(1, 'a')` fails. |
 | `GREATEST`, `LEAST`, `LPAD`, `SPLIT_PART`, `STRING_AGG`, `GROUP_CONCAT`, `ARRAY_AGG` | Not documented. |
-| `char_length(x)` | `length(x)`. |
-| `POSITION(a IN b)`, `STRPOS(b, a)` | Supported. |
+| `char_length(x)` | `length(x)`. It counts code points, as in PostgreSQL. |
+| `POSITION(a IN b)`, `STRPOS(b, a)`, `substr(x, s, n)` | Supported. A start below 1 follows PostgreSQL. |
+| `ln`, `log`, `log10`, `exp` | Supported. `log(base, x)` takes the base first, as in PostgreSQL. GoogleSQL `LOG(x, base)` differs. |
+| Regex `.` matching one emoji | It matches one UTF-16 unit, so an emoji counts as 2. Name the character in the pattern. |
 | `btrim(x, chars)` | `trim(x, chars)`. |
 | `EXTRACT(YEAR FROM d)`, `YEAR(d)` | Supported. Both are `INT64`. PostgreSQL returns `numeric`, so `epoch` and `millisecond` differ. |
 | `EXTRACT(dow FROM d)`, `DAYOFWEEK(d)`, `WEEK(d, 3)` | Supported. See [functions.md](functions.md) for units and modes. |

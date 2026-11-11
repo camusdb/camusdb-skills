@@ -1,7 +1,7 @@
 # Reading CamusDB EXPLAIN output
 
-`EXPLAIN` output is diagnostic. Node names, column names and detail formats are
-stable within one minor version. Do not parse it in production code.
+`EXPLAIN` output is for people. The docs give no format stability promise, so
+do not parse it in production code.
 
 ## Forms
 
@@ -30,8 +30,13 @@ EXPLAIN SELECT ... FOR UPDATE [NOWAIT | SKIP LOCKED]   -- a locking read, in eve
   transaction.
 - `EXPLAIN` without `ANALYZE` adds no count to `SHOW INDEX USAGE`.
   `EXPLAIN (ANALYZE)` adds counts.
-- A `SELECT` without `FROM` renders `constant-source`, `project`, and `limit`
-  when present. `EXPLAIN (ANALYZE)` rejects it.
+- A `SELECT` without `FROM` and without `WHERE` renders `constant-source`,
+  `project`, and `limit` when present. It has no costed plan, and
+  `EXPLAIN (ANALYZE)` rejects it. Plain `EXPLAIN` of this form does not run the
+  projection subqueries.
+- A `SELECT` without `FROM` but with `WHERE` plans a `function-scan` of
+  `*single_row*`. `EXPLAIN (ANALYZE)` works on it and runs the filter and the
+  projection.
 
 ## Result columns
 

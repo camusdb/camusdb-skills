@@ -120,6 +120,8 @@ Related settings (YAML, see https://camusdb.github.io/docs/configuration):
 - `CREATE TABLE ... AS SELECT` commits the table first, then loads rows in the
   caller's transaction. A failed load drops the table again, but an empty
   table can remain if that compensating drop fails.
+- The CTAS source can be a plain view, also `WITH NO DATA`. A scalar subquery
+  column keeps its declared type, even when it has no row.
 
 ## Statement catalog
 

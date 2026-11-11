@@ -1,6 +1,6 @@
 ---
 name: camusdb-schema-design
-description: Designs and reviews CamusDB schemas. Covers CREATE TABLE, primary keys, CREATE INDEX with INCLUDE covering columns, GIN indexes, DROP INDEX, column types (OID, UUID, INT64, NUMERIC, STRING(N), BYTES, DATETIME, ARRAY, JSONB), defaults such as gen_id(), gen_uuid_v4() and gen_uuid_v7(), CHECK and FOREIGN KEY constraints, CREATE SEQUENCE, SERIAL and identity columns, STORAGE strategies for large values, row-level TTL (ttl_expiration_expression), and COMMENT ON. Applies the CamusDB best practices for hotspots under hash routing and key_range_sharding. Use when writing or changing CamusDB DDL or a migration, when choosing a primary key, an index, or a column type, when auditing an existing schema or migration file (review mode), or when DDL fails with CADB0400, CADB0302, CADB0414, CADB0415, CADB0416, CADB0530 or CADB0533, or writes hit CADB0418, CADB0420, CADB0421, CADB0502 on a hot row or CADB0506 from too many index mutations.
+description: Designs and reviews CamusDB schemas. Covers CREATE TABLE, primary keys, CREATE INDEX with INCLUDE covering columns, GIN indexes, DROP INDEX, column types (OID, UUID, INT64, BIGINT, INT, SMALLINT, NUMERIC, STRING(N), CHAR(N), BYTES, DATETIME, ARRAY, JSONB), defaults such as gen_id(), gen_uuid_v4() and gen_uuid_v7(), CHECK and FOREIGN KEY constraints, CREATE SEQUENCE, SERIAL and identity columns, STORAGE strategies for large values, row-level TTL (ttl_expiration_expression), and COMMENT ON. Applies the CamusDB best practices for hotspots under hash routing and key_range_sharding. Use when writing or changing CamusDB DDL or a migration, when choosing a primary key, an index, or a column type, when auditing an existing schema or migration file (review mode), or when DDL fails with CADB0400, CADB0302, CADB0414, CADB0415, CADB0416, CADB0530 or CADB0533, or writes hit CADB0418, CADB0420, CADB0421, CADB0502 on a hot row or CADB0506 from too many index mutations.
 ---
 
 # CamusDB schema design
@@ -74,9 +74,12 @@ The skill has two modes:
   split. Indexes of every column type can split, `STRING` included.
 - The routing mode cannot change on existing data. A node set to the other mode
   refuses to start (`CADB0600`). To move, dump and reimport into a new cluster.
+- More nodes do not help one busy table under hash routing. With full
+  replication (the default), a new node is one more copy. For capacity, set
+  `kahuna.replication_factor` below the node count. See
+  [Cluster mode](https://camusdb.github.io/docs/cluster#choose-the-number-of-nodes).
 
-See [Best practices](https://camusdb.github.io/docs/best-practices) and
-[Key-range sharding](https://camusdb.github.io/docs/key-range-sharding).
+See [Best practices](https://camusdb.github.io/docs/best-practices) and [Key-range sharding](https://camusdb.github.io/docs/key-range-sharding).
 
 ## Primary keys
 
@@ -101,8 +104,7 @@ key-range sharding:
 - An `OID` from `gen_id()`. It starts with a timestamp in seconds.
 - A `UUID` from `gen_uuid_v7()`. It starts with a timestamp in milliseconds.
 
-A sequence also costs coordination under any routing mode. It is one logical
-counter, and every insert that needs a value goes through it.
+A sequence is one logical counter, so it costs coordination under any routing.
 
 ```sql
 CREATE TABLE players (
@@ -144,8 +146,8 @@ CREATE INDEX match_events_created_idx ON match_events (created_at);
 CREATE INDEX match_events_kind_idx ON match_events (kind, created_at);
 ```
 
-A low-cardinality column such as `kind` spreads writes only across its
-values. `player_id` or `tenant_id` is better. There is no hash-sharded index.
+A low-cardinality column such as `kind` spreads writes only across its values.
+`player_id` or `tenant_id` is better. There is no hash-sharded index.
 
 Use a covering index on a hot read path. The keyword is `INCLUDE`, not
 `STORING`: `CREATE INDEX i ON match_events (kind, created_at) INCLUDE (score)`.
@@ -181,9 +183,15 @@ The rules that matter most:
 - `NUMERIC` for money. It has fixed precision 38 and scale 9.
   `NUMERIC(10, 2)` is rejected.
 - `STRING(N)` and `BYTES(N)` are maximums. A longer value fails with
-  `CADB0302 ValueTooLong`. CamusDB never truncates.
-- A bare `STRING` allows 2,621,440 characters. A bare `BYTES` allows
+  `CADB0302 ValueTooLong`. CamusDB never truncates. `STRING(N)`, `CHAR(N)`, and
+  `VARCHAR(N)` count Unicode code points. `CHAR(N)` does not pad.
+- A bare `STRING` allows 2,621,440 code points. A bare `BYTES` allows
   10,485,760 bytes.
+- Text sorts in binary UTF-16 order. There is no `COLLATE`.
+- `SMALLINT` (16-bit range) and `INT`/`INTEGER` (32-bit range) store `INT64` but
+  refuse values outside their range with `CADB0420`. Use `BIGINT` or `INT64` for
+  ids, counters, and epoch milliseconds. Columns made before this rule keep the
+  unbounded range.
 - `DATETIME` is an instant in UTC. `TIMESTAMP` is an alias.
 - The type list has no `INTERVAL` type.
 - `ARRAY(T)` holds scalars only. No nested arrays, no `ARRAY(NUMERIC)`, and no
@@ -191,13 +199,10 @@ The rules that matter most:
 - `INT64` overflow fails with `CADB0420`. `FLOAT64` and `FLOAT32` overflow
   fails with `CADB0421`. Neither wraps or becomes infinity.
 
-Choose `JSONB` (alias `JSON`) when queries read inside the document. Choose
-`STRING` when you must keep the exact input text. `JSONB` sorts keys, drops
-duplicate keys, and rejects invalid JSON with `CADB0418`.
-
-A `JSONB` column cannot be in a primary key, a `UNIQUE` constraint, an ordered
-index, or a foreign key. To sort on a value, enforce it, or reference it, copy
-it to a typed column. See [JSON](https://camusdb.github.io/docs/json).
+Choose `JSONB` (alias `JSON`) to query inside a document, and `STRING` to keep
+the exact input text. `JSONB` sorts keys and rejects invalid JSON (`CADB0418`).
+It cannot be a key, `UNIQUE`, or foreign-key column. Copy a value to a typed
+column to sort on it or enforce it. See [JSON](https://camusdb.github.io/docs/json).
 
 ## Rows, large values, and hot rows
 
@@ -228,7 +233,8 @@ abort with `CADB0502 TransactionConflict`. Shard the counter with
 - **CHECK.** One-row deterministic predicates only. No subquery, aggregate, or
   volatile function (`now()`, `gen_id()`, `gen_uuid_v4()`, `gen_uuid_v7()`).
   Name a check at table level: `CONSTRAINT name CHECK (...)`. A named
-  column-level check is not supported.
+  column-level check is not supported. A new check must be boolean, and its
+  functions and types must be valid. Otherwise the DDL fails before any scan.
 - **UNIQUE.** Use a column-level `UNIQUE`, an inline `UNIQUE KEY name (cols)`,
   or `CREATE UNIQUE INDEX`. Uniqueness applies to key columns only. A `NULL`
   key never conflicts. `INSERT ... ON CONFLICT (a, b)` needs a unique index on
@@ -255,10 +261,12 @@ Use a sequence for a number people see: an invoice, an order, a ticket. Do not
 use one as the primary key of a high-write table. Keep an `OID` or `UUID` key,
 and add `invoice_no INT64 GENERATED BY DEFAULT AS IDENTITY`.
 
-- `SERIAL` and `BIGSERIAL` are `INT64` identity shorthand, not storage types.
+- `SERIAL` and `BIGSERIAL` are both `INT64` identity shorthand, not storage types.
 - Sequence values have gaps and are not a perfect insert order. `CYCLE` is not
   supported. `nextval` elsewhere than `INSERT ... VALUES`, a column default, or
-  a `SELECT` without `FROM` fails with `CADB0547`.
+  a top-level `SELECT` without `FROM` fails with `CADB0547`.
+- A sequence on a `SMALLINT` or `INT` column fails the write with `CADB0420`
+  when a value passes the column range.
 
 See [Sequences](https://camusdb.github.io/docs/sequences).
 
@@ -284,16 +292,13 @@ See [Row-level TTL](https://camusdb.github.io/docs/row-level-ttl).
 
 ## Comments
 
-Add a `COMMENT '...'` clause to each table, column, and inline index. Agents
-that use the CamusDB MCP server read them. A comment holds at most 65,535
-characters (`CADB0511`). See [Schema comments](https://camusdb.github.io/docs/comment-on).
+Add a `COMMENT '...'` to each table, column, and inline index. MCP agents read
+them. Maximum 65,535 characters (`CADB0511`). See [Schema comments](https://camusdb.github.io/docs/comment-on).
 
 ## Schema changes
 
-- `ALTER TABLE ... ADD COLUMN c T NOT NULL` needs a `DEFAULT` when the table
-  has rows. Otherwise it fails with `CADB0301`.
-- CamusDB rejects `DROP COLUMN` of a column that an index uses. Drop the index
-  first.
+- `ADD COLUMN c T NOT NULL` needs a `DEFAULT` on a table with rows (`CADB0301`).
+- `DROP COLUMN` of an indexed column is refused. Drop the index first.
 - Add a foreign key while child writers are quiet, or run an orphan check
   after the migration.
 - `CREATE TABLE ... AS SELECT` copies no index, constraint, default, comment,
@@ -314,18 +319,18 @@ Habits from other databases that are wrong in CamusDB:
 | `NUMERIC(10, 2)` | All | Rejected. `NUMERIC` is fixed at precision 38, scale 9. |
 | UUID in `VARCHAR(36)` | MySQL | Use a native `UUID` column. |
 | `JSON` to keep the input text | PostgreSQL | `JSON` is an alias of `JSONB`. Keys are sorted. Use `STRING` for exact text. |
-| Ordered index or key on a `JSONB` column | All | Refused with `CADB0400`. Use a GIN index or a typed column. |
 | `ON DELETE CASCADE` / `SET NULL` | All | Refused with `CADB0533`. Delete children in the application. |
 | `DEFERRABLE INITIALLY DEFERRED` | PostgreSQL | Refused with `CADB0533`. |
 | `"identifier"` in double quotes | PostgreSQL | Double quotes make a string literal. Quote identifiers with backticks. |
 | Bare `DROP INDEX name` | PostgreSQL | Refused with `CADB0400`. Use `DROP INDEX name ON t` or `DROP INDEX t.name`. |
 | `CONSTRAINT u UNIQUE (a, b)` | PostgreSQL | Use `UNIQUE KEY u (a, b)` or `CREATE UNIQUE INDEX`. |
-| `DESC` index on a `STRING` column | All | Rejected. `DESC` works on fixed-width types only. |
 | Expecting TTL to hide expired rows | Cassandra, Redis | Filter on the expiry column in queries. |
 | `ttl_expire_after = '30 days'` | CockroachDB | Not supported. Use `ttl_expiration_expression` with your own column. |
 | Index on `(created_at)` alone | All | A hotspot under key-range sharding. Lead with a spread column. |
 | One big `DELETE` for cleanup | All | Hits `CADB0506` at 20,000 mutations. Use TTL or batches. |
 | Long `TEXT` column truncated silently | MySQL | CamusDB fails with `CADB0302`. It never truncates. |
+| `INT` for ids, counters, or epoch milliseconds | All | `INT` is range-checked to 32 bits (`CADB0420`). Use `BIGINT` or `INT64`. |
+| `CHAR(N)` padded with spaces; `COLLATE` | PostgreSQL, MySQL | `CHAR(N)` is a maximum and does not pad. No `COLLATE`; use `LOWER`. |
 
 ## References
 

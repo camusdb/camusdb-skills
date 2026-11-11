@@ -1,6 +1,6 @@
 ---
 name: camusdb-sql
-description: Writes, ports, and reviews CamusDB SQL (the CamusSQL dialect). Covers SELECT, joins, subqueries, derived tables, UNION, INTERSECT, EXCEPT, window functions (OVER, row_number), generate_series, INSERT, UPDATE, DELETE, RETURNING, ON CONFLICT, UPSERT, INSERT ... SELECT, CREATE TABLE ... AS SELECT, TRUNCATE, views, materialized views, databases, SHOW TABLES, DESCRIBE, COMMENT ON, jsonb operators and functions (->, ->>, @>, jsonb_set), @name placeholders, prepared statements, backtick identifiers, CAST and ::, ANY/ALL, CASE, IF, NULLIF, coalesce, and scalar functions such as gen_id, date_add, date_trunc, EXTRACT, make_date, to_char, json_value, regexp_replace, and sha256. Use it when writing queries for CamusDB, porting SQL from PostgreSQL, MySQL, CockroachDB, or Spanner, or fixing errors such as CADB0400, CADB0403, CADB0404, CADB0406, CADB0413, CADB0418, CADB0420, CADB0421, CADB0506, CADB0520, CADB0525, CADB0529, CADB0531, CADB0538, CADB0550, or CADB0557.
+description: Writes, ports, and reviews CamusDB SQL (the CamusSQL dialect). Covers SELECT, SELECT without FROM, joins, correlated subqueries, EXISTS, derived tables, UNION, INTERSECT, EXCEPT, window functions (OVER), generate_series, INSERT, UPDATE, DELETE, RETURNING, ON CONFLICT, UPSERT, INSERT ... SELECT, CREATE TABLE ... AS SELECT, TRUNCATE, views, materialized views, SHOW TABLES, COMMENT ON, jsonb operators (->, ->>, @>), @name placeholders, backtick identifiers, CAST and ::, operator precedence, ^ power, LIKE ... ESCAPE, ANY/ALL, CASE, IF, coalesce, Unicode text, and functions such as gen_id, date_add, date_trunc, to_char, substr, strpos, ln, log, exp, regexp_replace, and sha256. Use it when writing queries for CamusDB, porting SQL from PostgreSQL, MySQL, CockroachDB, or Spanner, or fixing errors such as CADB0400, CADB0403, CADB0404, CADB0406, CADB0407, CADB0413, CADB0420, CADB0421, CADB0506, CADB0520, CADB0525, CADB0529, CADB0533, CADB0538, CADB0547, or CADB0557.
 ---
 
 # CamusDB SQL
@@ -17,12 +17,12 @@ Other skills cover nearby topics. Point to them instead of going deep:
 - `camusdb-transactions`: `BEGIN`, isolation, locks, `SELECT ... FOR UPDATE`, retries,
   transaction limits.
 - `camusdb-query-performance`: `EXPLAIN`, plans, statistics, hints, the result cache.
+- `camusdb-csharp-extensions`: inline C# `CREATE FUNCTION` and `CREATE TRIGGER`.
 
 ## Workflow
 
-1. Identify the statement family. Read
-   [references/statements.md](references/statements.md) for its exact syntax. See
-   "References" below for set operations, window functions, and `jsonb`.
+1. Identify the statement family. Read its syntax in
+   [references/statements.md](references/statements.md) or another file in "References".
 2. Apply the lexical rules below. Check every quote, identifier, and placeholder.
 3. Port SQL from another engine? Read
    [references/porting-from-postgres-mysql.md](references/porting-from-postgres-mysql.md)
@@ -31,15 +31,13 @@ Other skills cover nearby topics. Point to them instead of going deep:
    [references/functions.md](references/functions.md). Never assume that a
    PostgreSQL or MySQL function exists.
 5. Check each statement against "Not supported" below. Rewrite, do not hope.
-6. For `UPDATE` and `DELETE`, confirm a `WHERE` clause. For large writes, check
-   the 20,000-mutation default limit.
+6. Confirm a `WHERE` on `UPDATE` and `DELETE`. Check the 20,000-mutation limit.
 7. Verify a non-trivial read with `EXPLAIN`, and a view with `SHOW CREATE VIEW`.
 
 ## Lexical rules
 
-- A keyword is not case-sensitive. A function name is not case-sensitive.
-- CamusDB stores a name in its creation case. A later match ignores case.
-  `Robots` and `robots` cannot both exist in one database.
+- Keywords and function names ignore case. A name keeps its creation case, and a
+  later match ignores case: `Robots` and `robots` cannot both exist.
 - Quote an identifier with backticks only. Do this for reserved words, type
   names, and function names. `CASE`, `END`, `COMMENT`, `IF`, `OVER`, and
   `RETURNING` are reserved.
@@ -47,10 +45,13 @@ Other skills cover nearby topics. Point to them instead of going deep:
   an identifier.
 - A plain string does not treat a backslash as an escape. Double the active
   quote to escape it. Use `E'...'` for `\n`, `\t`, and other escapes.
-- Comments are `-- ...` and `/* ... */`. A block comment does not nest.
-- `--` always starts a comment. `10 --5` is `10`. Write `10 - -5`.
+- Comments are `-- ...` and `/* ... */`, with no nesting. `10 --5` is `10`: write `10 - -5`.
 - A number may group digits with one `_` between digits: `200_000`. A
   hexadecimal integer such as `0xFF` takes no separators.
+- An unknown character outside a literal or comment fails with `CADB0406`, with
+  its line and column. A non-breaking space is not white space. A raw tab or line
+  break inside a literal is refused: write `E'a\tb'`.
+- One request holds one statement. Split a script into requests.
 
 ```sql
 CREATE TABLE `order` (`select` STRING NOT NULL, `from` STRING);
@@ -71,16 +72,13 @@ A placeholder is `@name`. It can replace any value, including `LIMIT`,
 
 ```sql
 SELECT id, name FROM robots WHERE id = @id LIMIT @limit;
-SELECT @p::int64;
 SELECT * FROM users WHERE id = ANY (@ids);
 ```
 
-A prepared statement binds by position, in first-occurrence order. A repeated name
-fills one slot. You can prepare `SELECT`, `INSERT`, `UPDATE`, `DELETE`, and `SHOW`,
-but not DDL or user admin. Prepare through the API or a driver, not with SQL. On
-`CADB0520`, prepare again and replay one time. On `CADB0521`, close unused handles.
-Inline SQL over `max_statement_bytes` (default 8 MiB) fails with `CADB0557` before the
-parse. Bind large values as parameters.
+Prepare through a driver, not with SQL. "Prepared statements" in
+[references/statements.md](references/statements.md) has the rules and errors.
+Inline SQL over `max_statement_bytes` (default 8 MiB) fails with `CADB0557`. Bind
+large values as parameters.
 
 ## SELECT
 
@@ -97,26 +95,29 @@ LIMIT n OFFSET m
 FOR UPDATE;
 ```
 
-- Name an output column with `AS`. `ORDER BY` and `HAVING` can use that alias.
-- `LIMIT` and `OFFSET` take an integer literal or a placeholder.
+- Name an output column with `AS`. `ORDER BY` and `HAVING` can use that alias. An
+  unaliased expression is named by its zero-based position, such as `0`. A scalar
+  subquery takes its inner name.
+- `ORDER BY name` fails (`CADB0400`) when two different outputs share the name.
+  `LIMIT` and `OFFSET` take a nonnegative integer literal or placeholder.
+- `WHERE`, `HAVING`, and `JOIN ON` need a boolean. `WHERE 1` fails with `CADB0400`.
 - Aggregates are `COUNT(*)`, `COUNT(col)`, `SUM`, `AVG`, `MIN`, `MAX`, `jsonb_agg`,
   and `jsonb_object_agg`.
-- Every non-aggregate projection must appear in `GROUP BY`.
-- `HAVING` needs a `GROUP BY` or an aggregate projection. It reads a group key, a
-  select item, or an aggregate.
+- Every non-aggregate projection must appear in `GROUP BY`. `HAVING` needs a
+  `GROUP BY` or an aggregate. It reads a group key, a select item, or an aggregate.
 - Operators: `=`, `!=`, `<>`, `<`, `>`, `<=`, `>=`, `[NOT] BETWEEN` (inclusive),
   `AND`, `OR`, `NOT`, `IS NULL`, `IS NOT NULL`, `IN`, `NOT IN`, `EXISTS`,
   `[NOT] LIKE`, `[NOT] ILIKE`, and the regex operators `~`, `~*`, `!~`, `!~*`.
-- Arithmetic: `+`, `-`, `*`, `/`, `%`. `a || b` joins text; a `NULL` operand gives
-  `NULL`. Bitwise operators are `&`, `|`, `#` (XOR), `~`, `<<`, and `>>`.
-- An `IN` list item is a literal, a parameter, or a column name of the same row. An
-  expression item is a syntax error.
+- Arithmetic: `+`, `-`, `*`, `/`, `%`, and `^` (power). `a || b` joins text; a `NULL`
+  operand gives `NULL`. Bitwise operators are `&`, `|`, `#` (XOR), `~`, `<<`, and `>>`.
+- `LIKE` matches the whole value. `%` is any run, `_` is one code point, and a
+  backslash escapes. `ESCAPE '#'` picks another escape character.
+- An `IN` list item is a literal, a parameter, or a column of the same row.
 - `FOR UPDATE [OF t] [NOWAIT | SKIP LOCKED]` locks the returned rows. See
   `camusdb-transactions`.
-- Regex uses the .NET engine. Use `\p{L}`, not `[[:alpha:]]`. A bad pattern fails with
-  `CADB0400`. Write `'^\d+$'` with single backslashes in a plain string.
-- `NOT IN` against a set that holds a `NULL` returns no row for a non-match. Use
-  `NOT EXISTS` when the inner column is nullable.
+- Regex uses the .NET engine: `\p{L}`, not `[[:alpha:]]`. Write `'^\d+$'` with single
+  backslashes in a plain string. A bad pattern fails with `CADB0400`.
+- `NOT IN` against a set with a `NULL` drops every non-match. Prefer `NOT EXISTS`.
 - `NULL` sorts first ascending and last descending. `NULLS FIRST` is not supported.
 
 ```sql
@@ -141,15 +142,15 @@ INSERT INTO scores (id, score) SELECT i, i * 10 FROM generate_series(1, 1000) AS
 - Set operations match columns by position. A combined `ORDER BY` takes an output
   name or a position, not an expression.
 - A window call goes in the select list or the final `ORDER BY` only.
-- `generate_series` goes in `FROM` only. Its arguments are integers.
-
-Read [references/set-and-window.md](references/set-and-window.md) for the rules.
+- `generate_series` goes in `FROM` only. Its arguments are integers. Read
+  [references/set-and-window.md](references/set-and-window.md).
 
 ### SELECT without FROM
 
-It returns one row. It accepts projections, `LIMIT`, and `OFFSET` only. It rejects
-`SELECT *`, an aggregate, `WHERE`, `GROUP BY`, `HAVING`, and `ORDER BY`. Wrap an
-aggregate in a scalar subquery: `SELECT (SELECT COUNT(*) FROM accounts) AS total;`.
+It reads one synthetic row, with optional `WHERE`, `LIMIT`, and `OFFSET`. It refuses
+`*`, aggregates, `GROUP BY`, `HAVING`, and `ORDER BY`: write
+`SELECT (SELECT COUNT(*) FROM accounts) AS total;`. It also works as a subquery, a
+derived table, or a view body: `SELECT 'seed' WHERE NOT EXISTS (SELECT 1 FROM t);`.
 
 ## Joins and subqueries
 
@@ -160,13 +161,16 @@ aggregate in a scalar subquery: `SELECT (SELECT COUNT(*) FROM accounts) AS total
   `LEFT JOIN` removes the padded rows.
 - A `RIGHT JOIN` whose left operand is a join fails with `CADB0533`. Put the
   preserved table on the left.
-- `IN (SELECT ...)` must return one column and must not be correlated.
+- `IN (SELECT ...)` must return one column.
 - An uncorrelated subquery works in any expression position: the select list,
   `HAVING`, `JOIN ON`, `UPDATE ... SET`, and `INSERT ... VALUES`. `ORDER BY` and
   `GROUP BY` refuse one with `CADB0400`.
-- A correlated `EXISTS` works only in the `WHERE` of a `SELECT`. Elsewhere it fails
-  with `CADB0533`. A correlated scalar subquery is refused.
+- Correlated scalar, `EXISTS`, `IN`/`NOT IN`, and `ANY`/`ALL` subqueries work in
+  `SELECT ... WHERE`, a select list without grouping, aggregates, or windows,
+  `UPDATE ... SET`/`WHERE`, and `DELETE ... WHERE`. Elsewhere they fail with
+  `CADB0533`. A name resolves in the nearest query first. Qualify columns.
 - A scalar subquery with zero rows gives `NULL`. More than one row is an error.
+  Read "Subqueries" in [references/statements.md](references/statements.md).
 - A derived table needs an alias. Alias each computed column inside it.
 
 ```sql
@@ -187,17 +191,17 @@ DELETE FROM orders WHERE total > 100 LIMIT 10 RETURNING *;
 ```
 
 - `UPDATE` and `DELETE` require a `WHERE` clause. They accept `LIMIT n` before
-  `RETURNING`. To empty a table, use `TRUNCATE`.
+  `RETURNING`. To empty a table, use `TRUNCATE [TABLE] t [RESTART IDENTITY]`: one
+  table, no `CASCADE`, and not in an explicit transaction (`CADB0538`).
 - A multi-row `INSERT` is atomic. A repeated target column fails with `CADB0403`.
 - `ON CONFLICT` takes a column list or `ON CONSTRAINT name`, then `DO NOTHING` or
   `DO UPDATE`. `DO UPDATE` must name a target. `excluded.c` is the proposed row.
   `UPSERT` updates on the primary key. Read
   [references/statements.md](references/statements.md) for both forms.
 - Any failed statement ends an explicit transaction. There are no savepoints.
-- `RETURNING` takes `*`, columns, scalar expressions, aliases, and parameters.
-  It rejects aggregates and subqueries (`CADB0400`), sequence calls
-  (`CADB0547`), and unknown columns (`CADB0404`). It needs `SELECT` on the target.
-  `UPDATE` returns the new row only.
+- `RETURNING` takes `*`, columns, scalar expressions, aliases, and parameters. It
+  refuses aggregates and subqueries (`CADB0400`), sequence calls (`CADB0547`), and
+  unknown columns (`CADB0404`). It needs `SELECT`. `UPDATE` returns the new row.
 - A gRPC non-query reply over 4 MiB fails with `CADB0550`. Use `ExecuteQuery`.
 - One transaction may write at most `max_mutations_per_transaction` mutations
   (default 20,000). Excess fails with `CADB0506`. Split the work.
@@ -215,14 +219,9 @@ SELECT customer, SUM(total) AS total_spent FROM orders GROUP BY customer;
 - Columns match **by position**, never by name. Counts must agree.
 - CTAS copies the result shape only, and adds a leading key `id OID`. Alias every
   expression. Cast a bare `NULL`. List columns instead of `*` over a join.
+- The source can read a plain view. A scalar subquery column keeps its type when empty.
 - A source with `AS OF SYSTEM TIME` copies historical rows into the present. Use it
   to copy from a busy table. See [references/statements.md](references/statements.md).
-
-### TRUNCATE
-
-`TRUNCATE [TABLE] t [RESTART IDENTITY]` takes one table and no `CASCADE`. It fails
-inside an explicit transaction (`CADB0538`), on a referenced parent table
-(`CADB0530`), and on a view (`CADB0525`).
 
 ## Views and materialized views
 
@@ -235,45 +234,42 @@ REFRESH MATERIALIZED VIEW customer_totals;
 
 - Alias each expression of a view. A body may not mix `*` with other columns, use
   `AS OF SYSTEM TIME`, or carry hints. It can be a set operation.
+- `CREATE VIEW` binds the body without running it. A runtime error appears on read.
 - `CREATE OR REPLACE VIEW` may only append columns (`CADB0529`).
 - Every view is read-only (`CADB0525`). A view runs with its **owner's** privileges.
-- A materialized view changes only on `REFRESH`. `CONCURRENTLY` fails with `CADB0533`.
-- `DROP TABLE` fails while a view depends on it (`CADB0530`). It has no `CASCADE`.
+- A materialized view changes only on `REFRESH` (no `CONCURRENTLY`). `DROP TABLE`
+  fails while a view depends on it (`CADB0530`).
 
 ## Databases and inspection
 
-```sql
-CREATE DATABASE IF NOT EXISTS app;
-DROP DATABASE IF EXISTS app;                -- FORCE deletes it permanently
-SHOW DATABASES; SHOW TABLES; SHOW VIEWS; SHOW MATERIALIZED VIEWS;
-SHOW TABLES FROM app LIKE 'order%';         -- FROM or IN; needs no current database
-SHOW COLUMNS FROM robots; DESCRIBE robots; SHOW INDEXES FROM robots; SHOW CREATE TABLE robots;
-COMMENT ON COLUMN users.email IS 'Unique login email address';
-DROP INDEX year_idx ON robots;              -- the table is required
-```
-
-- Create a database explicitly. An unknown database gives `CADB0010`.
-- `USE app;` is a `camus-cli` shell command. A driver, HTTP, or gRPC client
-  names the database in the connection string or request.
-- `SHOW TABLES` lists tables only, not views.
+- Create a database explicitly: `CREATE DATABASE IF NOT EXISTS app;`. An unknown
+  database gives `CADB0010`. `USE app;` is a `camus-cli` command only.
+- `SHOW TABLES` lists tables only. Use `SHOW VIEWS` and `SHOW MATERIALIZED VIEWS`.
+- `DROP INDEX idx ON t` needs the table. The full syntax is in
+  [references/statements.md](references/statements.md).
 
 ## Expressions
 
 - Cast with `CAST(x AS type)` or `x::type`. `::` binds tighter than operators:
   write `(a + b)::text`.
 - A float cast to `INT64` rounds half away from zero: `2.5` gives `3`. A string must
-  spell an integer. `CAST('2.5' AS int64)` fails with `CADB0400`.
+  spell an integer. `::int` and `::smallint` check 32-bit and 16-bit ranges (`CADB0420`).
 - Two values compare only when their types have a rule. `5 = '5'` and `bool_col = 1`
   fail with `CADB0400`. Cast one side. `date` with `datetime`, and a string with a
   date, work. Read "Comparison rule" in [references/functions.md](references/functions.md).
 - `CASE`, `COALESCE`, `IFNULL`, `NVL`, and `IF(cond, a, b)` return one type. Numbers
   widen. `COALESCE(1, 'a')` fails with `CADB0400`, also in a branch that never runs.
+  `COALESCE`, `IFNULL`, and `NVL` stop at the first non-`NULL` value.
+- A known mistake fails before any row is read, even on an empty table: an unknown
+  function, a wrong argument count, a type clash, or a constant `1 / 0`.
+- Precedence follows PostgreSQL. `^` binds above `*`. `||`, bitwise, regex, and
+  `jsonb` operators share one level. `IS` binds below comparisons, and `a = b = c`
+  fails. Read [references/expressions.md](references/expressions.md).
 - `INT64` arithmetic never wraps: past the range it fails with `CADB0420`. A float
   overflow or underflow fails with `CADB0421`. `'Infinity'` and `'NaN'` are values.
 - `arr[n]` reads element `n`, starting at 1. Out of range gives `NULL`. All non-`NULL`
   elements of `ARRAY[...]` must share one type.
-- `x op ANY (array_or_subquery)`, `SOME`, and `ALL` work with `=`, `<>`, `<`,
-  `<=`, `>`, `>=`. A subquery on the right must not be correlated.
+- `x op ANY (array_or_subquery)`, `SOME`, and `ALL` take any comparison operator.
 - A statement deeper than 1,000 parse levels fails with `CADB0413`. So does one with
   more than 64 nested set operations. Replace a huge `CASE` with a join.
 
@@ -295,10 +291,10 @@ Key rules:
 - Session functions (`current_user()`, `current_database()`, ...) are not
   allowed in a `DEFAULT` or a `CHECK`.
 - Times are UTC. `date_add` returns `DATETIME`, even for a `DATE` input.
+- Text positions and lengths count code points. Sorting uses binary UTF-16 order,
+  with no `COLLATE`.
 
 ## Not supported
-
-The docs state these limits:
 
 - `FULL [OUTER] JOIN`, `NATURAL JOIN`, `JOIN ... USING (...)`, `LATERAL`.
 - `COUNT(DISTINCT x)`, `SELECT DISTINCT ... GROUP BY`, `SELECT DISTINCT COUNT(*)`.
@@ -316,15 +312,13 @@ The docs state these limits:
 ## Common mistakes
 
 - `"col"` as an identifier (PostgreSQL). It is a string. Use backticks.
-- `'O\'Brien'` (MySQL). Write `'O''Brien'` or `E'O\'Brien'`.
-- `LIMIT 10, 20` (MySQL). Write `LIMIT 20 OFFSET 10`.
-- `now() + interval '1 day'` or `DATE_ADD(d, INTERVAL 1 DAY)`. Write
-  `date_add(d, 1, 'day')`.
-- Local timestamp text without an offset. Add `Z` or `+00:00`.
-- `sha256(x)` expecting bytes (PostgreSQL). It returns hex text. Use `digest(x, 'sha256')`.
+- `'O\'Brien'` or `LIMIT 10, 20` (MySQL). Write `'O''Brien'` and `LIMIT 20 OFFSET 10`.
+- `now() + interval '1 day'`. Write `date_add(now(), 1, 'day')`.
 - `a || b` when an operand can be `NULL`. The result is `NULL`. Write `concat(a, b)`,
   which skips `NULL` arguments. `||` is not a logical OR.
 - `WHERE int_col = '5'` (MySQL). It fails with `CADB0400`. Write `int_col = 5`.
+- `'k=' || doc ->> 'k'`. It reads `('k=' || doc) ->> 'k'`. Write `'k=' || (doc ->> 'k')`.
+- A `LIKE` pattern with a literal `_` or `\`. Escape it: `'a\_%'`.
 - A plain `SELECT ... AS OF SYSTEM TIME` inside an explicit transaction. It works
   only in autocommit, or as the source of `INSERT ... SELECT` or CTAS.
 
@@ -339,6 +333,8 @@ Read these files in this skill:
 - [references/set-and-window.md](references/set-and-window.md): `UNION`, `INTERSECT`,
   `EXCEPT`, `OVER`, and `generate_series`.
 - [references/jsonb.md](references/jsonb.md): `jsonb` operators, functions, and aggregates.
+- [references/expressions.md](references/expressions.md): operator precedence, `LIKE`,
+  checks before rows are read, output names, `LIMIT` rules, and Unicode text.
 - [references/porting-from-postgres-mysql.md](references/porting-from-postgres-mysql.md):
   read when you translate SQL from PostgreSQL, MySQL, CockroachDB, or Spanner.
 

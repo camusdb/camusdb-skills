@@ -21,7 +21,6 @@ Source docs: https://camusdb.github.io/docs/dotnet-driver
 - OpenTelemetry
 - Node stats
 - Backups
-- Low-level gRPC client (`CamusDB.Grpc.Client`)
 
 ## Connection-string keys
 
@@ -71,6 +70,8 @@ Endpoint=http://a:5095,http://b:5095,http://c:5095;Database=app;RoutingMode=Lear
 ```
 
 - The pool rotates. An unreachable endpoint is skipped for 30 seconds.
+- The request that discovers the failure can still fail. Rotation does not replay it. Use the retry rules.
+- An Aspire `AddCamusDBCluster` connection string lists every node's endpoint in this form.
 - Rotation and health state are shared by connections with the same `Endpoint` value.
 - Learned routing sends repeated statements to the node that leads their data. It is a latency optimization only.
 - `Auto` negotiates only when `RoutingNodes` names at least two distinct endpoints. `Learned` needs one mapping.
@@ -333,6 +334,7 @@ The server can run C# extension procedures, triggers, and functions. The driver 
 - `CALL` is not prepared. It needs a superuser in this server version.
 - `CREATE TRIGGER` and `DROP TRIGGER` go to the DDL endpoint.
 - Extension errors use `CADB08xx` codes. A conflict can replay a statement, so a trigger or a procedure can run more than once.
+- Inline C# functions (`CREATE FUNCTION ... LANGUAGE csharp`) are called like built-in functions in SQL. Use the `camusdb-csharp-extensions` skill to write them.
 
 ## OpenTelemetry
 
@@ -364,28 +366,3 @@ builder.Services.AddOpenTelemetry()
 
 `connection.Backups` methods: `TakeFullBackupAsync()`, `TakeIncrementalBackupAsync(parentBackupId)`, `TakeCoordinatedBackupAsync()`, `GetChainAsync(leafBackupId)`, `ListBackupsAsync()`, `PreviewGarbageCollectionAsync()`, `CollectGarbageAsync()`.
 Backups are node-wide and REST-only. The server needs `kahuna.backup_dir`.
-
-## Low-level gRPC client (`CamusDB.Grpc.Client`)
-
-The CamusDB source tree has a separate project, `CamusDB.Grpc.Client` (namespace `CamusDB.Grpc.Client`).
-It has its own `CamusConnection` type. It is not the ADO.NET `CamusDB.Client.CamusConnection`.
-Prefer `CamusDB.Client` with `Protocol=grpc` for application code.
-The prepared-statements doc shows this low-level API:
-
-```csharp
-await using CamusConnection connection = CamusConnection.Connect("https://localhost:5001");
-
-await using CamusPreparedStatement insert = await connection.PrepareAsync(
-    "productiondb", "INSERT INTO robots (id, name, year) VALUES (gen_id(), @name, @year)");
-
-await insert.ExecuteNonQueryAsync(["optimus", 1984L]);                     // by ordinal
-await insert.ExecuteNonQueryAsync(new { name = "wall-e", year = 2008L });  // by name
-
-CamusTransactionSession txn = await connection.BeginTransactionAsync("productiondb");
-await txn.ExecuteNonQueryAsync(insert, ["bumblebee", 1985L]);
-await txn.CommitAsync();
-```
-
-- Binding by name rejects a missing or an extra property. It never binds a silent `NULL`.
-- The client re-registers statements on a rebuilt stream automatically.
-- Options live in `CamusGrpcOptions` (`ChannelPoolSize`, `CoalescingThreshold`, `CoalescingDelayMs`, TLS settings).

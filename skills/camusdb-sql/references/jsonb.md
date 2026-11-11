@@ -67,13 +67,23 @@ SELECT jsonb_build_object('a', 1), to_jsonb(42);
   A scalar operand becomes a one-element array.
 - A text operand where a document belongs is parsed as a document.
 
-These operators bind tighter than comparison, `IS`, and `IN`. So these forms work:
+These operators share one level with `||`, the bitwise operators, and the regex
+operators, as in PostgreSQL. They group left to right. Arithmetic binds tighter.
+Comparison, `IS`, and `IN` bind looser. So these forms work:
 
 ```sql
 SELECT id FROM events WHERE payload ->> 'deleted_at' IS NULL;
 SELECT id FROM events WHERE payload ->> 'kind' IN ('login', 'logout');
 SELECT id FROM events WHERE payload -> 'user' ->> 'id' = '7';
 ```
+
+Precedence traps:
+
+- `'x' || payload ->> 'kind'` means `('x' || payload) ->> 'kind'`. Write
+  `'x' || (payload ->> 'kind')`.
+- `payload -> 0 + 1` selects element 1.
+- A view or `CHECK` stored by an older version keeps its old grouping. See
+  "Operator precedence" in [expressions.md](expressions.md).
 
 Lexer traps:
 
@@ -193,7 +203,6 @@ distinct leaf of an indexed document counts against the transaction mutation lim
 | --- | --- |
 | `json` type | An alias of `jsonb`. The input text is not kept. |
 | `jsonb_path_ops` | Builds the same index as `jsonb_ops`. |
-| Precedence | Operators sit above `IS` and `IN`, not at the `\|\|` level. |
 | A text column as a document operand | Parsed as a document, not refused. |
 | Non-JSON text compared with a document | Equals no document, not refused. |
 | `jsonb_agg(x ORDER BY y)` | Not supported. |

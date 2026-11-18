@@ -2,6 +2,8 @@
 
 Sources: https://camusdb.github.io/docs/time-travel-reads,
 https://camusdb.github.io/docs/insert-select-and-ctas,
+https://camusdb.github.io/docs/sql-writes,
+https://camusdb.github.io/docs/error-codes,
 https://camusdb.github.io/docs/recover-dropped-objects,
 https://camusdb.github.io/docs/truncate-table,
 https://camusdb.github.io/docs/configuration,
@@ -15,7 +17,7 @@ to confirm the target time, the affected tables, and the recovery name.
 
 | Mechanism | Setting | Default | Notes |
 | --- | --- | --- | --- |
-| MVCC history (time travel) | `kahuna.persistent_revision_retention_age_seconds` | Unset: follows `kahuna.pitr_window_seconds` (`3600`) | Must be at least the PITR window, or `0` to disable age pruning. A restart setting. |
+| MVCC history (time travel) | `kahuna.persistent_revision_retention_age_seconds` | Unset: follows `kahuna.pitr_window_seconds` (`3600`) | Must be at least the PITR window, or `0` to disable age pruning. A restart setting. A read past it fails with `CADB0847`. |
 | Per-key revision cap | `kahuna.persistent_revision_retention_count` | `0` (off) | Can trim history below the PITR window on hot keys. Prefer the age bound. |
 | Orphans (dropped and truncated) | `orphan_retention_ms` | `604800000` (7 days) | `0` or below keeps orphans without limit. |
 | Orphan reclaimer | `orphan_reclaim_interval_ms` | `300000` (5 minutes) | `0` or below disables the sweep. |
@@ -26,8 +28,15 @@ to confirm the target time, the affected tables, and the recovery name.
 Use `SHOW VARIABLES LIKE 'orphan_%';` to see what a node resolved, and whether
 a key can change at runtime. `kahuna.*` keys always need a restart.
 
-Time travel beyond the history window does not error. It returns no rows. The
-expiry shown by `SHOW ORPHAN ...` is when an orphan becomes eligible for
+A time-travel read that needs history that retention already pruned fails with
+`CADB0847 SnapshotTooOld` (HTTP 409). It does not return missing rows or older
+values. A retry at the same timestamp fails again. Choose a newer timestamp,
+or raise retention before you need older history. Age retention keeps the
+revision visible at the start of the window, so an unchanged row stays
+readable through the whole window. A live branch protects its fork snapshot
+with a hold, independently of the age window.
+
+The expiry shown by `SHOW ORPHAN ...` is when an orphan becomes eligible for
 reclamation. Recovery works until it is actually reclaimed.
 
 ## Recipe 1: rows deleted or overwritten by mistake
@@ -61,8 +70,11 @@ table that was dropped and created again (new internal id).
    rescue, create the table `WITH NO DATA`, then copy slices with
    `INSERT ... SELECT ... AS OF SYSTEM TIME` and a range predicate per slice.
 
-4. Check the response. A historical copy that read nothing returns `rows: 0`
-   and a `warning`. That usually means the history was reclaimed.
+4. Check the response. A historical copy that read nothing reports 0 rows and
+   a warning. The warning lists the possible causes: the source was empty at
+   that snapshot, the history was reclaimed, or the rows were deleted after
+   the snapshot. Check the timestamp and the filter. A read that needs pruned
+   history fails with `CADB0847 SnapshotTooOld` instead.
 5. Put the rows back. Read from the side table, not from a historical query.
    In a historical statement, every subquery also reads the past.
 
@@ -81,16 +93,27 @@ table that was dropped and created again (new internal id).
    small on a busy source. A `GENERATED ALWAYS AS IDENTITY` column refuses
    supplied values unless the insert uses `OVERRIDING SYSTEM VALUE`.
 
-6. For a wrong `UPDATE`, rescue the old values the same way. Then write
-   per-row `UPDATE` statements from the side table, in batches:
-
-   ```bash
-   camus-cli shop -e "SELECT id, total FROM orders_rescue" --format json > old.json
-   ```
+6. For a wrong `UPDATE`, rescue the old values the same way. Then copy them
+   back with `UPDATE ... FROM` the side table. `AS OF SYSTEM TIME` does not
+   work directly with `UPDATE`, so always go through the side table.
 
    ```sql
-   UPDATE orders SET total = 120.5 WHERE id = STR_ID('507f1f77bcf86cd799439011');
+   UPDATE orders AS o
+   SET total = r.total
+   FROM orders_rescue AS r
+   WHERE o.id = r.id AND o.total <> r.total;
    ```
+
+   - Only `orders` changes. The joined form takes no `LIMIT`. Slice a large
+     set with a `WHERE` range on the side table, and repeat until a run
+     updates 0 rows. `o.total <> r.total` skips rows already restored.
+   - `<>` with a `NULL` on either side is unknown, so those rows are skipped.
+     Restore them with a separate statement that tests `IS NULL`.
+   - Each target row must match one side-table row. More than one match fails
+     the whole statement with `CADB0400` before it writes.
+   - You cannot assign the primary key in this form.
+   - Under Serializable, the match takes exclusive range locks on `orders` and
+     on the side table. Keep slices small on a busy table.
 
 7. Verify counts and spot-check rows. Ask before dropping `orders_rescue`.
 
@@ -249,6 +272,7 @@ https://camusdb.github.io/docs/key-range-sharding#split-a-range-manually.
 | `CADB0012` | `DatabaseAlreadyExists` | `CREATE DATABASE ... RELINK TO` target name is taken. |
 | `CADB0013` | `TableAlreadyExists` | `CREATE TABLE ... RELINK TO` target name is taken. |
 | `CADB0537` | `SnapshotPrecedesContentsGeneration` | Time travel before a truncate cut. |
+| `CADB0847` | `SnapshotTooOld` | Retention pruned history the read needs. HTTP 409. Do not retry the same timestamp. Choose a newer one, or begin a new transaction. |
 | `CADB0538` | `StatementNotAllowedInTransaction` | `TRUNCATE` inside `BEGIN`. |
 | `CADB0530` | `DependentObjectsExist` | `TRUNCATE` or `DROP` of a referenced parent. |
 | `CADB0534` | `ConcurrentSchemaChange` | Lost a race with another truncate. Retryable. |

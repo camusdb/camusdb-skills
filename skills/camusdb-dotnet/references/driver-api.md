@@ -1,7 +1,7 @@
 # CamusDB.Client driver API
 
 Read this file when you configure a connection string, tune routing or prepared statements, or need an exact method name.
-Source docs: https://camusdb.github.io/docs/dotnet-driver
+Source docs: https://camusdb.github.io/docs/dotnet-driver and https://camusdb.github.io/docs/prepared-statements
 
 ## Contents
 
@@ -222,6 +222,7 @@ Retry codes:
 | `CADB0506` | `TransactionMutationLimitExceeded` | Do not retry. Split the work. |
 | `CADB0555` | `LockNotAvailable` | `FOR UPDATE NOWAIT` met a held row. The transaction ended. Not retried. Let the application decide. |
 | `CADB0824` | `TransactionRollbackOnly` | The transaction is aborted. Roll back and start a new transaction. |
+| `CADB0847` | `SnapshotTooOld` | Retention removed history that a snapshot read needs. Do not retry the same snapshot. Use a newer `AS OF SYSTEM TIME`, or begin a new transaction. |
 | `CADB0400` | `InvalidInput` | Message "Unknown transaction": a statement already failed and the server rolled back. Do not retry the statement. |
 
 `SerializableRetryHelper` API:
@@ -302,6 +303,9 @@ await pipeline.CommitAsync(); // commits only if every statement of the transact
 - The driver re-prepares and replays once on `CADB0520` (`UnknownPreparedStatement`).
 - Behavior is unchanged: transaction, isolation, locks, affected rows, and result cache stay the same.
 - REST handles live on one node for one principal. gRPC handles live on one `BatchExecute` stream.
+- CamusDB never replicates a handle. Behind a load balancer, the driver prepares each statement once on each node it reaches.
+- A repeated `@name` binds one value. A parameter that matches no placeholder is an error, and so is a placeholder with no parameter. Neither becomes `NULL`.
+- Preparing checks no privileges. The server checks them at each execution, as for an inline statement.
 
 ## Query result cache
 

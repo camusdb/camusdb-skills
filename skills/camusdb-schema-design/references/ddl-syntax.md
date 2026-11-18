@@ -14,7 +14,9 @@ https://camusdb.github.io/docs/sequences,
 https://camusdb.github.io/docs/row-level-ttl,
 https://camusdb.github.io/docs/storage-layout,
 https://camusdb.github.io/docs/comment-on,
-https://camusdb.github.io/docs/databases.
+https://camusdb.github.io/docs/databases,
+https://camusdb.github.io/docs/data-types,
+https://camusdb.github.io/docs/csharp-extensions (trigger dependencies).
 
 ## Databases
 
@@ -103,6 +105,9 @@ Rules:
 - Names keep their case, but lookups ignore case. Two names that differ only
   in case are rejected.
 - Quote an identifier with backticks. Double quotes make a string literal.
+- `COMMENT`, `USING`, `LATERAL`, and the type keywords are reserved. Quote a
+  table or column with such a name: `` `using` ``.
+- `INTERVAL` is not a column type. Store interval text in a `STRING` column.
 
 ### CREATE TABLE AS SELECT
 
@@ -113,6 +118,7 @@ CREATE TABLE empty_copy AS SELECT * FROM robots WITH NO DATA;
 
 CTAS adds its own generated primary key column. It copies no index,
 constraint, default, comment, setting, or foreign key. Add them afterwards.
+CTAS cannot store an `INTERVAL` projection. Cast it to `STRING` in the query.
 
 ## Defaults
 
@@ -124,10 +130,11 @@ DEFAULT (gen_uuid_v4())     -- UUID / GUID
 DEFAULT (gen_uuid_v7())     -- UUID / GUID
 DEFAULT (nextval('seq'))    -- INT64
 DEFAULT (now())             -- DATETIME
+DEFAULT (DATE '2026-03-15') -- DATE or DATETIME, typed literal
 ```
 
 A function default must be a bare call with no argument. A type mismatch is
-rejected.
+rejected. A typed literal default needs the parentheses.
 
 ## Column storage strategies
 
@@ -276,6 +283,10 @@ ALTER TABLE t RENAME TO new_table_name;
 - `DROP COLUMN` fails when an index uses the column, as a key or `INCLUDE`
   column. Drop the index first.
 - `DROP COLUMN` of a column in a foreign key fails with `CADB0530`.
+- `DROP COLUMN` or `RENAME COLUMN` fails with `CADB0530` when a trigger names
+  the column in its C# body, or maps it as a typed row. Drop or rewrite the
+  trigger first. The check also counts a local variable or a string with the
+  column's name.
 - `SET NOT NULL` scans the table. It fails with `CADB0301` on an existing `NULL`.
 - You cannot drop `NOT NULL` from a primary key column.
 - A rename moves no data. A rename to an existing name fails with

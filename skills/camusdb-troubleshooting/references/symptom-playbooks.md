@@ -27,6 +27,8 @@ error code. Each playbook lists checks in order, then fixes.
 20. A statement fails with `CADB0400` after an upgrade
 21. Syntax error at an invisible character (`CADB0406`)
 22. Detected storage damage (`CADB0837`)
+23. Historical or snapshot read fails with `CADB0847`
+24. Recursive query fails with `CADB0560`
 
 ## 1. Conflict storm (`CADB0502`)
 
@@ -157,13 +159,17 @@ Checks:
 2. If `operation_duration_ms.max` jumped while `operations_total` grew a little,
    the stall did not come from load.
 3. Widen the filter. Find what advanced in the same interval:
-   `kahuna.kv.write.*`, `raft.wal.*`, `kahuna.backup.*`.
+   `kahuna.kv.write.*`, `raft.wal.*`, `kahuna.backup.*`, `kahuna.collect.*`.
 4. Compare `max` with `total / count`. A high `max` with normal `last` means a
    periodic stall.
+5. `SHOW ENGINE STATS LIKE 'kahuna.collect%'`. A `kahuna.collect.cycle.duration`
+   spike that lines up with the latency spike points to a Kahuna collection
+   cycle. `backlogged` close to `cycles` means collection cannot keep up.
+   `inspected` far above `evicted` means the cycles spend their budget on pinned
+   entries.
 
-Fixes depend on the cycle found: backup schedule, WAL flush pressure, or write
-batch behavior. A collection tick has no metric yet in the current Kahuna
-version; it appears as an unexplained gap.
+Fixes depend on the cycle found: backup schedule, WAL flush pressure, write
+batch behavior, or collection cycles.
 
 ## 7. Node overload
 
@@ -228,6 +234,9 @@ changes no row.
 - `CADB0520` after a restart: prepared handles are gone. Prepare again.
 - An explicit transaction lives on its node. If that node restarted, the
   transaction is gone. Replay from `BEGIN`.
+- A partition that cannot reach a majority of its members stops all commits.
+  It does not accept a change that could conflict with another copy. Restore
+  enough healthy members, then retry.
 
 ## 12. Nodes behave differently
 
@@ -244,8 +253,8 @@ changes no row.
   `WHERE "status" = 'x'` compares two strings. Use backticks for identifiers.
 - An expired TTL row stays readable until the sweep deletes it. Filter with
   `WHERE expires_at > NOW()`.
-- An `AS OF SYSTEM TIME` read older than retained history returns empty, not an
-  error.
+- A historical read never returns empty for history that retention removed. It
+  fails with `CADB0847`. See playbook 23.
 - Under `READ COMMITTED`, a second statement can see different rows and phantoms.
   One `SELECT` reads one snapshot in a pessimistic transaction.
 - A read at a snapshot can miss a commit from a node with a later clock. The .NET
@@ -389,6 +398,9 @@ Docs:
 - https://camusdb.github.io/docs/distributed-schema
 - https://camusdb.github.io/docs/wal-recovery
 - https://camusdb.github.io/docs/connection-model
+- https://camusdb.github.io/docs/cluster
+- https://camusdb.github.io/docs/time-travel-reads
+- https://camusdb.github.io/docs/sql-queries#recursive-ctes
 
 ## 20. A statement fails with `CADB0400` after an upgrade
 
@@ -461,3 +473,60 @@ Fixes:
   restore a backup. See the `camusdb-migrations-and-recovery` skill.
 - The endpoint does not scan for damage or repair it. SQLite has no page
   checksums, so detection there is weaker.
+
+## 23. Historical or snapshot read fails with `CADB0847`
+
+`CADB0847 SnapshotTooOld` (HTTP 409) means retention removed history that a
+snapshot read needs. CamusDB fails rather than return missing rows or older
+values. Two reads can get it: an `AS OF SYSTEM TIME` read, and a long snapshot
+transaction.
+
+Checks:
+
+1. Compare the read timestamp with the retention window.
+2. `SHOW VARIABLES LIKE 'kahuna.persistent\_revision%'`.
+   `kahuna.persistent_revision_retention_age_seconds` keeps old revisions for
+   that age. With neither retention key set, it follows
+   `kahuna.pitr_window_seconds` (3,600 by default). `0` turns age pruning off.
+   `kahuna.persistent_revision_retention_count` caps revisions per key. Its
+   default, `0`, turns count pruning off.
+3. A read before a `TRUNCATE` cut gives `CADB0537` instead. That is a
+   different fix: `CREATE TABLE ... RELINK TO`.
+
+Fixes:
+
+- Do not retry at the same timestamp. Pruned history does not come back.
+- Choose a newer `AS OF SYSTEM TIME` timestamp.
+- For a long snapshot transaction, roll back and begin a new transaction.
+- Raise retention before running work that needs older history. Set it under
+  `kahuna:` in `config.yml` and restart. `SET CLUSTER SETTING` rejects every
+  `kahuna.*` key. A nonzero age must be at least `kahuna.pitr_window_seconds`.
+- A branch protects its fork snapshot with holds, apart from the age window.
+
+## 24. Recursive query fails with `CADB0560`
+
+`CADB0560 RecursiveQueryLimitExceeded` (HTTP 400) means a `WITH RECURSIVE`
+query passed one of two limits. A retry of the same query hits the same limit.
+
+| Setting | Default | Counts |
+| --- | --- | --- |
+| `max_recursive_cte_iterations` | `10000` | Recursive steps that produce rows |
+| `max_recursive_cte_rows` | `10000000` | Total rows per run, seed rows included |
+
+Checks:
+
+1. Look for a stopping predicate in the recursive term, such as a depth bound.
+   Recursion ends only when a step produces no rows. On a cyclic graph,
+   `UNION ALL` keeps repeating rows. `UNION` drops repeated rows, but a changing
+   depth or path column keeps them distinct.
+2. Count the readers of the CTE. A single reader can stream rows, so its `LIMIT`
+   can stop recursion early. With several readers, CamusDB computes the whole
+   result first, and an outer `LIMIT` does not stop recursion.
+
+Fixes:
+
+- Add a terminating predicate, such as `WHERE depth < 20`.
+- Raise a limit with `SET CLUSTER SETTING` only after you check the query. Both
+  are runtime cluster settings. `0` disables a limit.
+- A deep chain of CTEs that reuse each other can fail with `CADB0413` instead.
+  See the `CADB0413` row in `error-codes.md`.

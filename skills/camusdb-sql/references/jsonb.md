@@ -151,10 +151,14 @@ fails with `CADB0422`. `jsonb_agg(x ORDER BY y)` is not supported.
 SELECT key, value FROM jsonb_each('{"a": 1, "b": [2]}');
 SELECT e.value FROM jsonb_array_elements(@doc) AS e WHERE e.value ->> 'ok' = 'true';
 SELECT k, v FROM jsonb_each(@doc) AS e(k, v);
+SELECT t.id, e.key FROM events AS t, jsonb_each(t.payload) AS e;
 ```
 
-- The argument is a literal, a parameter, or an expression without columns.
-- `FROM t, jsonb_each(t.doc)` is `LATERAL`, which is not supported.
+- An argument without column references (a literal, a parameter, or an expression)
+  is evaluated once.
+- An argument can read a column of a `FROM` source to its left, as in
+  `FROM t, jsonb_each(t.doc)`. The function then runs for each left row. `LATERAL`
+  is implicit. See [ctes-and-lateral.md](ctes-and-lateral.md).
 - A document of the wrong kind fails before the first row.
 - `key` is reserved, but `SELECT key` and `e.key` work as column references.
 
@@ -196,6 +200,9 @@ distinct leaf of an indexed document counts against the transaction mutation lim
 - HTTP sends the document as native JSON. JSON `null` and SQL `NULL` then look the
   same. Set `"jsonbAsText": true` on the request to keep them apart.
 - gRPC sends the text form in `Value.json_value`. An old client reads `NULL`.
+- A driver handles this encoding. For a custom client, see
+  https://camusdb.github.io/docs/http-api#jsonb-values and
+  https://camusdb.github.io/docs/grpc-api#value-encoding.
 
 ## Differences from PostgreSQL
 
@@ -206,7 +213,7 @@ distinct leaf of an indexed document counts against the transaction mutation lim
 | A text column as a document operand | Parsed as a document, not refused. |
 | Non-JSON text compared with a document | Equals no document, not refused. |
 | `jsonb_agg(x ORDER BY y)` | Not supported. |
-| `LATERAL` | Not supported. |
+| `LATERAL`, as in `FROM t, jsonb_each(t.doc)` | Supported. The keyword is optional for a table function. |
 | `jsonpath`, `@?`, `@@`, `jsonb_path_query` | Not supported. |
 | `doc['key']` | Not supported. Write `doc -> 'key'`. |
 | `row_to_json`, `jsonb_to_record`, `jsonb_populate_record` | Not supported. |

@@ -1,6 +1,6 @@
 ---
 name: camusdb-typescript
-description: Writes and reviews TypeScript or JavaScript (Node.js) code that uses CamusDB through the `camusdb` npm package, and code in any other language that calls the CamusDB HTTP API or gRPC API directly. Use when code imports CamusClient, camus, withRetry, isRetryable, CamusError, CamusErrorCode, ColumnType, CamusPipeline, or CamusTransportPool from 'camusdb', or calls endpoints such as /execute-sql-query, /execute-sql-non-query, /start-transaction, /login, or the CamusSql gRPC service, or hits CADB0824 or CADB0556. Covers client options and connection strings, query/execute/queryStream, typed parameters, JSONB, and result shapes, transaction(...), withRetry(...), failed statements, pipelines, call(...) for C# extension procedures, nodeStats, OpenTelemetry, CADB error codes, prepared statements, bearer tokens, request limits, and curl examples.
+description: Writes and reviews TypeScript or JavaScript (Node.js) code that uses CamusDB through the `camusdb` npm package, and code in any other language that calls the CamusDB HTTP API or gRPC API directly. Use when code imports CamusClient, camus, withRetry, isRetryable, CamusError, CamusErrorCode, ColumnType, CamusPipeline, or CamusTransportPool from 'camusdb', or calls endpoints such as /execute-sql-query, /execute-sql-non-query, /start-transaction, /prepare-sql-statement, /login, or the CamusSql gRPC service, or hits CADB0824, CADB0556, or CADB0520. Covers client options and connection strings, query/execute/queryStream, typed parameters, JSONB and jsonbAsText, INTERVAL results, and result shapes, transaction(...), withRetry(...), failed statements, pipelines, call(...) for C# extension procedures, nodeStats, OpenTelemetry, CADB error codes, prepared statements, bearer tokens, request limits, and curl examples.
 ---
 
 # CamusDB for TypeScript and HTTP clients
@@ -137,6 +137,7 @@ Result values:
 - `DATE` and `DATETIME` return UTC `Date` objects (millisecond precision).
 - `BYTES` returns `Uint8Array`. Unpack vectors with `CamusVector.toFloats(...)`.
 - `JSONB` returns the parsed value, or the text form with `jsonb: 'text'`.
+- `INTERVAL` returns an ISO-8601 `string`, such as `P1Y2M3DT4H5M6.5S` (zero is `PT0S`). A column cannot hold an interval.
 
 ### JSONB
 
@@ -259,6 +260,7 @@ try {
 | `CADB0516` / `CADB0517` | Authentication failed / insufficient privilege | Fix credentials or grants |
 | `CADB0518` | Login refused: busy or rate limited | The driver retries three times first; then back off |
 | `CADB0556` | Buffered result too large | Use `queryStream()` or page the result |
+| `CADB0847` | Snapshot too old: retention removed the history | Do not retry the same snapshot. Begin a new transaction |
 | `CADB0001` | Endpoint unreachable (client side) | Safe to retry elsewhere |
 
 ## Raw HTTP API
@@ -276,6 +278,8 @@ curl -s -X POST http://localhost:5095/execute-sql-query \
 
 - A `ColumnValue` carries a numeric `type` (`2` = int64, `3` = string, `1` = id, `11` = uuid, `12` = numeric, `13` = jsonb).
 - Query responses return `columns` plus positional `rows` arrays.
+- A `jsonb` cell is native JSON, so JSON `null` and SQL `NULL` look the same. Send `"jsonbAsText": true` to keep them apart.
+- A prepared handle (`/prepare-sql-statement`) belongs to one node and one principal. On `CADB0520`, prepare again and replay once.
 - Explicit transactions use `/start-transaction`, then pass `txnIdPT` and `txnIdCounter` on each request.
 - With authentication on, `POST /login` returns a bearer token. Send `Authorization: Bearer <token>`.
 - `/update` and `/delete` refuse a request with no filter (`CADB0400`, HTTP 400).
@@ -316,8 +320,8 @@ Read [references/grpc-api.md](references/grpc-api.md) before you build a gRPC cl
 ## References
 
 - [references/connector-api.md](references/connector-api.md): every `CamusClient` option, method, helper, and export, plus pipelines, node stats, OpenTelemetry, extensions, and client limits.
-- [references/http-api.md](references/http-api.md): REST endpoints, `ColumnValue` encoding, response shapes, transactions, prepared statements, tokens, curl examples.
-- [references/grpc-api.md](references/grpc-api.md): gRPC services, `Value` encoding, `BatchExecute`, retry trailers.
+- [references/http-api.md](references/http-api.md): REST endpoints, `ColumnValue` encoding, `JSONB` values and `jsonbAsText`, response shapes, transactions, prepared statements and handle lifetime, tokens, curl examples.
+- [references/grpc-api.md](references/grpc-api.md): gRPC services, `Value` encoding, `BatchExecute`, prepared statements, retry trailers.
 
 Public docs:
 
@@ -329,4 +333,5 @@ Public docs:
 - https://camusdb.github.io/docs/serializable-retries
 - https://camusdb.github.io/docs/sql-authentication
 - https://camusdb.github.io/docs/json
+- https://camusdb.github.io/docs/data-types
 - https://camusdb.github.io/docs/sql-transactions

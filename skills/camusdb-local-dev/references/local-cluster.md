@@ -5,6 +5,19 @@ https://camusdb.github.io/docs/growing-a-one-node-cluster,
 https://camusdb.github.io/docs/key-range-sharding, https://camusdb.github.io/docs/caraxes,
 and the engine repository `docker/` folder and `README.md`.
 
+## When to use cluster mode
+
+A standalone node is a single point of failure. Use cluster mode when one of these needs applies:
+
+- No single point of failure. A three-node cluster keeps committing while one node is down.
+- Durability on more than one machine. A commit is confirmed only after a majority holds it.
+- Room to grow past one machine.
+
+You do not need cluster mode for local development, tutorials, or quick tests. SQL and
+transaction guarantees are the same in both modes, so the queries do not change. If you expect to
+grow from one machine, start in cluster mode: a standalone node refuses joins, and its data needs
+a dump and reimport.
+
 ## Three nodes with .NET Aspire
 
 The easiest way to try a cluster or to develop an application against one. The AppHost starts
@@ -110,7 +123,10 @@ from the Dockerfile: `CAMUS_EXTRA_ARGS="--join-existing true"`. An empty `CAMUS_
 | `CAMUS_INITIAL_PARTITIONS` | `4` | Passed as `--initial-cluster-partitions` |
 | `CAMUS_LOG_LEVEL` | `Information` | Log level; also `CAMUS_LOG_LEVEL_KAHUNA`, `_KOMMANDER`, `_GRPC`, `CAMUS_LOG_FILTERS` |
 
-The image uses 4 partitions. The dotnet tool and `camusdb init` use 1 for standalone.
+The dotnet tool and `camusdb init` use 1 partition for standalone. Note: the settings reference
+says standalone mode always uses `1`. The image still passes `4`, and the Aspire docs set
+`CAMUS_INITIAL_PARTITIONS` on a standalone container. Check the resolved value with
+`SHOW VARIABLES LIKE 'initial_partitions';`.
 
 ## Three nodes on one machine, without Docker
 
@@ -280,7 +296,8 @@ kahuna:
 ## Behavior to expect
 
 - Every node exposes the database API. A write is routed to the partition leader.
-- A partition with no majority stops commits. It does not accept split-brain writes.
+- A partition without a majority stops committing. It does not accept a change that could
+  conflict with another copy of the same data.
 - `SET CLUSTER SETTING` commits through Raft. A node that was down catches up on replay.
 - `SHOW VARIABLES` and the dashboard are node-local. Check each node.
 - A starting node keeps waiting for partition leaders. A stop signal during that wait exits `0`. Any
@@ -295,8 +312,12 @@ Content-Type: application/json
 { "partitionId": 1, "targetEndpoint": "10.0.0.3:7072" }
 ```
 
-`200` means the target became leader. `409` returns `status` and `reason`. With auth off, the
-route is loopback-only. With auth on, it needs a superuser.
+- It is a graceful handoff, not a crash failover.
+- `targetEndpoint` is the target's Raft address (`raft_host:raft_port`). The target must host the
+  partition as a voter.
+- `200` means the target became leader before the call returned. `409` returns `status` and
+  `reason`, such as `NodeIsNotLeader`, `LeaderAlreadyElected`, or `Refused`.
+- With auth off, the route is loopback-only. With auth on, it needs a superuser.
 
 ## Storage health
 
@@ -332,7 +353,7 @@ curl -X POST http://localhost:5095/v1/cluster/split-range \
 - On `NotLeader`, use `leaderHint`. If `determinate` is false, re-read `SHOW RANGES` and compare
   with `descriptorsBefore` before you try again.
 
-## Caraxes (optional)
+## Caraxes chaos testing (optional)
 
 Caraxes is the reliability, chaos, and capacity harness for CamusDB. It lives in
 `https://github.com/camusdb/camusdb-caraxes`. Use it when you need evidence about a build under

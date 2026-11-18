@@ -93,7 +93,10 @@ Rules:
   with `InvalidAsOfSystemTime`.
 - Each operand needs `SELECT` on the tables it reads.
 - `FOR UPDATE` over a set operation fails with `CADB0400`.
-- `WITH` and `CORRESPONDING BY` are not supported.
+- A `WITH` query can name a set-operation result, and an operand can hold a `WITH`.
+  A recursive CTE joins its seed and step with `UNION [ALL]`. See
+  [ctes-and-lateral.md](ctes-and-lateral.md).
+- `CORRESPONDING BY` is not supported.
 - A chain of `UNION ALL`, `UNION`, `INTERSECT`, or `INTERSECT ALL` is rebalanced, so
   a thousand operands run. `EXCEPT` and mixed chains add one level per operator. A
   statement nests at most 64 set operations (`CADB0413`).
@@ -254,8 +257,13 @@ Arguments and the output are `INT64`. The default step is 1.
 
 - Overflow ends the series. It does not wrap.
 - An argument is a literal, a parameter, an operator expression, or a scalar
-  function call. It is evaluated once, before the first row.
-- A column of another relation, a subquery, and a non-integer value are refused.
+  function call. An argument without column references is evaluated once, before
+  the first row.
+- An argument can read columns of `FROM` sources to its left, with or without the
+  `LATERAL` keyword. The function then runs for each left row:
+  `SELECT t.id, n FROM tasks AS t, generate_series(1, t.repetitions) AS n;`. See
+  [ctes-and-lateral.md](ctes-and-lateral.md).
+- A non-integer value is refused.
 
 ### Names
 
@@ -290,10 +298,9 @@ or page the result.
 | Form | Result |
 | --- | --- |
 | `SELECT generate_series(1, 3)` | `CADB0533`: only in `FROM`. |
-| `FROM t, generate_series(1, t.n)` (`LATERAL`) | `CADB0533`. |
 | A timestamp, date, or `numeric` series | Error: arguments must be integers. |
 | `WITH ORDINALITY` | Parse error. |
 | `unnest`, `generate_subscripts`, `regexp_matches`, `regexp_split_to_table` in `FROM` | `CADB0533`. |
 | A scalar function in `FROM`, such as `FROM upper('a')` | `CADB0400`. |
 | An unknown name, such as `FROM no_such_function(1)` | `CADB0400`. |
-| An outer column inside a table-function argument | Not supported. |
+| An outer name of a correlated `EXISTS` body inside a table-function argument | Not supported. |

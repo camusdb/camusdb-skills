@@ -5,7 +5,11 @@ https://camusdb.github.io/docs/sql-expression-syntax,
 https://camusdb.github.io/docs/check-constraints,
 https://camusdb.github.io/docs/sequences,
 https://camusdb.github.io/docs/views,
-https://camusdb.github.io/docs/insert-select-and-ctas
+https://camusdb.github.io/docs/insert-select-and-ctas,
+https://camusdb.github.io/docs/sql-writes,
+https://camusdb.github.io/docs/joins-and-subqueries,
+https://camusdb.github.io/docs/csharp-extensions,
+https://camusdb.github.io/docs/time-travel-reads
 
 Read this file before you upgrade a server that holds data, and when a stored
 view, `CHECK`, or column acts differently after an upgrade. Rehearse the
@@ -20,7 +24,9 @@ upgrade on a branch or a restored copy, and inspect the objects below.
 - Float-to-integer casts in CHECK constraints
 - New CHECK validation
 - Statement checks that now fail
+- Time travel past retention
 - Views as copy sources
+- CTE bodies in views
 
 ## Rolling upgrades
 
@@ -112,8 +118,19 @@ row, even on an empty table:
   into the script (`CADB0406`, with line and column).
 - A second statement after a semicolon in one request. Split the script into
   separate requests.
+- An unquoted table or column named `using` or `lateral`. `USING` is now
+  reserved, and so is `LATERAL`. Quote the name with backticks: `` `using` ``.
+- A `DROP COLUMN` or `RENAME COLUMN` of a column that an inline trigger names
+  in its C# body. It fails with `CADB0530`. Drop or rewrite the trigger first.
 
 Fix the script. These errors are not retryable.
+
+## Time travel past retention
+
+A time-travel read that needs history that retention already pruned fails with
+`CADB0847 SnapshotTooOld` (HTTP 409). It does not return an empty or partial
+result. Update recovery scripts that treat an empty result as "history gone".
+A retry at the same timestamp fails again.
 
 ## Views as copy sources
 
@@ -135,3 +152,17 @@ SELECT (SELECT MAX(amount) FROM payments) AS largest_payment;
 ```
 
 A plain untyped `SELECT NULL AS x` is still refused.
+
+## CTE bodies in views
+
+A view or a materialized view body can now hold a `WITH` query.
+
+- The stored body expands each ordinary CTE reference into a derived table.
+  `SHOW CREATE VIEW` shows those derived tables, not your `WITH` clause.
+- A CTE that the body reads twice runs twice each time the view runs.
+- A recursive CTE keeps `WITH RECURSIVE` inside a derived table.
+  `SHOW CREATE` output parses again. `CREATE RECURSIVE VIEW` is not supported.
+- A plain view can return an `INTERVAL`. A materialized view cannot store one.
+
+Compare `SHOW CREATE VIEW` by meaning, not by text, after you rehearse such a
+migration.

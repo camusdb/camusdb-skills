@@ -18,8 +18,9 @@ columns, `ALTER TABLE`, `CREATE INDEX`, sequences) belongs to the
 | `BOOL` | `true`, `false` |
 | `OID` | `'507f1f77bcf86cd799439011'` (24 hex chars), or `str_id('...')` |
 | `UUID` | `'550e8400-e29b-41d4-a716-446655440000'`, or 32 hex digits |
-| `DATE` | `'2026-03-15'` |
-| `DATETIME` | `'2026-03-15T12:00:00Z'` (UTC, ISO-8601) |
+| `DATE` | `'2026-03-15'`, `DATE '2026-03-15'` |
+| `DATETIME` | `'2026-03-15T12:00:00Z'` (UTC, ISO-8601), `TIMESTAMP '...'`, `DATETIME '...'` |
+| `INTERVAL` | `INTERVAL '7 days'`, `INTERVAL 3 HOUR`, `'1 day'::interval`. Expression only; see "Intervals" in [functions.md](functions.md). |
 | `BYTES` | `X'DEADBEEF'` or `x'...'`, an even digit count |
 | `ARRAY(T)` | `ARRAY[1, 2, 3]`, `ARRAY[]` |
 | `JSONB` | `JSONB '{"a": 1}'`, `'{"a": 1}'::jsonb` |
@@ -27,9 +28,15 @@ columns, `ALTER TABLE`, `CREATE INDEX`, sequences) belongs to the
 CamusDB parses date and datetime text as UTC. The date functions reject a
 timestamp string with no `Z` or offset, such as `'2024-06-15 10:30:00'`.
 
+A typed literal (`DATE '...'`, `TIMESTAMP '...'`, `DATETIME '...'`) is the same as
+a cast of its text. It gives an expression its type without a target column. Put
+`T` between the date and the time: `TIMESTAMP '2026-03-15 12:00:00'` is refused.
+In a column default, wrap it in parentheses: `DEFAULT (DATE '2026-03-15')`.
+
 ## Queries
 
 ```sql
+[WITH [RECURSIVE] name [(col, ...)] AS [[NOT] MATERIALIZED] (query) [, ...]]
 SELECT [DISTINCT] expr [AS alias] [, ...]
 FROM source
   [AS OF SYSTEM TIME '-10s' | '<timestamp>' | <epoch-ms> | @p]
@@ -71,17 +78,23 @@ SELECT u.id FROM app_users u WHERE EXISTS (SELECT 1 WHERE u.active = true);
 ```sql
 table [[AS] alias]
 table@{FORCE_INDEX=index_name}
-(SELECT ...) [AS] alias                         -- derived table, alias required
+cte_name [[AS] alias]                           -- a WITH definition
+(SELECT ...) [AS] alias [(col, ...)]            -- derived table, alias required
+(VALUES (v1, v2), (...)) AS alias [(col, ...)]  -- inline rows, alias required
 a [INNER] JOIN b ON cond
 a LEFT [OUTER] JOIN b ON cond
 a RIGHT [OUTER] JOIN b ON cond                  -- left operand must not be a join
 a CROSS JOIN b
 a, b [, ...]                                    -- comma join; equalities in WHERE become join keys
+a CROSS JOIN LATERAL (SELECT ...) AS x          -- also comma, [INNER] JOIN, LEFT JOIN ... ON true
 fn(args) [[AS] alias[(col)]]                    -- set-returning function: generate_series, jsonb_each
 ```
 
 `FULL [OUTER] JOIN` and a `RIGHT JOIN` after another join fail with `CADB0533`.
 `SELECT *` over a `RIGHT JOIN` lists the preserved table's columns first.
+`WITH`, `LATERAL`, `VALUES` sources, and derived-table column lists are in
+[ctes-and-lateral.md](ctes-and-lateral.md). A table-function argument can read
+columns of sources to its left; the function then runs for each left row.
 
 Predicates:
 
@@ -127,6 +140,8 @@ each outer row.
 - A scalar subquery gives `NULL` for zero rows. More than one row is an error. It
   takes its inner output name. Alias it anyway for callers and stored definitions.
 - `IN` and `NOT IN` need a one-column subquery. A multi-column one is refused.
+- A scalar, `IN`, `ANY`, or `ALL` subquery accepts `SELECT *` or `SELECT alias.*`
+  when it expands to exactly one column. More than one column is refused.
 - An empty inner result makes `NOT IN` true, even for a `NULL` outer value. One
   `NULL` in a non-empty result makes every non-match unknown. Prefer `NOT EXISTS`.
 - A name resolves in the nearest query first, then in the enclosing queries. An
@@ -143,7 +158,8 @@ each outer row.
 - A correlated `EXISTS` body can use joins, views, derived tables, set operations,
   aggregates, `GROUP BY`, `HAVING`, window functions, `OFFSET`, and nested
   subqueries. It can omit `FROM` and read only outer values.
-- An outer name inside a table-function argument is not supported.
+- In a correlated `EXISTS` body, an outer name inside a table-function argument is
+  not supported. A column of a source to the left in the same `FROM` works.
 - A simple one-table `EXISTS` can seek an index on the correlated columns. Other
   bodies run the full query pipeline. A result can be reused for repeated outer
   values within one statement. See `camusdb-query-performance`.
@@ -160,11 +176,15 @@ WHERE active = true;
 ```
 
 `AS OF SYSTEM TIME` reads a past snapshot. A plain read with it runs in
-autocommit only. It applies to every join and subquery of the statement. See
+autocommit only. It applies to every join and subquery of the statement. When
+retention has removed history that the read needs, it fails with `CADB0847`
+`SnapshotTooOld` (HTTP 409). A retry at the same timestamp cannot succeed: choose a
+newer timestamp, or begin a new transaction. See
 https://camusdb.github.io/docs/time-travel-reads.
 
 `UNION`, `INTERSECT`, `EXCEPT`, window functions (`OVER`), and `generate_series` are
-in [set-and-window.md](set-and-window.md).
+in [set-and-window.md](set-and-window.md). `WITH`, `WITH RECURSIVE`, `LATERAL`, and
+`VALUES` sources are in [ctes-and-lateral.md](ctes-and-lateral.md).
 
 `FOR UPDATE` locks each returned row until the transaction ends. `FOR NO KEY UPDATE`
 is a synonym. `FOR SHARE` and `FOR KEY SHARE` fail with `CADB0533`. Isolation rules,
@@ -181,8 +201,13 @@ INSERT ... ON CONFLICT ((col, ...) | ON CONSTRAINT name)
 UPSERT INTO t [(col, ...)] { VALUES ... | SELECT ... } [RETURNING list];
 UPDATE t SET col = expr [, ...] WHERE condition [LIMIT n] [RETURNING list];
 DELETE FROM t WHERE condition [LIMIT n] [RETURNING list];
+UPDATE t [AS a] SET col = expr [, ...] [FROM sources] WHERE condition [RETURNING list];
+DELETE FROM t [AS a] [USING sources] WHERE condition [RETURNING list];
 TRUNCATE [TABLE] t [RESTART IDENTITY | CONTINUE IDENTITY];
 ```
+
+A `WITH` clause can precede `INSERT`, `UPSERT`, `UPDATE`, and `DELETE`. See
+[ctes-and-lateral.md](ctes-and-lateral.md).
 
 `SHOW ORPHAN TABLES` and `CREATE TABLE t2 RELINK TO '<id>'` recover truncated rows
 within the retention window.
@@ -190,7 +215,7 @@ within the retention window.
 - Without a column list, `INSERT` targets every column in schema order.
 - `WHERE` is required in `UPDATE` and `DELETE`.
 - `RETURNING list` is a select list over the target table: `*`, columns,
-  scalar expressions, `AS` aliases, parameters.
+  scalar expressions, `AS` aliases, parameters. A joined write refuses a bare `*`.
 - `RETURNING` returns the stored row image: the inserted row, the new row after
   `UPDATE`, or the deleted row. `OLD` and `NEW` qualifiers are not supported.
 - A repeated target column fails with `CADB0403` before any write. Names compare
@@ -198,6 +223,68 @@ within the retention window.
 - Any failed statement ends an explicit transaction. There are no savepoints.
 - `CONTINUE IDENTITY` is the default. `RESTART IDENTITY` restarts only
   sequences owned by identity columns of the table.
+
+### UPDATE ... FROM and DELETE ... USING
+
+```sql
+UPDATE accounts AS a
+SET balance = a.balance + d.amount
+FROM deltas AS d
+WHERE d.account_id = a.id
+RETURNING a.id, a.balance;
+
+DELETE FROM orders AS o
+USING customers AS c
+WHERE c.id = o.customer_id AND c.closed = true
+RETURNING o.id;
+
+UPDATE accounts AS a SET balance = a.balance + d.amount
+FROM (VALUES (1, 25), (2, -10)) AS d (id, amount)
+WHERE a.id = d.id;
+```
+
+- Only the target table changes. `FROM` and `USING` take the sources of a
+  `SELECT`: tables, views, derived tables, CTEs, `VALUES` lists, set-returning
+  functions, comma lists, joins, and lateral sources.
+- A target alias also works without a source list:
+  `UPDATE accounts AS a SET balance = 0 WHERE a.id = @id`. Once you alias the
+  target, qualify it by the alias.
+- A bare column that the target and a source share is ambiguous (`CADB0400`). A
+  self join needs an alias on at least one copy of the target.
+- The statement first collects the matching target keys and source values. A self
+  join reads rows as this match phase found them. Then it locks and rereads each
+  target row. `SET` reads the locked target values and the collected source values,
+  so `a.balance + d.amount` adds the delta to the balance read under the lock.
+- Every assignment reads the same row before the update. A subquery in `SET` runs in
+  the match phase.
+- After the lock, each `AND` term that reads a target column and holds no subquery
+  is checked again. A row that fails it now is skipped and not counted.
+- Triggers, constraints, index upkeep, and transaction limits apply as for a plain
+  write. Under Serializable, the match phase takes exclusive range locks on the
+  target and source relations. The write phase takes exclusive locks on target rows.
+- An `UPDATE` fails with `CADB0400`, before it writes anything, when one target row
+  matches several source rows. PostgreSQL picks one match. Aggregate the source
+  first. A `DELETE` removes such a row once.
+
+```sql
+UPDATE accounts AS a
+SET balance = a.balance + d.amount
+FROM (SELECT account_id, SUM(amount) AS amount FROM deltas GROUP BY account_id) AS d
+WHERE d.account_id = a.id;
+```
+
+Limits:
+
+- `WHERE` is required. Write `WHERE TRUE` to change every matching row.
+- `LIMIT` is not supported in these forms. A plain `UPDATE` and `DELETE` keep it.
+- `RETURNING` takes target columns and target expressions only. A source column or
+  a bare `RETURNING *` fails with `CADB0400`. A target alias without `FROM` or
+  `USING` still allows `RETURNING *`.
+- A primary-key assignment, `EXPLAIN UPDATE`, and `EXPLAIN DELETE` are not supported
+  in these forms.
+- Privileges: `UPDATE` or `DELETE` on the target, and `SELECT` on every relation
+  the statement reads, the target included.
+- `USING` is reserved. Quote a name `using` with backticks. `using_id` is fine.
 
 ### RETURNING on each endpoint
 
@@ -213,6 +300,10 @@ within the retention window.
   the flag with `CADB0400`.
 - `RETURNING` needs `SELECT` on the target. Without it the statement fails with
   `CADB0517`.
+- The .NET `ExecuteStreamReaderAsync()` and TypeScript `queryStream()` stream the
+  rows. The .NET `ExecuteNonQueryAsync()` and TypeScript `execute()` ask for the
+  count only. Request fields: https://camusdb.github.io/docs/http-api#post-execute-sql-non-query
+  and https://camusdb.github.io/docs/grpc-api#sql-service.
 - `returning` is reserved. Quote a column with that name in backticks.
 
 ### ON CONFLICT and UPSERT
@@ -271,6 +362,8 @@ CREATE TABLE [IF NOT EXISTS] new_t AS SELECT ... [WITH DATA | WITH NO DATA];
 - Columns match by position.
 - The source is an ordinary `SELECT`. It can read a plain view, also for CTAS
   `WITH NO DATA`. Reading a view does not make the view writable.
+- The source can use `WITH`, `LATERAL`, and `VALUES` sources:
+  `INSERT INTO t WITH c AS (...) SELECT ... FROM c`.
 - A scalar subquery keeps its declared type even when its value is `NULL`. So
   `SELECT (SELECT MAX(amount) FROM payments) AS largest_payment` makes a typed column
   over an empty table. An untyped `SELECT NULL AS x` is still refused.
@@ -282,7 +375,8 @@ CREATE TABLE [IF NOT EXISTS] new_t AS SELECT ... [WITH DATA | WITH NO DATA];
 - In CTAS, alias every expression, cast a bare `NULL` (`CAST(NULL AS INT64) AS x`),
   and list columns instead of `*` over a join. A scalar subquery can take its inner
   name, but an expression such as `MAX` inside it still needs an alias.
-- CTAS makes `INT64` integer columns, also from a `SMALLINT` or `INT` source.
+- CTAS makes `INT64` integer columns, also from a `SMALLINT` or `INT` source. It
+  cannot store an `INTERVAL` column: cast it to `STRING`.
 - CTAS commits the table before the rows. A failed load drops the table again. If
   that drop fails, an empty table stays.
 - A source with `AS OF SYSTEM TIME` copies historical rows into the present. It also
@@ -323,6 +417,11 @@ SHOW CREATE VIEW v;
   `CREATE VIEW deferred AS SELECT (SELECT 1 / 0) AS x` succeeds, and a read of it
   fails. Unknown names and known type mistakes still fail at creation.
 - A body can be a `SELECT` without `FROM`: `CREATE VIEW readiness AS SELECT 'ready' AS status`.
+- A body can use `WITH` and `WITH RECURSIVE`. The stored body expands each CTE
+  reference into a derived table, and `SHOW CREATE VIEW` shows them. Each reference
+  then runs separately: the computed-once reuse is lost. A recursive CTE keeps
+  `WITH RECURSIVE` inside a derived-table wrapper. `CREATE RECURSIVE VIEW` is not
+  supported.
 - A view can be the source of CTAS, `INSERT ... SELECT`, or a materialized view. It
   reads with the rules of an ordinary `SELECT`.
 - A view runs with its owner's privileges. Every view is read-only (`CADB0525`).
@@ -344,6 +443,8 @@ CREATE INDEX mv_idx ON mv (col);
 - `WITH NO DATA` makes reads fail with `CADB0531` until a refresh. `CONCURRENTLY`
   fails with `CADB0533`.
 - A materialized view gets a generated `id` key. You can index it.
+- The body can use `WITH` as a view body does. A refresh stores its result as usual.
+  An `INTERVAL` column cannot be stored.
 - The body can read a plain view. A scalar-subquery column keeps its declared type
   when the subquery has no value. The definition binds without running subqueries.
   The population step then runs the query, unless `WITH NO DATA` is given.
@@ -437,6 +538,10 @@ COMMENT ON COLUMN t.col IS NULL;               -- removes the comment
 
 Prepare through a transport or driver. There is no SQL `PREPARE` statement.
 
+- The .NET and TypeScript drivers prepare repeated statements for you, manage the
+  handles, and recover expired ones. `CamusCommand.PrepareAsync()` and
+  `client.prepare(sql)` prepare before the first run. The Python driver binds
+  parameters without server-side prepared statements.
 - gRPC: on the duplex `BatchExecute` stream, `PREPARE` → `statement_id` and
   `parameter_names`; execute with `positional_parameters`; `CLOSE`. A handle
   lives as long as the stream.
@@ -445,8 +550,11 @@ Prepare through a transport or driver. There is no SQL `PREPARE` statement.
   `/execute-sql-non-query` with `statementId` and `positionalParameters`. Omit
   `sql`, `databaseName`, and `parameters`. Close with `POST /close-sql-statement`.
 - A handle belongs to one node (and, for REST, one principal). It is never replicated.
-- The .NET and TypeScript connectors bind by name and send ordinals for you.
-- Preparable: `SELECT`, `INSERT`, `UPDATE`, `DELETE`, every `SHOW`.
+- Preparable: `SELECT` (also `SELECT ... FOR UPDATE`), `INSERT`, `UPDATE`, `DELETE`,
+  every `SHOW`. A prepare checks no privileges; the execution does.
+- Protocol details for a custom client:
+  https://camusdb.github.io/docs/http-api#prepared-statements and
+  https://camusdb.github.io/docs/grpc-api#prepared-statements.
 
 | Key | Default |
 | --- | ---: |
@@ -472,13 +580,13 @@ unused handles.
 | `CADB0011` | `TableDoesntExist` | Unknown table. |
 | `CADB0302` | `ValueTooLong` | Value exceeds `STRING(N)` or `BYTES(N)`. |
 | `CADB0303` | `CheckConstraintViolation` | A type error while an existing `CHECK` runs rejects the write. A new `CHECK` with a known type error fails at definition. |
-| `CADB0400` | `InvalidInput` | Bad shape: CTAS projection, `INSERT ... SELECT` count, bad cast, bad regex, `RETURNING` aggregate. A comparison across types with no rule. No common type in `CASE`, `COALESCE`, `IFNULL`, `IF`, or a set operation. A window call in a bad clause. A wrong argument count. A non-boolean `WHERE`, `HAVING`, or `JOIN ON`. A constant division by zero. A negative `LIMIT` or `OFFSET`. An ambiguous `ORDER BY` name. A bad `LIKE` escape. A lone surrogate half in a string parameter. Malformed JSON on a SQL endpoint. |
+| `CADB0400` | `InvalidInput` | Bad shape: CTAS projection, `INSERT ... SELECT` count, bad cast, bad regex, `RETURNING` aggregate. A comparison across types with no rule. No common type in `CASE`, `COALESCE`, `IFNULL`, `IF`, or a set operation. A window call in a bad clause. A wrong argument count. A non-boolean `WHERE`, `HAVING`, or `JOIN ON`. A constant division by zero. A negative `LIMIT` or `OFFSET`. An ambiguous `ORDER BY` name. A bad `LIKE` escape. A lone surrogate half in a string parameter. Malformed JSON on a SQL endpoint. In `UPDATE ... FROM`, a target row that matches several source rows. In a joined write, an ambiguous bare column, a bare `RETURNING *`, or a source column in `RETURNING`. An interval overflow. An infinite angle, or an inverse sine or cosine input outside `[-1, 1]`. |
 | `CADB0401` | `UnknownType` | A known invalid assignment, refused before any row is read. |
 | `CADB0403` | `DuplicateColumn` | A repeated column in `UPDATE ... SET`, an `INSERT` target list, or `ON CONFLICT DO UPDATE`. |
 | `CADB0404` | `UnknownColumn` | Unknown column name. |
 | `CADB0406` | `SqlSyntaxError` | The parser cannot parse the text. Also an unknown character, a non-SQL white space, a second statement in one request, or a chain such as `a = b = c`. The message gives the line and column. |
 | `CADB0407` | `InvalidAstStmt` | An unknown function, refused before any row is read. |
-| `CADB0413` | `StatementTooDeeplyNested` | Parse tree deeper than 1,000 levels, or more than 64 nested set operations. |
+| `CADB0413` | `StatementTooDeeplyNested` | Parse tree deeper than 1,000 levels, more than 64 nested set operations, or a `WITH` clause whose expansion copies more than 250,000 parse nodes. |
 | `CADB0417` | `NumericValueOutOfRange` | `NUMERIC` overflow. |
 | `CADB0418` | `InvalidJsonText` | Text is not a valid `jsonb` document. |
 | `CADB0419` | `JsonNestingTooDeep` | A document nests deeper than 512 levels. |
@@ -496,7 +604,7 @@ unused handles.
 | `CADB0530` | `DependentObjectsExist` | Drop or truncate blocked by a view or foreign key. |
 | `CADB0531` | `MaterializedViewNotPopulated` | Read of a `WITH NO DATA` materialized view. |
 | `CADB0532` | `RefreshAlreadyInProgress` | A second concurrent refresh. |
-| `CADB0533` | `FeatureNotSupported` | Parsed but unimplemented: `REFRESH ... CONCURRENTLY`, `FULL JOIN`, `FOR SHARE`, a correlated subquery in `HAVING`, `JOIN ON`, `ON CONFLICT DO UPDATE`, or a grouped select list, `LATERAL`, or a set-returning function in the select list. |
+| `CADB0533` | `FeatureNotSupported` | Parsed but unimplemented: `REFRESH ... CONCURRENTLY`, `FULL JOIN`, `FOR SHARE`, a correlated subquery in `HAVING`, `JOIN ON`, `ON CONFLICT DO UPDATE`, or a grouped select list, or a set-returning function in the select list. |
 | `CADB0534` | `ConcurrentSchemaChange` | Lost a schema race. Retryable. |
 | `CADB0537` | `SnapshotPrecedesContentsGeneration` | `AS OF SYSTEM TIME` before the last `TRUNCATE`. |
 | `CADB0538` | `StatementNotAllowedInTransaction` | `TRUNCATE` inside an explicit transaction. |
@@ -506,5 +614,7 @@ unused handles.
 | `CADB0556` | `ResultSetTooLarge` | A buffered result passed `max_buffered_result_rows` or `max_buffered_result_bytes`. Stream or page it. |
 | `CADB0557` | `StatementTooLarge` | Inline SQL over `max_statement_bytes` (default 8 MiB). Bind large values as parameters. |
 | `CADB0559` | `JsonbValueCorrupt` | A stored `jsonb` cell does not decode. |
+| `CADB0560` | `RecursiveQueryLimitExceeded` | A recursive CTE passed `max_recursive_cte_iterations` (default 10,000 steps) or `max_recursive_cte_rows` (default 10,000,000 rows). HTTP 400. Add a stop condition. |
+| `CADB0847` | `SnapshotTooOld` | Retention removed history that a snapshot read needs. HTTP 409. Choose a newer timestamp or begin a new transaction; do not retry the same snapshot. |
 
 Full list: https://camusdb.github.io/docs/error-codes.

@@ -5,7 +5,8 @@ or a batch. Sources: https://camusdb.github.io/docs/transaction-limits,
 https://camusdb.github.io/docs/sql-indexes,
 https://camusdb.github.io/docs/storage-layout,
 https://camusdb.github.io/docs/data-types,
-https://camusdb.github.io/docs/json, and
+https://camusdb.github.io/docs/json,
+https://camusdb.github.io/docs/csharp-extensions, and
 https://camusdb.github.io/docs/error-codes.
 
 ## Limits
@@ -74,7 +75,7 @@ exempt. `TRUNCATE` counts no mutations.
 | `CADB0304` | `ForeignKeyViolation` | Child has no parent; `ADD CONSTRAINT` finds an orphan | Insert the parent first. |
 | `CADB0305` | `ForeignKeyRestrictDelete` | Delete of a referenced parent | Delete the children first. |
 | `CADB0306` | `ForeignKeyRestrictUpdate` | Update of a referenced parent key | Update the children first, or keep keys immutable. |
-| `CADB0400` | `InvalidInput` | No primary key; `DESC` on `STRING`/`BYTES`; invalid `CHECK`, including a non-boolean condition or a wrong argument count; invalid TTL setting; bad default; bare `DROP INDEX name`; `JSONB` as an ordered key; wrong GIN index shape; comparison of types with no rule; a lone UTF-16 surrogate half in a string parameter or row write; a constant division by zero | Fix the DDL or the statement. |
+| `CADB0400` | `InvalidInput` | No primary key; `DESC` on `STRING`/`BYTES`; invalid `CHECK`, including a non-boolean condition or a wrong argument count; invalid TTL setting; bad default; bare `DROP INDEX name`; `JSONB` as an ordered key; wrong GIN index shape; comparison of types with no rule; a lone UTF-16 surrogate half in a string parameter or row write; a constant division by zero; interval overflow | Fix the DDL or the statement. |
 | `CADB0403` | `DuplicateColumn` | Same column twice, or rename to an existing column | Rename. |
 | `CADB0404` | `UnknownColumn` | Reference to a missing column | Check the name. |
 | `CADB0406` | `SqlSyntaxError` | Syntax from another database; an unknown character, a non-breaking space, or a byte-order mark outside a literal (the message gives line and column) | See [ddl-syntax.md](ddl-syntax.md). Check copied SQL for invisible characters. |
@@ -94,7 +95,7 @@ exempt. `TRUNCATE` counts no mutations.
 | `CADB0505` | `TransactionLifetimeExceeded` | Transaction open over 1 hour | Roll back and retry from `BEGIN`. |
 | `CADB0506` | `TransactionMutationLimitExceeded` | Batch too large for the index count | Do not retry. Split the batch. |
 | `CADB0511` | `CommentTooLong` | Comment over 65,535 characters | Shorten it. |
-| `CADB0530` | `DependentObjectsExist` | Drop or truncate of an object a foreign key or view needs | Drop the dependent object first. |
+| `CADB0530` | `DependentObjectsExist` | Drop or truncate of an object a foreign key or view needs; drop or rename of a column a trigger names | Drop the dependent object first. |
 | `CADB0533` | `FeatureNotSupported` | `CASCADE`, `SET NULL`, `DEFERRABLE`, `MATCH FULL`, TTL parent | Use a supported form. |
 | `CADB0542` | `SequenceAlreadyExists` | Sequence name taken by a sequence, table, or view | Rename. |
 | `CADB0545` | `InvalidSequenceDefinition` | Non-positive increment, `CACHE` below 1, `MAXVALUE` below `MINVALUE` | Fix the options. |

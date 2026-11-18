@@ -2,7 +2,10 @@
 
 Read this file when you choose a column type, write a literal, or check a
 length limit. Source: https://camusdb.github.io/docs/data-types,
-https://camusdb.github.io/docs/json, and https://camusdb.github.io/docs/storage.
+https://camusdb.github.io/docs/json, https://camusdb.github.io/docs/storage,
+and, for reserved words, https://camusdb.github.io/docs/comment-on,
+https://camusdb.github.io/docs/sql-writes, and
+https://camusdb.github.io/docs/joins-and-subqueries.
 
 ## Type table
 
@@ -21,6 +24,7 @@ https://camusdb.github.io/docs/json, and https://camusdb.github.io/docs/storage.
 | `STRING`, `STRING(N)` | Unicode text | Length prefix + text | Yes | No |
 | `DATE` | A calendar date, UTC ticks at midnight | Ticks | Yes | Yes |
 | `DATETIME` | An instant in UTC | Ticks | Yes | Yes |
+| `INTERVAL` | A span of months, days, and microseconds | Not storable: expressions only | No | No |
 | `BYTES`, `BYTES(N)` | Opaque bytes | Length prefix + bytes | Yes | No |
 | `ARRAY(T)` | An ordered list of scalar `T` | Element type + elements | No | No |
 | `JSONB` | One JSON document | One format byte + canonical CBOR | GIN only | No |
@@ -66,6 +70,7 @@ ordinary column name.
 | Counters, epoch milliseconds | `INT64` | |
 | Point in time | `DATETIME` (UTC) | `STRING` dates |
 | Calendar day | `DATE` | |
+| Duration you must keep | `STRING` holding interval text; cast it back to `INTERVAL` on read | An `INTERVAL` column; a table cannot store one |
 | Short text with a known bound | `STRING(N)` | Bare `STRING` when a bound exists |
 | Enumerated status | `STRING(N)` plus `CHECK (status IN (...))` | |
 | JSON document you query inside | `JSONB` | `STRING` |
@@ -75,8 +80,9 @@ ordinary column name.
 | Vector embedding | `BYTES(N) STORAGE PLAIN` plus a `CHECK` on `vector_dims(...)` | |
 | List of tags | `ARRAY(STRING)` when you never filter by an index on it | `ARRAY` when you need an index |
 
-The type list has no `INTERVAL` type. Every `DATETIME` is an instant in UTC.
-CamusDB parses date and datetime text as UTC.
+`INTERVAL` exists in expressions only. A column cannot use it. See
+[INTERVAL](#interval). Every `DATETIME` is an instant in UTC. CamusDB parses
+date and datetime text as UTC.
 
 ## Integer type names
 
@@ -143,6 +149,9 @@ SELECT CAST(32768 AS SMALLINT);  -- CADB0420
 - An index built before these rules holds old keys for `-0` and `NaN`. Rebuild
   it with `DROP INDEX` and `CREATE INDEX` if the column holds either value.
 - A `NaN` or infinity cannot `CAST` to `NUMERIC` (`CADB0400`).
+- Trigonometric functions reject an infinite angle with `CADB0400`. Inverse
+  sine and cosine reject an input outside `[-1, 1]` with `CADB0400`. A pole,
+  such as `cot(0)` or `tand(90)`, returns infinity.
 
 ## DATE and DATETIME
 
@@ -152,6 +161,58 @@ SELECT CAST(32768 AS SMALLINT);  -- CADB0420
 - A `DATETIME` literal can be a bare date: `'2026-03-15'`.
 - A comparison parses a string into the `DATE` or `DATETIME` type. Text that
   does not parse fails with `CADB0400`.
+- A typed literal gives an expression its type without a column:
+  `DATE '2026-03-15'`, `TIMESTAMP '2026-03-15T12:00:00Z'`, or
+  `DATETIME '2026-03-15T12:00:00Z'`. Each equals a `CAST` of its text.
+- Put a `T` between the date and the time. A space, as in
+  `TIMESTAMP '2026-03-15 12:00:00'`, is rejected.
+- Wrap a typed literal in parentheses for a default:
+  `DEFAULT (DATE '2026-03-15')`.
+
+## INTERVAL
+
+An interval is a span of months, days, and microseconds. Use it in
+calculations, such as a rolling window or a billing date.
+
+Intervals are expression values only:
+
+- You cannot declare an `INTERVAL` column, write an interval into a column, or
+  use one as an array element.
+- `CREATE TABLE ... AS SELECT` and a materialized view cannot store an interval
+  projection. A plain view can return one.
+- To keep an interval, cast it to `STRING` and store the text. Cast the text
+  back to `INTERVAL` when you read it.
+
+```sql
+SELECT * FROM orders WHERE created_at > now() - INTERVAL '7 days';
+SELECT CAST('2024-01-31' AS DATE) + INTERVAL '1 month';  -- 2024-02-29T00:00:00Z
+SELECT finished_at - started_at AS duration FROM jobs;
+```
+
+- Keep an indexed timestamp column alone on one side.
+  `created_at > now() - INTERVAL '7 days'` can use an index range scan.
+  `created_at + INTERVAL '7 days' > now()` gives no range bound.
+- Literal forms: `INTERVAL '1 year 2 mons 3 days 04:05:06'`,
+  `INTERVAL 'P1DT2H'`, `INTERVAL '3' HOUR`, `INTERVAL 3 HOUR`,
+  `INTERVAL @n DAY`, and `CAST('1 day' AS INTERVAL)`.
+- Only text casts to an interval. For a number, multiply:
+  `days_to_ship * INTERVAL '1 day'`.
+- `DATE` or `DATETIME` plus or minus an interval returns `DATETIME`. A
+  `DATETIME` minus a `DATETIME` returns an interval with days and time, but no
+  months.
+- A month added to a date follows the calendar. An invalid day becomes the last
+  day of the month.
+- A comparison counts a month as 30 days and a day as 24 hours.
+  `INTERVAL '1 month' = INTERVAL '30 days'` is true.
+- Compare with `INTERVAL '1 day'`, not with the text `'1 day'`. An implicit
+  comparison with text is not supported.
+- `SUM` and `AVG` of intervals and MySQL compound units such as `HOUR_MINUTE`
+  are not supported.
+- Overflow fails with `CADB0400`. Months and days each fit a signed 32-bit
+  integer. Microseconds fit a signed 64-bit integer. A result timestamp must
+  fall in years 1 through 9999.
+- The .NET, TypeScript, and Python drivers return an interval as ISO-8601
+  text, such as `P1Y2M3DT4H5M6.5S`. A cast to `STRING` gives the same text.
 
 ## Comparing different types
 
@@ -313,8 +374,9 @@ GIN index rules are in [ddl-syntax.md](ddl-syntax.md#gin-indexes).
 | `BOOL` | `true` or `false` | `true` |
 | `OID` | A quoted 24-character hex string | `'507f1f77bcf86cd799439011'` |
 | `UUID` | A quoted UUID, with hyphens or 32 hex digits | `'550e8400-e29b-41d4-a716-446655440000'` |
-| `DATE` | A quoted `yyyy-MM-dd` | `'2026-03-15'` |
-| `DATETIME` | A quoted ISO-8601 UTC string | `'2026-03-15T12:00:00Z'` |
+| `DATE` | A quoted `yyyy-MM-dd`, or a typed literal | `'2026-03-15'`, `DATE '2026-03-15'` |
+| `DATETIME` | A quoted ISO-8601 UTC string, or a typed literal | `'2026-03-15T12:00:00Z'`, `TIMESTAMP '2026-03-15T12:00:00Z'` |
+| `INTERVAL` (expressions only) | `INTERVAL '...'` | `INTERVAL '7 days'` |
 | `BYTES` | Hex in `X'...'` (even digit count) | `X'DEADBEEF'` |
 | `ARRAY(T)` | `ARRAY[...]` | `ARRAY[1, 2, 3]` |
 | `JSONB` | A quoted document, or a typed literal | `'{"a": 1}'`, `JSONB '[1, 2]'` |
@@ -341,6 +403,7 @@ String literal rules:
 | `DEFAULT (gen_uuid_v7())` | `UUID`, `GUID` | Time-ordered UUID per row. |
 | `DEFAULT (nextval('seq'))` | `INT64` or a narrower integer | Next sequence value. A value outside the column range fails with `CADB0420`. |
 | `DEFAULT (now())` | `DATETIME` | Current time. All rows of one statement get the same value. |
+| `DEFAULT (DATE '2026-03-15')` | `DATE`, `DATETIME` | A typed literal. The parentheses are required. |
 
 - A function default must be a bare call with no argument.
 - A default whose type does not match the column is rejected, for example
@@ -361,3 +424,6 @@ timestamp bytes blob uuid guid array
 
 Only the exact word is reserved. `dates`, `internal`, and `blob_store` are
 valid names.
+
+Other reserved words also need backticks as names: `COMMENT`, `USING`, and
+`LATERAL`. For example, write `` `using` `` for a column named `using`.

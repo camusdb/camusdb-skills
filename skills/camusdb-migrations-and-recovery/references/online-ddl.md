@@ -5,6 +5,8 @@ https://camusdb.github.io/docs/distributed-schema,
 https://camusdb.github.io/docs/sql-indexes,
 https://camusdb.github.io/docs/foreign-keys,
 https://camusdb.github.io/docs/check-constraints,
+https://camusdb.github.io/docs/sql-writes,
+https://camusdb.github.io/docs/csharp-extensions,
 https://camusdb.github.io/docs/error-codes
 
 ## How a DDL statement runs
@@ -122,6 +124,7 @@ Related settings (YAML, see https://camusdb.github.io/docs/configuration):
   table can remain if that compensating drop fails.
 - The CTAS source can be a plain view, also `WITH NO DATA`. A scalar subquery
   column keeps its declared type, even when it has no row.
+- CTAS cannot store an `INTERVAL` projection. Cast it to `STRING`.
 
 ## Statement catalog
 
@@ -163,6 +166,11 @@ ALTER TABLE docs REWRITE STORAGE;
 - A rename to an existing column name fails with `DuplicateColumn`
   (`CADB0403`). A rename of a missing column fails with `UnknownColumn`
   (`CADB0404`).
+- `DROP COLUMN` and `RENAME COLUMN` fail with `CADB0530` when a trigger names
+  the column in its C# body, or maps it as a typed row. The check also counts
+  a local variable or a string with the column's name. Drop or rewrite the
+  trigger first, then run the change.
+- `INTERVAL` is not a column type. Store interval text in a `STRING` column.
 
 ### Primary keys
 
@@ -260,7 +268,8 @@ All refused changes fail with `CADB0530 DependentObjectsExist`.
 | `CREATE TABLE ... RELINK TO` of a child | Comes back without foreign keys. |
 
 Dependent views also raise `CADB0530`. You also cannot drop a column that an
-index uses as a key or `INCLUDE` column.
+index uses as a key or `INCLUDE` column. A trigger that names a column blocks
+both its drop and its rename.
 
 ## Patterns for common migrations
 
@@ -278,7 +287,49 @@ ALTER TABLE orders ALTER COLUMN region SET NOT NULL;
 ```
 
 Check the default syntax with your server on the branch first. The docs show
-defaults as `DEFAULT (<expression>)`.
+defaults as `DEFAULT (<expression>)`. A typed literal default also needs the
+parentheses: `DEFAULT (DATE '2026-03-15')`.
+
+### Fill a column from another table
+
+Use `UPDATE ... FROM`. Only the target table changes.
+
+```sql
+ALTER TABLE orders ADD COLUMN region STRING NULL;
+
+UPDATE orders AS o
+SET region = c.region
+FROM customers AS c
+WHERE c.id = o.customer_id AND o.region IS NULL AND c.country = "ES";
+-- repeat with the next slice until every slice affects 0 rows
+```
+
+- The joined form takes no `LIMIT`. Slice it with a `WHERE` range so each run
+  stays under the mutation limit. `o.region IS NULL` skips rows already done.
+- `WHERE` is mandatory. A bare column that both tables share is ambiguous
+  (`CADB0400`). Qualify it with the alias.
+- A target row that matches several source rows fails the whole `UPDATE` with
+  `CADB0400` before it writes. Aggregate the source first, for example in a
+  derived table with `GROUP BY`.
+- You cannot assign a primary-key column in this form.
+- Under Serializable, the match takes exclusive range locks on the target and
+  the source. The write takes exclusive row locks on the target.
+- After the lock, CamusDB rechecks each `AND` term that reads a target column
+  and has no subquery. A row that a concurrent write changed is skipped and
+  not counted.
+- `RETURNING` takes target columns and expressions only. A bare `RETURNING *`
+  is refused.
+- The statement needs `UPDATE` (or `DELETE`) on the target, and `SELECT` on
+  every table it reads, the target included.
+
+`DELETE ... USING` follows the same rules. A target row that matches several
+source rows is deleted once.
+
+```sql
+DELETE FROM orders AS o
+USING customers AS c
+WHERE c.id = o.customer_id AND c.closed = true AND o.created_at < "2025-01-01";
+```
 
 ### Change a column type
 

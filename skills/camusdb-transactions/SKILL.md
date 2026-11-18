@@ -1,6 +1,6 @@
 ---
 name: camusdb-transactions
-description: Guides writing and reviewing correct transactional application code for CamusDB. Covers BEGIN, START TRANSACTION, COMMIT, ROLLBACK, SET TRANSACTION ISOLATION LEVEL (SERIALIZABLE, READ ONLY, READ COMMITTED), SET TRANSACTION LOCKING PESSIMISTIC or OPTIMISTIC, SET TRANSACTION PRIORITY, wait-die conflicts, failed statements that abort a transaction (CADB0824, no savepoints), SELECT FOR UPDATE with NOWAIT or SKIP LOCKED, job queues, INSERT ON CONFLICT and UPSERT, driver retry helpers and client retry loops for CADB0502, CADB0504, CADB0505, CADB0509, CADB0503, CADB0506 and CADB0555, the 20,000-mutation and one-hour limits, batching large writes, hot rows and sharded counters, two-phase commit, and AS OF SYSTEM TIME reads. Use when writing CamusDB transaction code or retry logic, when using the .NET SerializableRetryHelper, the TypeScript transaction() and withRetry() helpers, or Python camusdb.run_transaction(), or when porting transaction code from PostgreSQL, MySQL, CockroachDB, or Spanner to CamusDB.
+description: Guides writing and reviewing correct transactional application code for CamusDB. Covers BEGIN, START TRANSACTION, COMMIT, ROLLBACK, SET TRANSACTION ISOLATION LEVEL (SERIALIZABLE, READ ONLY, READ COMMITTED), SET TRANSACTION LOCKING PESSIMISTIC or OPTIMISTIC, serializable_optimistic_point_locks, SET TRANSACTION PRIORITY, wait-die conflicts, failed statements that abort a transaction (CADB0824, no savepoints), SELECT FOR UPDATE with NOWAIT or SKIP LOCKED, job queues, INSERT ON CONFLICT, UPSERT, UPDATE FROM, retry helpers and loops for CADB0502, CADB0504, CADB0505, CADB0509, CADB0503, CADB0506 and CADB0555, the 20,000-mutation and one-hour limits, batching, hot rows, two-phase commit, and AS OF SYSTEM TIME reads (CADB0847 SnapshotTooOld). Use when writing CamusDB transaction code or retry logic, when using the .NET SerializableRetryHelper, the TypeScript transaction() and withRetry() helpers, or Python camusdb.run_transaction(), or when porting transaction code from PostgreSQL, MySQL, CockroachDB, or Spanner.
 ---
 
 # CamusDB transactions
@@ -89,7 +89,9 @@ UPDATE accounts SET balance = balance + 1 WHERE id = @id;
 
 A plain `SELECT` followed by an `UPDATE` in a later statement is not protected
 under Read Committed. Use Serializable or `SELECT ... FOR UPDATE` for that
-pattern.
+pattern. `UPDATE ... FROM` and `DELETE ... USING` are one statement too: they
+lock and reread each target row. An `UPDATE` that matches one target row to
+several source rows fails with `CADB0400`.
 
 An autocommit `SELECT` reads one pinned snapshot under either default level, with
 no lock. For read-your-writes across nodes, the .NET and TypeScript gRPC clients
@@ -101,15 +103,16 @@ reference for commit waits and the raw token rules for custom clients.
 - Pessimistic (default): CamusDB takes locks before conflicting work continues.
   Conflicts usually surface at lock acquisition.
 - Optimistic: writes skip the exclusive lock and validate at commit. Under
-  `SERIALIZABLE`, reads and scans still take shared locks, so phantoms stay
-  excluded. Under `READ COMMITTED`, optimistic takes no lock at all.
+  `SERIALIZABLE`, single-key reads validate at commit and scans keep range
+  locks. `serializable_optimistic_point_locks = true` restores shared point
+  locks. Under `READ COMMITTED`, optimistic takes no lock at all.
 - Wait-die resolves a conflict between serializable transactions. An older
   transaction may wait. A younger transaction that would create a cycle aborts
   and must retry.
 - One lock wait is capped by `lock_wait_deadline_ms` (default `500`). CamusDB
   then reports a retryable error, `CADB0502` or `CADB0504`.
 - Many point read locks in one bucket escalate to one bucket lock (default
-  `lock_escalation_threshold` is `50`). Conflicts can then rise.
+  `lock_escalation_threshold` is `1000`). Conflicts can then rise.
 
 Read [references/isolation-and-locking.md](references/isolation-and-locking.md)
 when you choose between the combinations or tune lock settings.
@@ -195,8 +198,6 @@ Rules for the callback:
 - Do not catch a statement error inside it. Let the error reach the helper.
 - Keep email, payment, and other external side effects outside it. It can run
   more than once.
-- Plain commands and hand-managed transaction blocks do not replay a whole
-  business operation. Use the helper for that boundary.
 
 ## Retry contract
 
@@ -213,20 +214,15 @@ The helpers implement this contract. You normally do not dispatch on the codes:
 | `CADB0555` | `LockNotAvailable` | Not retried: `FOR UPDATE NOWAIT` asked not to wait. The transaction ended. |
 | `CADB0558` | `ConcurrencyLimitExceeded` | The node has too many open explicit transactions. Retry `BEGIN` after a back-off. |
 | `CADB0824` | `TransactionRollbackOnly` | Do not replay as is. An earlier error was swallowed. Fix that code. HTTP and gRPC show `CADB0400` "Unknown transaction" instead. |
+| `CADB0847` | `SnapshotTooOld` | Do not retry the same snapshot. Retention removed the history it needs. Read at a newer timestamp, or begin a new transaction. |
 
-If `CADB0509` still reaches your code after the driver's retries, resend the
-same finalize on the same handle. Do not start the business operation again.
 Every other code needs a change to the request first. See
-https://camusdb.github.io/docs/error-codes for the full list.
+https://camusdb.github.io/docs/error-codes for the full list. The server retries
+an autocommit statement with a bound, except a streaming HTTP query. It never
+replays an explicit transaction.
 
 Read [references/retry-patterns.md](references/retry-patterns.md) for the full
 helper code and for a hand-written loop for HTTP or gRPC clients.
-
-## Server-side autocommit retries
-
-The server retries an autocommit statement, with a bound. A streaming HTTP query
-in autocommit runs one attempt only, because rows may already be on the wire. The
-server never replays an explicit transaction. The client restarts it.
 
 ## Limits
 
@@ -260,8 +256,7 @@ worked examples, TTL, and hot-row patterns.
 
 A row that every transaction updates makes all writers conflict, with
 `CADB0502` storms. Shard it: spread the writes across N rows, pick a random shard
-per write, and sum on read. See
-[references/limits-and-batching.md](references/limits-and-batching.md).
+per write, and sum on read.
 
 `SET TRANSACTION PRIORITY { BACKGROUND | LOW | NORMAL | HIGH | CRITICAL }` orders
 admission only, when the gate is on (`kahuna.max_concurrent_sessions` above `0`).
@@ -290,6 +285,9 @@ SELECT player_id, score FROM leaderboard AS OF SYSTEM TIME '-10s' LIMIT 100;
   It blocks no writer.
 - It works in autocommit only. Inside an explicit transaction it fails with
   `CADB0409`. Use a `SERIALIZABLE READ ONLY` transaction instead.
+- A read of history that retention removed fails with `CADB0847 SnapshotTooOld`.
+  A long snapshot transaction can get it too. Do not retry the same timestamp.
+  Pick a newer one, or begin a new transaction.
 
 ## Common mistakes
 
@@ -325,8 +323,8 @@ Read these files when the task needs the detail:
 - [references/retry-patterns.md](references/retry-patterns.md): full retry code
   for .NET, TypeScript, and raw HTTP or gRPC.
 - [references/isolation-and-locking.md](references/isolation-and-locking.md):
-  isolation and locking combinations, statement snapshots, causal tokens, lock
-  settings, schema pinning.
+  isolation and locking combinations, statement snapshots, joined writes, causal
+  tokens, lock settings, schema pinning.
 - [references/locking-reads-and-upserts.md](references/locking-reads-and-upserts.md):
   `SELECT ... FOR UPDATE`, job queues, `INSERT ... ON CONFLICT`, `UPSERT INTO`.
 - [references/limits-and-batching.md](references/limits-and-batching.md):
@@ -339,9 +337,12 @@ Public docs:
 - https://camusdb.github.io/docs/sql-transactions
 - https://camusdb.github.io/docs/sql-queries#for-update
 - https://camusdb.github.io/docs/sql-writes#on-conflict
+- https://camusdb.github.io/docs/sql-writes#joined-writes
 - https://camusdb.github.io/docs/serializable-transactions
+- https://camusdb.github.io/docs/transactions-locking-internals
 - https://camusdb.github.io/docs/serializable-retries
 - https://camusdb.github.io/docs/transaction-limits
+- https://camusdb.github.io/docs/time-travel-reads
 - https://camusdb.github.io/docs/error-codes
 - https://camusdb.github.io/docs/dotnet-driver,
   https://camusdb.github.io/docs/typescript-connector, and

@@ -79,7 +79,7 @@ from the last row upward to follow data flow.
 | `index-in-list` | `col IN (v1, v2, ...)` on an indexed column | `index=<name>, values=<n>` (distinct values probed) |
 | `gin-scan` | A JSONB predicate served by a GIN index. A `filter` above it checks each candidate | `index=<name>, groups=<n>, entries=<m>` |
 | `filter` | Residual predicate not served by the index | `<expr>` |
-| `aggregate` | `GROUP BY` or an aggregate function | `group=[...], aggs=[...]` |
+| `aggregate` | `GROUP BY` or an aggregate function | `group=[...], aggs=[...]`; a grouped top k adds `top_k=[<alias> ASC/DESC, k: <n>]` |
 | `having-filter` | `HAVING` | `<expr>` |
 | `sort` | `ORDER BY` not satisfied by scan order, no usable bound | `<col> ASC/DESC, ...` |
 | `topk` | `ORDER BY` bounded by `LIMIT`; keeps `offset + limit` rows. With spill on, it moves to disk only when those rows pass the byte cap | `k: <n>, <col> ASC/DESC, ...` |
@@ -94,7 +94,10 @@ from the last row upward to follow data flow.
 | `index-nested-loop-join` | Right side has an index on the join key | `on=<expr>, index=<name>, left=<col>, right=<col>` |
 | `hash-join` | Equi-join with an in-memory hash table | `on=<left>=<right>, build=<alias>` |
 | `merge-join` | Equi-join over ordered inputs | `on=<l>=<r>, right-order=forced-index=<name>` or `right-order=sort` |
-| `derived-table-scan` | Subquery in `FROM` | `alias=<alias>` |
+| `derived-table-scan` | Subquery in `FROM`, or an expanded CTE | `alias=<alias>`; a shared CTE result adds `computed_once=<name>` |
+| `recursive-union` | A reader of a `WITH RECURSIVE` CTE. The seed and recursive-term plans follow it | CTE name and reader alias |
+| `work-table-scan` | The rows of the previous recursive step | The CTE work table |
+| `values` | A `VALUES` list used as the sole source | `alias=<name>, rows=<n>` |
 | `window` | Window functions, one entry per distinct `(PARTITION BY, ORDER BY)` | `partition=[...] order=[...] functions=[...]` |
 | `function-scan` | Set-returning function in `FROM`, such as `generate_series`. No table access. Constant arguments give an exact `estimated_rows` | `<function>(<args>), alias=<alias>, column=<column>` |
 | `union` | `UNION [ALL]` | `all`, or `distinct: hash` |
@@ -117,6 +120,38 @@ operation.
 A FROM-less operand of a set operation shows a one-row
 `function-scan(*single_row*(), ...)`.
 
+### Grouped top k
+
+A grouped query ordered by one aggregate alias, with a `LIMIT`, can add `top_k` to
+the `aggregate` detail. `k` is `OFFSET + LIMIT`:
+
+```sql
+EXPLAIN SELECT customer_id, MAX(total) AS largest_order
+FROM orders GROUP BY customer_id
+ORDER BY largest_order DESC LIMIT 5;
+-- aggregate detail includes: top_k=[largest_order DESC, k: 5]
+```
+
+- Eligible: `COUNT` descending, `MAX` descending, or `MIN` ascending on a
+  `NOT NULL` column. No `HAVING`.
+- `MAX DESC` or `MIN ASC`, with only grouped columns and the ordered aggregate
+  projected: each cluster span sends only its local top k groups, ties included.
+- `COUNT DESC` with spill: a spilled grouping can skip spill partitions whose
+  upper bound cannot beat the current k-th count. It still scans the whole input.
+- The result does not change. Ties come back in no fixed order. Add `ORDER BY` keys
+  when you need a deterministic order.
+
+### CTE and recursive plans
+
+- A CTE read once is inlined. Its reader shows a `derived-table-scan`.
+- A CTE read more than once is computed once. Each reader shows
+  `computed_once=<name>`. The CTE runs in full before a reader gets a row, even
+  under `LIMIT`.
+- A `WITH RECURSIVE` reader shows `recursive-union`, then the seed plan and the
+  recursive-term plan with a `work-table-scan`. `EXPLAIN (ANALYZE)` does not count
+  the rows of each term separately.
+- A `VALUES` list that is the only source shows `values(alias=v, rows=N)`.
+
 ### Extra detail suffixes on join rows
 
 The engine renderer (`PlanRenderer.cs`) emits these suffixes.
@@ -124,6 +159,7 @@ The engine renderer (`PlanRenderer.cs`) emits these suffixes.
 | Suffix | Meaning |
 | --- | --- |
 | `kind=left-outer` | `LEFT JOIN`, or a `RIGHT JOIN` swapped into a left join |
+| `lateral` | The right source is a `LATERAL` source. It runs as a nested loop, in the written join order |
 | `right-filter=<expr>` | Filter pushed to the right input of a nested-loop, index nested-loop or merge join |
 | `build-filter=<expr>` | Filter pushed to the hash build side |
 | `right-index=<name>` | Right input of a hash or nested-loop join reads an index range |
@@ -259,6 +295,9 @@ when estimated entries reach the 40 % breakeven.
 | `window` with `spilled` above 0 | A partition passed the spill threshold | Narrow the `WHERE` |
 | `filter` above `gin-scan`, high `rows_read` | The GIN candidates are a superset of the matches | Expected. Add a more selective JSONB conjunct |
 | `ran=grace-hash` | Hash build side larger than its limit | Filter the build side, or index for a nested-loop or merge join |
+| `computed_once=` reader under a `LIMIT`, high `rows_read` | The shared CTE runs in full before any reader gets a row | `NOT MATERIALIZED` when readers need only part of the result |
+| Join marked `lateral`, slow | The lateral body runs for each left row | Filter the left side first |
+| A `recursive-union` query fails with `CADB0560` | The recursion passed its step or row limit | Add a stopping predicate |
 | Estimates off by orders of magnitude | Missing or stale statistics | `ANALYZE TABLE` |
 
 ## Examples
@@ -326,5 +365,8 @@ analyze  index-nested-loop-join  on=o.customer_id=c.id, index=orders_idx  6     
 analyze  table-scan              table=customers                          4            4          0           4
 ```
 
-Source: https://camusdb.github.io/docs/explain and
-https://camusdb.github.io/docs/query-planner-internals
+Sources: https://camusdb.github.io/docs/explain,
+https://camusdb.github.io/docs/query-planner-internals,
+https://camusdb.github.io/docs/sql-queries (WITH queries),
+https://camusdb.github.io/docs/joins-and-subqueries (LATERAL and VALUES sources),
+https://camusdb.github.io/docs/spill-to-disk

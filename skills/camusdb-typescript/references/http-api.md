@@ -5,7 +5,7 @@ The docs call this page the HTTP/JSON protocol reference. It is for driver autho
 in languages without a driver, health probes, and endpoint diagnostics. Application code in
 .NET, TypeScript, or Python uses its driver, which handles encoding, tokens, transaction handles,
 and retries.
-Source docs: https://camusdb.github.io/docs/http-api and https://camusdb.github.io/docs/sql-authentication
+Source docs: https://camusdb.github.io/docs/http-api, https://camusdb.github.io/docs/prepared-statements, and https://camusdb.github.io/docs/sql-authentication
 
 ## Contents
 
@@ -13,6 +13,7 @@ Source docs: https://camusdb.github.io/docs/http-api and https://camusdb.github.
 - Request limits
 - Authentication and tokens
 - `ColumnValue` encoding
+- `JSONB` values
 - Endpoint list
 - SQL execution and response shapes
 - Streaming queries
@@ -110,14 +111,36 @@ Parameters, row-operation values, filters, and defaults use `ColumnValue`. `type
 { "type": 10, "arrayElementType": 2, "arrayValues": [{ "type": 2, "longValue": 42 }] }
 { "type": 13, "strValue": "{\"kind\": \"login\"}" }
 { "type": 5, "floatValue": "NaN" }
+{ "type": 7, "bytesValue": "AAAAAAAAgD8=" }
 ```
 
 - Convert Unix milliseconds to ticks: `ticks = 621355968000000000 + unix_millis * 10000`.
 - `NUMERIC` rounds to nine fraction digits. Out-of-range values fail with `CADB0417`.
 - SQL byte literals use `X'...'`. JSON uses base64.
+- A vector parameter is a `BYTES` value: the packed `float32` elements as base64, with `type` 7. The last example above is the vector `[0.0, 1.0]`.
 - A float parameter accepts the strings `"Infinity"`, `"-Infinity"`, and `"NaN"` in `floatValue`.
-- A plain string written to a `jsonb` column also works.
+
+## `JSONB` values
+
+- A parameter is `{ "type": 13, "strValue": "<json text>" }`. A plain string written to a `jsonb` column also works.
 - Invalid JSON fails with `CADB0418`. Nesting deeper than 512 levels fails with `CADB0419`.
+- In result rows, a `jsonb` column has type `13`. By default, each cell is the document as native JSON. Numbers keep all their digits.
+- In this default form, JSON `null` and SQL `NULL` are both the token `null`. A client cannot tell them apart. If it writes the value back, it can store SQL `NULL` in place of the document.
+
+Send `"jsonbAsText": true` to keep them apart. It applies to `/execute-sql-query`, `/execute-sql-query-stream`,
+and the `RETURNING` rows of `/execute-sql-non-query`. Each `jsonb` cell is then a JSON string that holds the
+document text. SQL `NULL` stays the token `null`.
+
+| Value | Default form | Text form |
+| --- | --- | --- |
+| SQL `NULL` | `null` | `null` |
+| JSON `null` | `null` | `"null"` |
+| `"abc"` | `"abc"` | `"\"abc\""` |
+| `{"a": 1}` | `{"a": 1}` | `"{\"a\": 1}"` |
+
+The server marks each column that uses the text form: `{ "name": "payload", "type": 13, "jsonbAsText": true }`.
+Decode a cell as text only when its column has this mark. An older server ignores the field and sends the
+default form. A string document such as `"abc"` is valid in both forms, so the mark is the only safe test.
 
 ## Endpoint list
 
@@ -129,7 +152,7 @@ Parameters, row-operation values, filters, and defaults use `ColumnValue`. `type
 | `POST /create-db` | `{ databaseName, ifNotExists }` |
 | `POST /drop-db` | `{ databaseName }` |
 | `POST /close-db` | `{ databaseName }` |
-| `POST /create-table` | Structured table definition. Prefer SQL DDL. |
+| `POST /create-table` | Structured table definition. Prefer SQL DDL. Foreign-key `onDelete` and `onUpdate` accept `"no action"` and `"restrict"`; `cascade`, `set null`, or `set default` returns `CADB0533`. |
 | `POST /execute-sql-ddl` | Schema SQL. Server-level statements can omit `databaseName`. |
 | `POST /execute-sql-query` | `SELECT`, `SHOW`, and writes with `RETURNING`. Buffered. |
 | `POST /execute-sql-query-stream` | Same body; NDJSON streaming response. |
@@ -191,12 +214,8 @@ Positional cell encoding:
 | uuid | `[high, low]` pair of signed 64-bit integers |
 | numeric | decimal string |
 | array | JSON array of element values; `columns[c].elementType` names the element type |
-| jsonb | the document as native JSON; with `jsonbAsText`, a JSON string that holds the text form |
+| jsonb | the document as native JSON; with `jsonbAsText`, a JSON string that holds the text form. See "`JSONB` values". |
 | null | `null` |
-
-By default, JSON `null` and SQL `NULL` are both the token `null`. Send `"jsonbAsText": true` to keep them apart.
-The server then marks each such column: `{ "name": "payload", "type": 13, "jsonbAsText": true }`.
-Decode a cell as text only when its column has this mark. An older server ignores the field and sends native JSON.
 
 Optional extras: `cacheStatus`, `cacheName`, `cacheBypassReason`, `ageMs` for cache-hinted queries, and `routing` when routing was negotiated.
 
@@ -207,6 +226,16 @@ Optional extras: `cacheStatus`, `cacheName`, `cacheBypassReason`, `ageMs` for ca
 ```
 
 With `RETURNING`, the response adds `columns` and positional `returningRows`. `rows` stays the affected count.
+The response can also carry `warning`, as on `/execute-sql-ddl`. An `INSERT ... SELECT` time-travel copy that reads no rows sets it.
+
+### `/execute-sql-ddl` response
+
+```json
+{ "status": "ok", "rows": 2, "warning": null }
+```
+
+- `rows` is the number of rows the statement wrote, such as the rows that `CREATE TABLE ... AS SELECT` copied. It is `0` for a DDL statement that writes no rows.
+- `warning` is `null` unless there is something to report. A time-travel copy that reads no rows returns a warning.
 
 ## Streaming queries
 
@@ -248,24 +277,71 @@ POST /start-transaction
 
 ## Prepared statements
 
+A prepared statement registers SQL once. Later executions send a handle and positional values.
+Preparable: `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `SHOW`. `/execute-sql-ddl` rejects a handle; it does not ignore it.
+
+### `POST /prepare-sql-statement`
+
 ```json
 POST /prepare-sql-statement
-{ "databaseName": "app", "sql": "SELECT id, name FROM robots WHERE year >= @year" }
+{ "databaseName": "app", "sql": "UPDATE robots SET name = @name, year = @year WHERE id = @id" }
 
-200 { "status": "ok", "statementId": "opaque-handle", "parameterNames": ["@year"] }
+200 { "status": "ok", "statementId": "opaque-node-local-handle", "parameterNames": ["@name", "@year", "@id"] }
 ```
+
+- `parameterNames` lists the distinct placeholder names in binding order, first occurrence first. Each name keeps its `@`.
+- A name that appears more than once occupies one slot. The list includes placeholders inside subqueries.
+- Preparing parses and registers the SQL, but checks no privileges. Authorization runs at each execution, for the principal of that request.
+- A statement that does not parse fails at prepare, not at a later execution.
+
+### Execute a prepared statement
+
+Send `statementId` and `positionalParameters` to `/execute-sql-query`, `/execute-sql-query-stream`, or `/execute-sql-non-query`:
 
 ```json
-POST /execute-sql-query
-{ "statementId": "opaque-handle", "positionalParameters": [{ "type": 2, "longValue": 1980 }] }
+{
+  "statementId": "opaque-node-local-handle",
+  "positionalParameters": [
+    { "type": 3, "strValue": "Artoo" },
+    { "type": 2, "longValue": 1977 },
+    { "type": 1, "strValue": "507f1f77bcf86cd799439011" }
+  ]
+}
 ```
 
-- `positionalParameters[i]` binds to `parameterNames[i]`. The counts must match.
-- A repeated name occupies one slot.
-- Handles belong to one node and one principal. Close with `POST /close-sql-statement { "statementId": ... }`.
-- On `CADB0520` (HTTP 404), prepare again and replay once. Behind a load balancer, expect one prepare per node.
-- `CADB0521` (HTTP 429) means a prepared-statement cap was reached. Close unused handles.
-- Preparable: `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `SHOW`.
+- `positionalParameters[i]` binds to `parameterNames[i]`. The number of values must equal the number of names.
+- Each value uses the same `ColumnValue` encoding as the inline `parameters` map.
+- The names do not travel on the wire. A client that binds by name maps its arguments to the ordinals itself.
+- Omit `sql`, `databaseName`, and `parameters`. Every other field works as it does inline, including `txnIdPT`, `txnIdCounter`, `isolationLevel`, `transactionMode`, `locking`, and `causalToken`.
+
+### `POST /close-sql-statement`
+
+```json
+{ "statementId": "opaque-node-local-handle" }
+```
+
+- Repeating a close is harmless.
+- You can skip the close. The idle handle reaper collects abandoned handles. A client that prepares an unbounded number of different statements still reaches its cap.
+- `CADB0521` (HTTP 429) means a prepared-statement cap was reached. Close unused handles. The defaults are 512 live statements per principal on one node, and 8192 per node.
+
+### Handle lifetime
+
+- A REST handle is an opaque string. It belongs to the node and the principal that prepared it.
+- CamusDB frees it at an explicit close, at the idle timeout (`prepared_statement_idle_timeout_ms`, 600000 ms by default), or at process exit.
+- CamusDB never replicates a handle to another node.
+
+### Recover from `CADB0520`
+
+An execution fails with `CADB0520` (`UnknownPreparedStatement`, HTTP 404) when the node does not know its handle.
+Treat it as routine: prepare the statement again, then replay the execution once. It occurs when:
+
+- The handle stayed unused past `prepared_statement_idle_timeout_ms`.
+- The node restarted.
+- A load balancer sent the request to a different node.
+- The handle belongs to a different principal. CamusDB reports this case the same way on purpose, so a caller cannot confirm that someone else's handle exists.
+
+Behind a load balancer, use sticky sessions, or accept one new prepare per node per statement.
+On `/execute-sql-query-stream`, the server resolves the handle before it writes any bytes. The 404 arrives as a normal JSON error, not in the middle of a stream.
 
 ## Direct row operations
 
@@ -296,11 +372,14 @@ Prefer SQL endpoints. They share the parser and executor with the engine tests.
 | `CADB0558` | Node at a concurrency cap. HTTP 503. Retry after a backoff. |
 | `CADB0506` | Do not retry. Split the transaction. |
 | `CADB0503` | Retry later or on another node. |
-| `CADB0520` | Prepare again, then replay once. |
+| `CADB0520` | Unknown prepared statement. HTTP 404. Prepare again, then replay once. |
+| `CADB0521` | Prepared-statement cap reached. HTTP 429. Close unused handles. |
+| `CADB0847` | Snapshot too old: retention removed history the read needs. HTTP 409. Do not retry the same snapshot. Use a newer timestamp or a new transaction. |
 | `CADB0516` | Log in again. |
 | `CADB0517` | Missing privilege. Do not retry. |
 
 Switch on `code`, never on `message`. Many domain errors use HTTP 500. Authentication, authorization, validation, not-found, conflict, and rate-limit errors use their matching status.
+Foreign-key violations use HTTP 409. Invalid foreign-key definitions use HTTP 400.
 
 ## curl walkthrough
 

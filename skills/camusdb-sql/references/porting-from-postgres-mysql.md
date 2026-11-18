@@ -55,8 +55,13 @@ Spanner. Each row says what you might write, and what to write in CamusDB.
 | Correlated subquery in `HAVING`, `JOIN ON`, or `ON CONFLICT DO UPDATE` | `CADB0533`. Move it to `WHERE`, or join a derived table. |
 | `ORDER BY (SELECT ...)`, `GROUP BY (SELECT ...)` | Refused (`CADB0400`). |
 | `ORDER BY x NULLS FIRST`, `NULLS LAST` | Not supported. `NULL` sorts first ascending and last descending. PostgreSQL does the opposite by default. |
-| `WITH cte AS (...) SELECT ...` | Not supported. Use a derived table or a view. |
-| `WITH RECURSIVE` | Not supported. |
+| `WITH cte AS (...) SELECT ...` | Supported, also with `MATERIALIZED` and `NOT MATERIALIZED`. A CTE read twice is computed once. See [ctes-and-lateral.md](ctes-and-lateral.md). |
+| `WITH d AS (DELETE ... RETURNING ...)` (writable CTE) | Not supported. Run the write as its own statement. |
+| `WITH c AS (VALUES ...)` | Write `WITH c AS (SELECT * FROM (VALUES ...) AS v)`. |
+| `WITH RECURSIVE` | Supported: `seed UNION [ALL] step`. Add a stop condition. The step and row limits fail with `CADB0560`. |
+| `SEARCH`, `CYCLE` clauses, `CREATE RECURSIVE VIEW` | Not supported. `UNION` stops a cycle when whole rows repeat. Otherwise add an explicit stop condition, such as a depth bound. A view body can use `WITH RECURSIVE`. |
+| Mutually recursive CTEs | Not supported. |
+| Recursive seed `SELECT NULL` or a bare parameter | Becomes `STRING`. Cast the seed to the type you need. |
 | `UNION`, `UNION ALL`, `INTERSECT`, `EXCEPT` | Supported, with `ALL`. See [set-and-window.md](set-and-window.md). |
 | `(q1 UNION q2) ORDER BY a + 1` | An expression fails. Use `SELECT * FROM (q1 UNION q2) AS s ORDER BY s.a + 1`. |
 | `UNION CORRESPONDING BY` | Not supported. |
@@ -64,9 +69,15 @@ Spanner. Each row says what you might write, and what to write in CamusDB.
 | `SUM(x) FILTER (WHERE ...)` | Syntax error. Write `SUM(CASE WHEN ... THEN x END)`. |
 | `OVER w ... WINDOW w AS (...)` | Not supported. Write the specification in each `OVER`. |
 | `GROUPS` frames, `EXCLUDE`, `RANGE n PRECEDING` | Not supported. Use `ROWS`. |
-| `FROM t, generate_series(1, t.n)`, `LATERAL` | Not supported (`CADB0533`). |
+| `CROSS JOIN LATERAL (...)`, `LEFT JOIN LATERAL (...) ON true` | Supported. `RIGHT JOIN LATERAL` is refused. See [ctes-and-lateral.md](ctes-and-lateral.md). |
+| `FROM t, generate_series(1, t.n)`, `FROM t, jsonb_each(t.doc)` | Supported. `LATERAL` is implicit for a table function. |
+| `CROSS APPLY`, `OUTER APPLY` | Not supported. Write `CROSS JOIN LATERAL (...) AS x` or `LEFT JOIN LATERAL (...) AS x ON true`. |
+| `VALUES (1), (2)` as a statement | Not supported. Write `SELECT * FROM (VALUES (1), (2)) AS v`. |
+| `(VALUES ...)` in `FROM` | Supported. The alias is required. Columns are `column1`, `column2`, ... unless you list names: `AS v (id, label)`. |
+| `FROM (SELECT ...) AS d (a, b)` | Supported. The list renames columns by position. |
+| `x IN (SELECT * FROM one_col)` | Supported when `*` expands to exactly one column. |
 | `SELECT generate_series(1, 3)` | `CADB0533`. Write `SELECT * FROM generate_series(1, 3)`. |
-| `generate_series` over dates or timestamps | Not supported. Arguments are integers. Use `date_add(d, i, 'day')` with an integer series. |
+| `generate_series` over dates or timestamps | Not supported. Arguments are integers. Use `date_add(d, i, 'day')` or `d + i * INTERVAL '1 day'` with an integer series. |
 | `unnest(a)`, `WITH ORDINALITY` | Not supported. |
 | `FOR SHARE`, `FOR KEY SHARE` | `CADB0533`. |
 | `FOR UPDATE` with a join, `DISTINCT`, `GROUP BY`, or a view | `CADB0400`. See `camusdb-transactions`. |
@@ -83,8 +94,13 @@ Spanner. Each row says what you might write, and what to write in CamusDB.
 | --- | --- |
 | `UPDATE t SET x = 1` with no `WHERE` | Rejected. Add a predicate that matches every row. Watch the mutation limit. |
 | `DELETE FROM t` to empty a table | Rejected. `TRUNCATE TABLE t`. |
-| `UPDATE t SET ... FROM other`, `UPDATE a JOIN b` | Not documented. Use a subquery in `WHERE`, or several statements in a transaction. |
-| `UPDATE ... ORDER BY ... LIMIT` (MySQL) | `LIMIT n` is accepted. `ORDER BY` in `UPDATE`/`DELETE` is not documented. |
+| `UPDATE t SET ... FROM other` (PostgreSQL) | Supported. A target row that matches several source rows fails with `CADB0400`; PostgreSQL picks one. Aggregate the source first. |
+| `UPDATE a JOIN b SET ...` (MySQL) | Write `UPDATE a SET ... FROM b WHERE b.k = a.k`. |
+| `DELETE FROM t USING u WHERE ...` (PostgreSQL) | Supported. A multiply matched row is deleted once. |
+| `DELETE t FROM t JOIN u ...` (MySQL) | Write `DELETE FROM t USING u WHERE u.k = t.k`. |
+| `UPDATE ... FROM ... LIMIT`, `RETURNING *` in a joined write | Not supported. List target columns in `RETURNING`. |
+| A table or column named `using` or `lateral` | Both words are reserved. Quote them with backticks. |
+| `UPDATE ... ORDER BY ... LIMIT` (MySQL) | `LIMIT n` is accepted. `ORDER BY` and `OFFSET` in `UPDATE`/`DELETE` are not supported. |
 | `UPDATE t SET v = 1, v = 2` | Fails with `CADB0403`. |
 | `INSERT ... ON CONFLICT DO UPDATE` | Supported. It must name a target. See [statements.md](statements.md). |
 | `UPSERT INTO` (CockroachDB) | Supported, on the primary key. |
@@ -119,6 +135,7 @@ Spanner. Each row says what you might write, and what to write in CamusDB.
 | `INSTEAD OF` trigger, rule | Not supported. |
 | `WITH (security_invoker = true)` | Not supported. Views run as the owner. |
 | `CREATE TEMP VIEW` | Not supported. |
+| A view body with `WITH` | Supported. Each CTE reference is stored as a derived table and runs separately. |
 | View across two databases | Not supported. |
 | `DROP TABLE t CASCADE` | No `CASCADE`. Drop dependent views first. |
 | `REFRESH MATERIALIZED VIEW CONCURRENTLY mv` | `REFRESH MATERIALIZED VIEW mv`. It never blocks readers. `CONCURRENTLY` fails (`CADB0533`). |
@@ -162,6 +179,10 @@ Spanner. Each row says what you might write, and what to write in CamusDB.
 | A `json` column that keeps its input text | `json` is an alias of `jsonb`. The text is canonical. |
 | `a + b::int` meaning `(a + b)::int` | `::` binds tighter. Write `(a + b)::int`. |
 | `'2024-06-15 10:30:00'` in a date function | Add an offset: `'2024-06-15T10:30:00Z'`. |
+| `TIMESTAMP '2024-06-15 10:30:00'` | The space is refused. Write `TIMESTAMP '2024-06-15T10:30:00Z'`. `DATE '2024-06-15'` works. |
+| An `INTERVAL` column | Not supported. `INTERVAL` is an expression type only. Store `CAST(i AS STRING)`, and cast the text back. |
+| `WHERE i > '1 day'` for an interval | Plain text does not compare with an interval. Write `INTERVAL '1 day'`. |
+| `SUM(i)`, `AVG(i)` over intervals | Not supported. |
 | `ObjectId('...')` | `str_id('...')` or `to_id('...')`, 24 lowercase hex characters. |
 | `gen_random_uuid()` | `gen_uuid_v4()`. |
 | `uuid_generate_v7()` | `gen_uuid_v7()`. |
@@ -189,7 +210,13 @@ Spanner. Each row says what you might write, and what to write in CamusDB.
 | `CURDATE()` (MySQL) | `current_date()`. It reads the start of the transaction. |
 | `now()` expecting the time of each row (MySQL `SYSDATE()`) | `now()` is the start of the transaction. Use `clock_timestamp()` or `sysdate()`. |
 | `make_date`, `make_timestamp`, `makedate`, `last_day` | Supported. A negative year (PostgreSQL BC) fails. |
-| `d + INTERVAL '1 day'`, `DATE_ADD(d, INTERVAL 1 DAY)` | `date_add(d, 1, 'day')`. Returns `DATETIME`. |
+| `d + INTERVAL '1 day'`, `now() - INTERVAL '7 days'` | Supported. A `DATE` or `DATETIME` plus an interval returns `DATETIME`. See [functions.md](functions.md). |
+| `DATE_ADD(d, INTERVAL 1 DAY)`, `DATE_SUB(d, INTERVAL 1 DAY)` (MySQL) | Supported. `date_add(d, 1, 'day')` also works. Returns `DATETIME`. |
+| `INTERVAL '1:30' HOUR_MINUTE` (MySQL compound unit) | Not supported. Write `INTERVAL '1 hour 30 minutes'`. |
+| `ts1 - ts2` | Returns an `INTERVAL` with days and time, no months. Use `age(ts1, ts2)` for years and months. |
+| `age`, `make_interval`, `justify_days`, `justify_hours`, `justify_interval`, `date_bin` | Supported. `age` is volatile, so a `CHECK` cannot use it. `make_interval` takes no named arguments. `date_bin` needs an origin. |
+| `EXTRACT(epoch FROM interval)` | Supported. Returns whole seconds as `INT64`. |
+| `sin`, `cos`, `atan2`, `sind`, `cosd`, `radians`, `degrees`, `pi()` | Supported. Return `FLOAT64`. |
 | `DATEDIFF(a, b)` (MySQL) | `date_diff(start, end, 'day')`. Mind the argument order. |
 | `date_trunc('month', x)` | Same order. Returns `DATETIME` in UTC. |
 | `UNIX_TIMESTAMP(x)`, `FROM_UNIXTIME(s)`, `to_timestamp(s)` | Supported. |

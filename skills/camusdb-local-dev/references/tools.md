@@ -28,24 +28,30 @@ dotnet tool update -g CamusDB.WebConsole
 Or run the Docker image:
 
 ```bash
-docker run --rm -p 8080:8080 \
+docker run --rm -p 127.0.0.1:8080:8080 \
   -e CamusDB__Endpoint=http://host.docker.internal:5095 \
   -e CamusDB__Database=demo \
   camusdb/camusdb-webconsole:latest
 ```
 
 Open `http://localhost:8080`. On Linux, add `--add-host=host.docker.internal:host-gateway`,
-or use the host LAN IP.
+or use the host LAN IP. The `127.0.0.1` binding keeps the port reachable only from the Docker host.
+
+- The console has no sign-in of its own. Anyone who can reach it can use its configured CamusDB
+  connection. Keep it on loopback for local work.
+- Before you expose it, put an authenticated reverse proxy or VPN in front, turn on CamusDB
+  authentication, and set `CamusDB__LockEndpoint=true` or `ConsoleLaunch__AllowedEndpoints`.
 
 | Setting | Env var | Notes |
 | --- | --- | --- |
 | `Endpoint` | `CamusDB__Endpoint` | REST port for `rest`, gRPC port for `grpc` |
 | `Database` | `CamusDB__Database` | Session database |
 | `Protocol` | `CamusDB__Protocol` | `rest` (default) or `grpc` |
-| `TimeoutSeconds` | `CamusDB__TimeoutSeconds` | Request timeout |
-| `MaxRows` | `CamusDB__MaxRows` | Grid and export row cap |
+| `TimeoutSeconds` | `CamusDB__TimeoutSeconds` | Request timeout; default `30`, capped at `600` |
+| `MaxRows` | `CamusDB__MaxRows` | Page size and grid and export row cap; default `1000`, capped at `100000` |
 | `User` / `Password` | `CamusDB__User` / `CamusDB__Password` | Empty user means no auth |
 | `AccessToken` | `CamusDB__AccessToken` | Token from elsewhere |
+| `RequireAccessToken` | `CamusDB__RequireAccessToken` | Accept access tokens only; refuse user and password sign-in |
 | `AllowInsecureCredentials` | `CamusDB__AllowInsecureCredentials` | Credentials to non-loopback `http://` |
 | `LockEndpoint` | `CamusDB__LockEndpoint` | Stop sessions from repointing the endpoint |
 | `BackupEndpoint` | `CamusDB__BackupEndpoint` | REST endpoint for backups when using gRPC or a pool |

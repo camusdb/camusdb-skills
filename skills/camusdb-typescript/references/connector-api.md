@@ -1,7 +1,7 @@
 # `camusdb` connector API
 
 Read this file when you need an exact option, method, helper, or export of the Node.js connector.
-Source docs: https://camusdb.github.io/docs/typescript-connector
+Source docs: https://camusdb.github.io/docs/typescript-connector, https://camusdb.github.io/docs/prepared-statements, and https://camusdb.github.io/docs/data-types#intervals
 
 ## Contents
 
@@ -157,7 +157,11 @@ Decoded values:
 | `UUID` | lowercase canonical `string` |
 | `JSONB` | parsed value, with an unsafe integer as `bigint`; or JSON text with `jsonb: 'text'` |
 | `ARRAY(T)` | array of decoded elements |
+| `INTERVAL` | ISO-8601 `string`, such as `P1Y2M3DT4H5M6.5S`; zero is `PT0S`; mixed signs stay, as in `P-1DT2H` |
 | `NULL` | `null` |
+
+`INTERVAL` is an expression type only. A table column cannot hold it. To store one, cast it to `STRING`.
+To pass a span as a parameter, bind a number and give it a unit: `INTERVAL @n DAY`.
 
 Over REST, `Infinity`, `-Infinity`, and `NaN` in a float cell arrive as JSON strings, and the driver returns them as strings.
 Over REST, a non-finite float parameter is written as JSON `null`. gRPC carries these values as floats.
@@ -222,6 +226,9 @@ A server can also send `CADB0400`. The constant name `InvalidParameter` does not
 - Preparable: `SELECT`, `INSERT`, `UPSERT`, `UPDATE`, `DELETE`, `SHOW`, and a query that starts with a parenthesis. Others run inline.
 - If the server refuses a registration, the statement keeps running inline.
 - Parameters still bind by name. The connector maps names to positions.
+- A repeated `@name` binds one value. A parameter that matches no placeholder is an error, and so is a placeholder with no parameter. Neither becomes `NULL`.
+- A handle belongs to the node that prepared it. Behind a load balancer, the connector prepares each statement once on each node it reaches.
+- Preparing checks no privileges. The server checks them at each execution.
 
 ## Authentication
 

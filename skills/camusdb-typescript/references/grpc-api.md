@@ -4,7 +4,7 @@ Read this file before you build a gRPC client from the proto, or debug the conne
 The `camusdb` connector already implements this protocol. Set `protocol: 'grpc'` instead of writing your own when you use Node.js.
 The docs call this page the gRPC protocol reference, for driver authors, custom clients, and transport
 diagnostics. The .NET and TypeScript drivers support gRPC; Python uses REST.
-Source docs: https://camusdb.github.io/docs/grpc-api
+Source docs: https://camusdb.github.io/docs/grpc-api and https://camusdb.github.io/docs/prepared-statements
 
 ## Basics
 
@@ -29,6 +29,9 @@ Source docs: https://camusdb.github.io/docs/grpc-api
 | `CamusSql` | `Ping` | unary | Liveness |
 | `CamusSql` | `GetNodeStats` | unary | Disk, CPU, and memory of the node that answers |
 | `CamusRows` | `InsertRow`, `Query`, `QueryById`, `UpdateRows`, `UpdateById`, `DeleteRows`, `DeleteById` | mixed | Typed row CRUD without SQL text |
+
+`DdlReply` and `NonQueryReply` carry `affected_rows` and `warning`. A `CREATE TABLE ... AS SELECT` or
+`INSERT ... SELECT` time-travel copy that reads no rows sets `warning`. An absent warning is the empty string, as proto3 requires.
 
 ## `SqlRequest`
 
@@ -69,6 +72,7 @@ Fields: `database`, `sql`, `parameters` (`map<string, Value>`), `txn_handle`, `i
 
 - Send ObjectIds in `id_value`, not `string_value`.
 - Send UUIDs as 16 bytes, not text.
+- Send a vector as its packed `float32` bytes in `bytes_value`.
 - Send dates as ticks, not ISO strings.
 - Include the array element type even for an empty array.
 - Treat an unset `Value` and `null_value` as NULL.
@@ -114,11 +118,24 @@ A write with `RETURNING` is buffered on the server, so `CADB0556` applies to it.
 
 ## Prepared statements on gRPC
 
-- `PREPARE (database, sql)` returns `PrepareReply { statement_id, parameter_names }`.
-- Execute with `statement_id` and `positional_parameters`. Omit `sql`, `database`, and `parameters`.
-- A handle lives only on its stream. Unary RPCs reject handles.
-- Wait for the `PrepareReply` before you execute with its id.
+```text
+PREPARE (database, sql)  -> PrepareReply { statement_id, parameter_names[] }
+QUERY | NON_QUERY (statement_id, positional_parameters[])
+CLOSE (statement_id)     -> CloseReply
+```
+
+- Prepared statements live only on the `BatchExecute` stream. Unary RPCs reject a handle.
+- `statement_id` is an `int32` handle scoped to that stream.
+- `parameter_names` lists the distinct placeholder names in binding order, first occurrence first. Each keeps its `@`.
+- `positional_parameters[i]` binds to `parameter_names[i]`. A repeated name occupies one slot. The list includes placeholders inside subqueries. The number of values must equal the number of names.
+- The names do not travel on the wire. A client that binds by name maps its arguments to the ordinals itself.
+- With a `statement_id`, omit `sql`, `database`, and `parameters`. The server refuses a request with both; it applies no precedence rule.
+- Wait for the `PrepareReply` before you send anything that uses its id. Operations on a stream run concurrently.
+- Repeating `CLOSE` is harmless, and closing an unknown id succeeds.
+- The stream frees every handle when it ends: normally, by cancellation, or by a fault. A long stream must still close unused handles to stay under `grpc_max_prepared_statements_per_stream` (512 by default).
+- A handle belongs to one stream on one node. CamusDB never replicates it.
 - On `CADB0520`, prepare again on the current stream and replay once.
+- A stream has 2^31 registrations. After that, the server tells the client to open a new stream.
 
 ## Errors
 
@@ -126,6 +143,7 @@ A write with `RETURNING` is buffered on the server, so `CADB0556` applies to it.
 - Batch operations return `BatchError` inside the stream.
 - Auth: `UNAUTHENTICATED` for a bad or expired token, `PERMISSION_DENIED` for a missing privilege, `RESOURCE_EXHAUSTED` for login rate limits.
 - Bad client input, including SQL syntax errors, maps to `INVALID_ARGUMENT`.
+- Foreign-key violations map to `FAILED_PRECONDITION`. Invalid foreign-key definitions map to `INVALID_ARGUMENT`.
 - A value outside its type's range maps to `OUT_OF_RANGE` (`CADB0417`, `CADB0420`, `CADB0421`).
 - `ABORTED` also covers `CADB0555`, which is not retried. Branch on `camus-error-code`, not on the status.
 - `RESOURCE_EXHAUSTED` also covers `CADB0556` and `CADB0558`.

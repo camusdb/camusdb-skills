@@ -14,7 +14,8 @@ Add a hint only when all of these hold:
 - Its data changes much less often than it is read.
 - Its result is small: at most 10,000 rows and 1 MiB by default.
 - Its result is deterministic. Do not hint a query that uses `NOW()`, random
-  values or other volatile inputs.
+  values or other volatile inputs. A query that calls a volatile function, such
+  as `age()`, bypasses the cache.
 
 ## Syntax
 
@@ -156,4 +157,5 @@ stored.
 - Expecting a different parameter value to hit the same entry.
 - Hinting a large result. It exceeds 10,000 rows or 1 MiB and is never stored.
 
-Source: https://camusdb.github.io/docs/query-result-cache
+Sources: https://camusdb.github.io/docs/query-result-cache,
+https://camusdb.github.io/docs/functions-datetime (interval functions)

@@ -29,7 +29,7 @@ Binary: `CamusDB.Mcp/bin/Debug/net10.0/CamusDB.Mcp`. The repository README also 
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `CAMUS_MCP_CONNECTION_STRING` | none | Full connection string, e.g. `Endpoint=http://localhost:5095;Database=mydb;Timeout=30`. Wins over `CAMUS_MCP_ENDPOINT`. |
-| `CAMUS_MCP_ENDPOINT` | `http://localhost:5095` | Endpoint, or a comma-separated list used in turn. |
+| `CAMUS_MCP_ENDPOINT` | see the note below | Endpoint, or a comma-separated list used in turn. |
 | `CAMUS_MCP_DEFAULT_DATABASE` | none | Database for a tool call without a `database` argument. Also read from `Database=`. |
 | `CAMUS_MCP_TIMEOUT_SECONDS` | client default, `10` | Command timeout when built from `CAMUS_MCP_ENDPOINT`. |
 | `CAMUS_MCP_MAX_ROWS` | `1000` | Hard cap on `select_query` rows. |
@@ -37,6 +37,10 @@ Binary: `CamusDB.Mcp/bin/Debug/net10.0/CamusDB.Mcp`. The repository README also 
 | `CAMUS_MCP_PASSWORD` | none | Its password. Exchanged once for a bearer token. |
 | `CAMUS_MCP_ACCESS_TOKEN` | none | A bearer token from elsewhere. Used verbatim; never renewed. |
 | `CAMUS_MCP_TOKEN_LIFETIME_SECONDS` | client default, `600` | Fallback token lifetime when the server reports none. |
+
+Always set `CAMUS_MCP_ENDPOINT` or `CAMUS_MCP_CONNECTION_STRING`. The sources disagree on the
+default: the CamusDB docs say `http://localhost:7141` (plain HTTP to the HTTPS port), while the
+camusdb-mcp source and README say `http://localhost:5095`.
 
 Pair the scheme with the port: `http://host:5095`, or `https://host:7141`. A node has no HTTPS
 listener without `https_certificate`.
@@ -139,7 +143,9 @@ GRANT SELECT ON analytics.* TO mcp;
 
 ## Tools
 
-The camusdb-mcp source and README list these 23 tools:
+The camusdb-mcp source and README list these 23 tools. The CamusDB docs page lists 15 of them:
+the read, query, and write tools. The diagnostic tools and the `insert_rows` options below
+appear only in the camusdb-mcp repository.
 
 | Tool | Kind | Notes |
 | --- | --- | --- |

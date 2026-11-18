@@ -35,9 +35,9 @@ When nothing sets `data_dir`, the engine uses, in order:
 3. `~/.local/share/camusdb` (Windows: `%LOCALAPPDATA%\camusdb`)
 
 `camusdb init` writes that resolved path into `data_dir`. The Docker image uses `/data`.
-Note: the configuration docs table still says `~/.camusdb/data`. The engine source, the engine
-README, and the tutorial say `~/.local/share/camusdb`. Trust the startup banner line
-`Data directory: ...`.
+Note: the configuration and settings reference tables say `~/.camusdb/data`. The server
+installation page, the engine source, and the engine README say `$XDG_DATA_HOME/camusdb` or
+`~/.local/share/camusdb`. Check the startup banner line `Data directory: ...`.
 
 ## Precedence
 
@@ -96,9 +96,12 @@ The full table, with every tuning key, is at https://camusdb.github.io/docs/conf
 
 - `memory_profile: dev` fixes caches at about 96 MiB on any machine. `prod` sizes them to
   about 16% of memory. `dev` is slower once the working set exceeds the cache.
-- `memory_profile: dev` also runs the node under workstation GC. The server starts itself again as a
-  child process with `DOTNET_gcServer=0`. Set `DOTNET_gcServer` yourself to turn the relaunch off.
-  A SIGKILL to the first process leaves the child running. The startup banner names the GC.
+- The docs and the engine disagree on the GC under `dev`. The configuration docs say
+  `memory_profile` changes only the four cache sizes, and the server GC stays the default until you
+  set `DOTNET_gcServer=0`. The engine source also switches a `dev` node to workstation GC: the
+  server starts itself again as a child process with `DOTNET_gcServer=0`, unless you set
+  `DOTNET_gcServer` yourself. Check the startup banner line `Memory profile: ...`, which names
+  the GC.
 - `key_range_sharding` selects the routing mode. Hash routing is the default. `CAMUS_KEY_RANGE_SHARDING`
   accepts `true` or `1`. Choose the mode before you create data:
   - The cluster records its mode the first time a node of a new cluster starts.
@@ -209,9 +212,21 @@ SHOW VARIABLES LIKE 'slow_query_%';
 ```
 
 Columns: `variable`, `value`, `type`, `default`, `source`, `mutability`, `scope`.
-`source` is `default`, `config`, `env`, `cli`, or `cluster`. Secrets render as `********`.
+`source` is `default`, `config`, `env`, `cli`, or `cluster`.
 The `LIKE` match is case-sensitive; names are lowercase. It uses the query wildcards and escapes:
 `_` matches one character, so write `SHOW VARIABLES LIKE 'ttl\_%'` for a literal underscore.
+
+- The output shows effective values, not the text of `config.yml`. A key you commented out shows
+  its default. A key that an environment variable overrode shows the override.
+- Secrets are masked: `bootstrap_superuser_password`, `access_token_server_key`, and `node_secret`
+  render as `********` when set, and as empty when not.
+- It does not list `mode`, `node_name`, the HTTP and internal cluster ports, `peers`,
+  `http_peers`, or the `diagnostics:` section. Read the configuration file or the startup banner.
+- It does not list computed values, such as the effective spill threshold. It lists the settings
+  that produce them.
+- It is node-local. Run it against each node to compare a cluster.
+- With auth on, it needs a superuser. Other users get `CADB0517`. With auth off, anyone may run it.
+- It is read-only. There is no `SET GLOBAL` and no session variable. Use `SET CLUSTER SETTING`.
 
 ## Runtime cluster settings
 
@@ -223,9 +238,15 @@ SHOW CLUSTER SETTINGS LIKE 'ttl_%';
 RESET CLUSTER SETTING default_isolation_level;
 ```
 
-- Only `mutability = runtime` keys accept a change.
-- A change to the slow query log, the query result cache limits, or the abandoned-transaction reaper
-  applies to the running node. `query_result_cache_enabled` needs a restart.
+- A `runtime` key applies at the next statement, transaction start, or background pass. No restart.
+- A `restart` key fails with `CADB0400`, with six exceptions. The statement accepts
+  `transaction_idle_timeout_ms`, `transaction_reaper_interval_ms`,
+  `query_result_cache_default_ttl_ms`, `query_result_cache_max_entries`,
+  `query_result_cache_max_bytes`, and `query_result_cache_sweep_interval_ms`. `SHOW VARIABLES`
+  then shows the new value, but the node obeys the old value until it restarts.
+- `query_result_cache_enabled` is a `restart` key. Edit the file and restart.
+- `scope = node` keys may differ through each node's `config.yml`. A cluster setting still applies
+  to every node and overrides the file.
 - Values use `config.yml` spelling: lowercase booleans, plain numbers, enum tokens with
   underscores and no quotes, durations in whole milliseconds.
 - Any node accepts the statement. It commits through Raft and applies everywhere.

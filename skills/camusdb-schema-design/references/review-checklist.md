@@ -50,13 +50,13 @@ Give each fix as CamusDB SQL. Quote the exact error code when an item is an
 | A10 | Valid `CHECK` | Subquery, aggregate, `now()`, `gen_id()`, `gen_uuid_v4()`, `gen_uuid_v7()`, unknown column or function, wrong argument count, a non-boolean condition such as `CHECK (qty)`, a known type mismatch; a named column-level check | Rewrite as a deterministic one-row boolean predicate. Name it at table level. New checks fail at definition time. |
 | A11 | Valid `INCLUDE` | `INCLUDE` on a primary key; a column in both key and `INCLUDE`; `ASC`/`DESC` in `INCLUDE` | Fix the list. |
 | A12 | Index size limits | More than 32 key plus `INCLUDE` columns; `INCLUDE` payload above 4 KiB | Trim the index. |
-| A13 | No foreign syntax | `STORING`, hash-sharded index, `INTERVAL`, `ttl_expire_after`, a five-field cron, an expression in `ttl_expiration_expression`, `CYCLE` on a sequence, negative `INCREMENT` | Use the CamusDB form in [ddl-syntax.md](ddl-syntax.md). |
-| A14 | Identifiers quoted correctly | Identifiers in double quotes | Use backticks. Double quotes make a string. |
+| A13 | No foreign syntax | `STORING`, hash-sharded index, `ttl_expire_after`, a five-field cron, an expression in `ttl_expiration_expression`, `CYCLE` on a sequence, negative `INCREMENT`, a space instead of `T` in `TIMESTAMP '...'` | Use the CamusDB form in [ddl-syntax.md](ddl-syntax.md). |
+| A14 | Identifiers quoted correctly | Identifiers in double quotes; an unquoted reserved word as a name, such as `using`, `lateral`, `comment`, or a type keyword | Use backticks. Double quotes make a string. |
 | A15 | Documented DDL forms only | A bare `DROP INDEX name`; `CONSTRAINT x UNIQUE (a, b)`; inline `INDEX name (...)`; a column type change | Use `DROP INDEX name ON t` or `DROP INDEX t.name`, `UNIQUE KEY`, `KEY`. For a type change, add a new column, copy in batches, then drop the old one. |
-| A16 | Valid defaults | A function default with arguments; a type mismatch such as `gen_id()` on `UUID`; a string default longer than the column bound | Fix the default. |
+| A16 | Valid defaults | A function default with arguments; a type mismatch such as `gen_id()` on `UUID`; a string default longer than the column bound; a typed literal without parentheses, such as `DEFAULT DATE '2026-03-15'` | Fix the default. Write `DEFAULT (DATE '2026-03-15')`. |
 | A17 | `nextval` placement | `nextval` in `UPDATE ... SET`, a filter, a view body, a `CHECK`, or a nested `SELECT` without `FROM` | Use it only in `INSERT ... VALUES`, defaults, or a top-level `SELECT` without `FROM`. Otherwise `CADB0547`. |
 | A18 | Safe `ADD COLUMN` | `ADD COLUMN ... NOT NULL` with no `DEFAULT` on a table with rows | Add a `DEFAULT`, or add nullable, fill, then `SET NOT NULL`. Otherwise `CADB0301`. |
-| A19 | Safe drops | `DROP COLUMN` of an indexed column; `DROP COLUMN`, `DROP TABLE`, or `TRUNCATE` that breaks a foreign key | Drop the index or constraint first. Otherwise `CADB0530`. |
+| A19 | Safe drops and renames | `DROP COLUMN` of an indexed column; `DROP COLUMN`, `DROP TABLE`, or `TRUNCATE` that breaks a foreign key; `DROP COLUMN` or `RENAME COLUMN` of a column that a trigger names in its C# body or maps as a typed row | Drop the index, constraint, or trigger first. Otherwise `CADB0530`. |
 | A20 | Name collisions | Two names that differ only in case; a sequence named like a table or view; database `_system` or `information_schema` | Rename. |
 | A21 | Database exists | Table DDL before `CREATE DATABASE` | Add `CREATE DATABASE IF NOT EXISTS`. Otherwise `CADB0010`. |
 | A22 | Owned sequence untouched | `DROP SEQUENCE` on an identity sequence | Drop the column instead. Otherwise `CADB0548`. |
@@ -65,6 +65,7 @@ Give each fix as CamusDB SQL. Quote the exact error code when an item is an
 | A25 | No unsupported `JSONB` index | Expression index on `(doc ->> 'k')` | Not yet supported. Use a GIN index with `doc ->> 'k' = text`, or a typed column. |
 | A26 | Supported integer names | `INT16` or `INT32` | Use `SMALLINT`, `INT`, `BIGINT`, or `INT64`. |
 | A27 | No collation clause | `COLLATE ...` on a column or in a query | Remove it. Strings sort in binary UTF-16 order. Use `LOWER` for case-insensitive matches. |
+| A28 | No stored interval | An `INTERVAL` column; an interval as an array element; CTAS or a materialized view that projects an interval | `INTERVAL` is expression-only. Store `CAST(i AS STRING)` in a `STRING` column. Cast the text back to `INTERVAL` on read. |
 
 ## B. Hotspots and contention (HIGH)
 

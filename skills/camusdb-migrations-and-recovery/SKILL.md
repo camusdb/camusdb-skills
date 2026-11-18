@@ -1,6 +1,6 @@
 ---
 name: camusdb-migrations-and-recovery
-description: Plans and runs safe CamusDB schema changes and recovers lost data. Covers online DDL (ALTER TABLE, CREATE INDEX, DROP INDEX, DeleteOnly/WriteOnly/Public states, backfill), migration rehearsal on a branch (CREATE DATABASE ... BRANCH FROM, SHOW BRANCHES, SHOW ANCESTORS), batched backfills under the 20,000-mutation limit, AS OF SYSTEM TIME recovery, SHOW ORPHAN TABLES, SHOW ORPHAN DATABASES and RELINK TO, TRUNCATE recovery, physical backups and PITR (/v1/backups, /v1/restore, camus-cli backup, pitr_bootstrap_from), camus-dump, logical dump and reimport across storage revisions, Solarium and key_range_sharding, and WAL crash recovery. Use when writing or applying a migration, after an accidental DROP, DELETE, UPDATE or TRUNCATE, when setting up backups or retention, before a server upgrade, or when you see CADB0506, CADB0530, CADB0534, CADB0537, CADB0539, CADB0510, CADB0503, CADB0600, CADB0837 StorageCorrupted or a CADB07xx backup error.
+description: Plans and runs safe CamusDB schema changes and recovers lost data. Covers online DDL (ALTER TABLE, CREATE INDEX, DROP INDEX, DeleteOnly/WriteOnly/Public states, backfill), migration rehearsal on a branch (CREATE DATABASE ... BRANCH FROM, SHOW BRANCHES, SHOW ANCESTORS), batched backfills and UPDATE ... FROM under the 20,000-mutation limit, AS OF SYSTEM TIME recovery, SHOW ORPHAN TABLES, SHOW ORPHAN DATABASES and RELINK TO, TRUNCATE recovery, physical backups and PITR (/v1/backups, /v1/restore, camus-cli backup, pitr_bootstrap_from), camus-dump, logical dump and reimport across storage revisions, Solarium and key_range_sharding, and WAL crash recovery. Use when writing or applying a migration, after an accidental DROP, DELETE, UPDATE or TRUNCATE, when setting up backups or retention, before a server upgrade, or when you see CADB0506, CADB0530, CADB0534, CADB0537, CADB0539, CADB0510, CADB0503, CADB0600, CADB0847 SnapshotTooOld, CADB0837 StorageCorrupted or a CADB07xx backup error.
 ---
 
 # CamusDB migrations and recovery
@@ -31,7 +31,7 @@ Public docs: https://camusdb.github.io/docs/intro
 
 | Situation | Tool | Window |
 | --- | --- | --- |
-| Rows changed or deleted by mistake | `AS OF SYSTEM TIME` + `INSERT ... SELECT` / CTAS | MVCC history, about 1 hour by default |
+| Rows changed or deleted by mistake | `AS OF SYSTEM TIME` + CTAS, then `INSERT ... SELECT` or `UPDATE ... FROM` | MVCC history, about 1 hour by default |
 | `DROP TABLE` or `DROP DATABASE` (root database) | `SHOW ORPHAN ...` + `RELINK TO` | `orphan_retention_ms`, 7 days by default |
 | `TRUNCATE TABLE` | `SHOW ORPHAN TABLES` (`retired contents`) + `RELINK TO` | `orphan_retention_ms` |
 | Node or cluster data loss, or a point before the MVCC window | Physical backup + offline restore | The chain's recoverable range |
@@ -113,28 +113,20 @@ A batch that loses a row lock to a writer is retried without limit. The batch
 halves on each loss. A table under sustained writes is still indexed or filled,
 only more slowly. The caller of the statement waits for the whole backfill.
 
-Supported `ALTER TABLE` and index forms (from the docs):
+Common `ALTER TABLE` and index forms (the full catalog is in the reference):
 
 ```sql
 ALTER TABLE robots ADD COLUMN model STRING NULL;
 ALTER TABLE robots DROP COLUMN model;
-ALTER TABLE robots ADD PRIMARY KEY (id);
-ALTER TABLE robots DROP PRIMARY KEY;
 ALTER TABLE robots RENAME TO machines;
 ALTER TABLE machines RENAME COLUMN name TO display_name;
 ALTER TABLE robots ADD INDEX robots_kind_idx (kind) INCLUDE (name, year);
-ALTER TABLE robots ADD UNIQUE INDEX robots_code_year_uq (code, year);
 ALTER TABLE robots DROP INDEX robots_kind_idx;
-DROP INDEX robots_kind_idx ON robots;
 DROP INDEX IF EXISTS robots.robots_kind_idx;
-CREATE INDEX events_payload_gin ON events USING GIN (payload);
 ALTER TABLE robots RENAME INDEX robots_name_idx TO robots_display_name_idx;
 ALTER TABLE products ADD CONSTRAINT positive_price CHECK (price > 0);
 ALTER TABLE weather ADD CONSTRAINT weather_city_fk FOREIGN KEY (city) REFERENCES cities (name);
-ALTER TABLE products DROP CONSTRAINT positive_price;
 ALTER TABLE employees ALTER COLUMN name SET NOT NULL;
-ALTER TABLE employees ALTER COLUMN name DROP NOT NULL;
-ALTER TABLE docs ALTER COLUMN image SET STORAGE PLAIN;
 ALTER TABLE docs REWRITE STORAGE;
 ALTER TABLE sessions SET (ttl_expiration_expression = 'expires_at', ttl_job_cron = '@hourly');
 ```
@@ -142,7 +134,8 @@ ALTER TABLE sessions SET (ttl_expiration_expression = 'expires_at', ttl_job_cron
 Rules the agent must respect:
 
 - **Renames are metadata only.** Renaming a table, column, or index moves no
-  data. Foreign keys follow the rename.
+  data. Foreign keys follow the rename. A trigger that names a column blocks
+  its rename and its drop with `CADB0530`. Drop or rewrite the trigger first.
 - **A NOT NULL column on a non-empty table needs a default.** Without one, the
   statement fails with `CADB0301`. Otherwise, add it nullable, backfill in
   batches, then run `ALTER COLUMN ... SET NOT NULL`.
@@ -178,8 +171,7 @@ Rules the agent must respect:
 - **Quiesce writers before adding a foreign key.** A long transaction that
   wrote an orphan row before the constraint existed can still commit it.
 
-Full DDL rules, states, limits, and error codes:
-[references/online-ddl.md](references/online-ddl.md).
+Full DDL rules, states, limits, and error codes: [references/online-ddl.md](references/online-ddl.md).
 
 ## Key rules for data backfills
 
@@ -205,6 +197,9 @@ LIMIT 4000;
 
 `UPDATE` and `DELETE` require a `WHERE` clause and accept `LIMIT`. To empty a
 whole table, use `TRUNCATE` instead of `DELETE`. It costs no mutations.
+
+`UPDATE ... FROM` and `DELETE ... USING` read other tables. They take no
+`LIMIT`, so slice them with a `WHERE` range. See [references/online-ddl.md](references/online-ddl.md#fill-a-column-from-another-table).
 
 `INSERT ... SELECT` and the row load of `CREATE TABLE ... AS SELECT` are user
 writes. They also obey the limit. For a large copy, run CTAS `WITH NO DATA`,
@@ -236,10 +231,13 @@ RESET CLUSTER SETTING max_mutations_per_transaction;
   CTAS to write the old data into the present.
 - **Use an absolute timestamp for multi-statement recovery.** A relative
   offset such as `'-2h'` moves with each statement.
-- **An empty result can mean "history reclaimed".** There is no "too old"
-  error. A CTAS or `INSERT ... SELECT` from an empty snapshot returns a warning.
+- **History past retention fails with `CADB0847 SnapshotTooOld`.** A retry at
+  the same timestamp fails again. A copy that reads no rows returns a warning.
 - **After a `TRUNCATE`,** time travel before the cut fails with `CADB0537`.
   Use `SHOW ORPHAN TABLES` and `RELINK TO` instead.
+- **Put changed values back from a side table.** `AS OF SYSTEM TIME` does not
+  work directly with `UPDATE`. Copy the old rows with CTAS, then run
+  `UPDATE ... FROM` the copy.
 - **`RELINK TO` always creates a new name.** The orphan id is an opaque string.
   Recovered tables come back without foreign keys. Add them again with
   `ALTER TABLE ... ADD CONSTRAINT`.
@@ -283,8 +281,9 @@ CREATE TABLE orders_recovered RELINK TO 'A0';
 An upgrade can change how stored objects behave. New `INT` and `SMALLINT`
 columns enforce their range, but old ones do not. Stored `LIKE` patterns take
 the new escape rules. Stored views and `CHECK`s keep their old operator
-grouping. Rehearse the upgrade on a branch, inspect `SHOW CREATE TABLE` and
-`SHOW CREATE VIEW`, and keep all nodes on one version when results must agree.
+grouping. `USING` and `LATERAL` are now reserved words. Rehearse the upgrade
+on a branch, inspect `SHOW CREATE TABLE` and `SHOW CREATE VIEW`, and keep all
+nodes on one version when results must agree.
 Read [references/upgrade-behavior.md](references/upgrade-behavior.md) first.
 
 ## Choices you cannot change in place
@@ -306,7 +305,7 @@ Each of these needs a logical dump and reimport. See
 - Running a migration straight on production without a branch rehearsal.
 - Adding `FORCE` to a `DROP` "to clean up". It removes the safety net.
 - Assuming time travel reaches days back. By default history follows
-  `kahuna.pitr_window_seconds` (3600 seconds).
+  `kahuna.pitr_window_seconds` (3600 seconds). Older reads fail with `CADB0847`.
 - Using `NOT IN (SELECT id FROM orders)` in a time-travel `INSERT ... SELECT`.
   Every subquery reads the same historical snapshot, not the live table. Copy
   the snapshot to a side table first, then diff against the live table.
@@ -327,7 +326,8 @@ Each of these needs a logical dump and reimport. See
 ## References
 
 - [references/online-ddl.md](references/online-ddl.md): read before writing
-  any `ALTER TABLE` or index migration, or when a DDL error appears.
+  any `ALTER TABLE`, index, or `UPDATE ... FROM` migration, or when a DDL
+  error appears.
 - [references/branching.md](references/branching.md): read when creating,
   inspecting, or dropping branches.
 - [references/recovery-playbook.md](references/recovery-playbook.md): read
@@ -346,4 +346,5 @@ Public docs, under `https://camusdb.github.io/docs/` (append the page name):
 `recover-dropped-objects`, `truncate-table`, `backup-and-restore`, `camus-dump`,
 `logical-dump-and-reimport`, `key-range-sharding`, `growing-a-one-node-cluster`,
 `configuration`, `wal-recovery`, `cluster#check-storage-health`, `views`,
-`databases`.
+`databases`, `sql-writes`, `joins-and-subqueries`, `error-codes`, and
+`csharp-extensions`.

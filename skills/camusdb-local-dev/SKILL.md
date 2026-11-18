@@ -1,6 +1,6 @@
 ---
 name: camusdb-local-dev
-description: Sets up CamusDB for local development and testing, and drives its developer tools. Covers CamusDB.Server (dotnet tool, Homebrew brew install camusdb/tap/camusdb, brew services, camusdb init, ~/.camusdb/config.yml), the camusdb/camusdb Docker image, the compose cluster (docker/local.yml), growing a one-node cluster, ports 5095/5096/7070/7141, --grpc-port, camus-cli (-c, -e, -f, --tui), the Web Console, operator dashboard, browser playground, config.yml keys (data_dir, memory_profile, key_range_sharding, kahuna.storage, Solarium, max_statement_bytes), SHOW VARIABLES, SET CLUSTER SETTING, authentication (CAMUSDB_AUTH_ENABLED, CREATE USER, CADB0516 to CADB0519), the MCP server (CAMUS_MCP_ENDPOINT, .mcp.json), load tests (camus-cli workload), per-PR databases with CREATE DATABASE ... BRANCH FROM, Testcontainers, .NET Aspire (AddCamusDB, AddCamusDBCluster), and the Kubernetes Operator. Use it when a developer installs, starts, configures, connects to, secures, or load-tests a local CamusDB node or cluster.
+description: Sets up and drives CamusDB for local development and testing. Covers CamusDB.Server (dotnet tool, Homebrew brew install camusdb/tap/camusdb, brew services, camusdb init, ~/.camusdb/config.yml), the camusdb/camusdb Docker image, the compose cluster (docker/local.yml), growing a one-node cluster, ports 5095/5096/7070/7141, --grpc-port, camus-cli (-c, -e, -f, --tui), the Web Console, operator dashboard, browser playground, config.yml keys (data_dir, memory_profile, key_range_sharding, kahuna.storage, Solarium, max_statement_bytes), SHOW VARIABLES, SET CLUSTER SETTING, authentication (CAMUSDB_AUTH_ENABLED, CREATE USER, CADB0516 to CADB0519), the MCP server (CAMUS_MCP_ENDPOINT, .mcp.json), load and chaos tests (camus-cli workload, Caraxes), per-PR databases with CREATE DATABASE ... BRANCH FROM, Testcontainers, .NET Aspire (AddCamusDB, AddCamusDBCluster), and the Kubernetes Operator. Use it when a developer installs, starts, configures, connects to, secures, or load-tests a local CamusDB node or cluster.
 ---
 
 # CamusDB local development
@@ -157,7 +157,8 @@ slow_query_log_enabled: true
 SHOW VARIABLES LIKE 'memory_%';
 ```
 
-The `source` column shows `default`, `config`, `env`, `cli`, or `cluster`. Read
+The `source` column shows `default`, `config`, `env`, `cli`, or `cluster`. It does not list
+`mode`, `node_name`, ports, or `peers`; read the file or the startup banner for those. Read
 `references/configuration.md` for defaults, flags, and validation errors.
 
 ## Change settings at runtime
@@ -173,6 +174,7 @@ RESET CLUSTER SETTING max_mutations_per_transaction;
 ```
 
 - A `restart` key, such as `data_dir` or any `kahuna.*` key, fails with `CADB0400`. Edit the file and restart.
+  Six `restart` keys are accepted but apply only after a restart (see `references/configuration.md`).
 - An invariant break across two fields fails with `CADB0600` `InvalidConfig`.
 - `RESET` removes the overlay. Each node falls back to its own local value.
 - `SHOW VARIABLES` is node-local. Run it on every node to confirm a fleet change.
@@ -191,12 +193,7 @@ export CAMUSDB_BOOTSTRAP_USER=admin                          # used only while n
 export CAMUSDB_BOOTSTRAP_PASSWORD="$(openssl rand -base64 24)"
 export CAMUSDB_NODE_SECRET="$(openssl rand -hex 32)"         # cluster only
 camusdb
-```
-
-Then, as the bootstrap superuser:
-
-```bash
-camus-cli -u admin            # prompts for the password without echo
+camus-cli -u admin     # second terminal: bootstrap superuser; prompts for the password without echo
 ```
 
 ```sql
@@ -249,7 +246,7 @@ Register it in the client. This block is the generic form (Claude Code reads it 
 }
 ```
 
-- `CAMUS_MCP_ENDPOINT` defaults to `http://localhost:5095`. Set it for any other node.
+- Always set `CAMUS_MCP_ENDPOINT`. The docs and the camusdb-mcp source disagree on its default.
 - Point the agent at a branch, not at the source database: `CREATE DATABASE app_agent BRANCH FROM app;`.
 - With auth on, add `CAMUS_MCP_USER` and `CAMUS_MCP_PASSWORD`, and grant only `SELECT` for a read-only agent.
 - `select_query` accepts only `SELECT`, `SHOW`, and `DESCRIBE`. It rejects row-locking reads such as
@@ -319,9 +316,9 @@ Read `references/tools.md` for details and limits.
 
 - `references/installation.md`: NuGet, Homebrew, and Docker install, update, file and log locations. Read before installing or upgrading a node.
 - `references/camus-cli.md`: all camus-cli flags, meta commands, history, output formats. Read before scripting the CLI.
-- `references/configuration.md`: discovery, precedence, key defaults, flags, storage backends, request limits, auth environment, Docker auth, validation errors. Read before editing `config.yml`.
+- `references/configuration.md`: discovery, precedence, key defaults, flags, storage backends, request limits, `SHOW VARIABLES` output, runtime settings, auth environment, Docker auth, validation errors. Read before editing `config.yml` or running `SET CLUSTER SETTING`.
 - `references/mcp-server.md`: MCP build, environment variables, Claude Code / Codex / Cursor config, tools. Read before wiring an agent.
-- `references/local-cluster.md`: Aspire cluster, compose cluster ports, manual cluster flags, cluster sizing, growing a one-node cluster, storage health, manual range split, leadership transfer, Caraxes. Read before running more than one node.
+- `references/local-cluster.md`: when to use cluster mode, Aspire cluster, compose cluster ports, manual cluster flags, cluster sizing, growing a one-node cluster, storage health, manual range split, leadership transfer, Caraxes. Read before running more than one node.
 - `references/tools.md`: Web Console, operator dashboard, browser playground, workload utility. Read before using any of them.
 
 Public docs:
@@ -330,6 +327,8 @@ Public docs:
 - https://camusdb.github.io/docs/server-installation
 - https://camusdb.github.io/docs/camus-cli
 - https://camusdb.github.io/docs/configuration
+- https://camusdb.github.io/docs/settings-reference
+- https://camusdb.github.io/docs/show-variables
 - https://camusdb.github.io/docs/cluster
 - https://camusdb.github.io/docs/growing-a-one-node-cluster
 - https://camusdb.github.io/docs/key-range-sharding
@@ -338,6 +337,7 @@ Public docs:
 - https://camusdb.github.io/docs/mcp-server
 - https://camusdb.github.io/docs/database-branching
 - https://camusdb.github.io/docs/workload-utility
+- https://camusdb.github.io/docs/caraxes
 - https://camusdb.github.io/docs/web-console
 - https://camusdb.github.io/docs/operator-dashboard
 - https://camusdb.github.io/docs/browser-playground

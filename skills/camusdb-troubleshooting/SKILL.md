@@ -1,6 +1,6 @@
 ---
 name: camusdb-troubleshooting
-description: Diagnoses CamusDB errors and runtime problems. Explains the cause, the fix, and the retry rule for any CADBxxxx error code, such as CADB0502 TransactionConflict, CADB0504, CADB0509, CADB0506, CADB0503, CADB0536, CADB0549, CADB0555, CADB0556, CADB0558, CADB0824 TransactionRollbackOnly, CADB0400, CADB0406, CADB0420, CADB0421, CADB0600, CADB0517, CADB0837 StorageCorrupted, or inline C# codes CADB0838 to CADB0846. Guides diagnosis of slow, stuck, or overloaded workloads with SHOW QUERIES, SHOW CLUSTER QUERIES, SHOW CONNECTIONS, CANCEL QUERY, SHOW SLOW QUERIES, SHOW STATEMENT STATS, SHOW INDEX USAGE, SHOW ENGINE STATS, SHOW VARIABLES, /v1/cluster/health storage faults, Prometheus and OpenTelemetry diagnostics, and the operator dashboard. Use when a user pastes a CamusDB error, an HTTP "status":"failed" body, a gRPC camus-error-code trailer, or a Kommander "Slow dispatch" warning, or reports latency spikes, hung queries, conflict storms, refused writes, statements that fail after an upgrade, or nodes that disagree.
+description: Diagnoses CamusDB errors and runtime problems. Explains the cause, fix, and retry rule of any CADBxxxx code, such as CADB0502 TransactionConflict, CADB0504, CADB0509, CADB0506, CADB0503, CADB0536, CADB0549, CADB0555, CADB0556, CADB0558, CADB0824 TransactionRollbackOnly, CADB0847 SnapshotTooOld, CADB0400, CADB0406, CADB0420, CADB0421, CADB0560, CADB0600, CADB0517, CADB0837 StorageCorrupted, or inline C# codes CADB0838 to CADB0846. Diagnoses slow, stuck, or overloaded workloads with SHOW QUERIES, SHOW CLUSTER QUERIES, SHOW CONNECTIONS, CANCEL QUERY, SHOW SLOW QUERIES, SHOW STATEMENT STATS, SHOW INDEX USAGE, SHOW ENGINE STATS, SHOW VARIABLES, /v1/cluster/health storage faults, Prometheus and OpenTelemetry, and the operator dashboard. Use when a user pastes a CamusDB error, an HTTP "status":"failed" body, a gRPC camus-error-code trailer, or a Kommander "Slow dispatch" warning, or reports latency spikes, hung queries, conflict storms, refused writes, statements that fail after an upgrade, or nodes that disagree.
 ---
 
 # CamusDB troubleshooting
@@ -48,10 +48,10 @@ skill. For writing retry code, use the `camusdb-transactions` skill.
 | `CADB00xx` | Catalog, metadata, storage state. Many are corruption signals. |
 | `CADB03xx` | Integrity constraints: unique, not null, check, foreign key. |
 | `CADB04xx` | Invalid SQL, input, or expression shape. |
-| `CADB05xx` | Transactions, schema catch-up, prepared statements, auth, views, sequences, query cancel, row locks, node limits. |
+| `CADB05xx` | Transactions, schema catch-up, prepared statements, auth, views, sequences, query cancel, row locks, node limits, recursive query limits. |
 | `CADB06xx` | Configuration validation. |
 | `CADB07xx` | Backup and point-in-time recovery. |
-| `CADB08xx` | C# extensions, inline functions, and triggers. Also `CADB0824`, an aborted transaction, and `CADB0837`, detected storage damage. |
+| `CADB08xx` | C# extensions, inline functions, and triggers. Also `CADB0824`, an aborted transaction, `CADB0837`, detected storage damage, and `CADB0847`, a snapshot older than retained history. |
 
 ## Retry classes
 
@@ -61,7 +61,7 @@ skill. For writing retry code, use the `camusdb-transactions` skill.
 | Finalize | `CADB0509` | The driver's commit or rollback resends the same finalize. If it still fails, resend it for the same transaction id. Never replay. |
 | Retry | `CADB0503`, `CADB0520` (after re-prepare), `CADB0532`, `CADB0534`, `CADB0535`, `CADB0558`, `CADB070A`, `CADB070D` | Retry after the condition clears. |
 | After fix | `CADB0516`, `CADB0518`, `CADB0536`, `CADB0817`, `CADB0834`, `CADB0845` | Fresh credentials, wait out the rate limit, free disk, or deploy the extension file. Then retry. |
-| Fix first | `CADB0506`, `CADB0555`, `CADB0556`, `CADB0824`, and most `03xx`, `04xx`, `05xx` codes | Change the request, data, or schema. A retry fails again. |
+| Fix first | `CADB0506`, `CADB0555`, `CADB0556`, `CADB0560`, `CADB0824`, `CADB0847`, and most `03xx`, `04xx`, `05xx` codes | Change the request, data, or schema. A retry fails again. For `CADB0847`, read at a newer timestamp. |
 | Operator | `CADB0014`, `CADB0099`, `CADB0559`, `CADB0701`, `CADB0704`, `CADB0706`, `CADB070F`, `CADB0837` | Investigate. Collect logs. Never retry `CADB0837` or read it as an empty result. |
 
 ## The most common errors
@@ -133,6 +133,16 @@ retryable. Check `GET /v1/cluster/health` and keep the node out of service.
 failure, refused construct, budget, feature off, or a missing owner. See the
 `camusdb-csharp-extensions` skill.
 
+**`CADB0847 SnapshotTooOld`.** Retention removed history that a snapshot read
+needs: an `AS OF SYSTEM TIME` read, or a long snapshot transaction. CamusDB
+fails instead of returning missing rows. Do not retry the same timestamp. Read
+at a newer one, or begin a new transaction. Raise retention for older history.
+
+**`CADB0560 RecursiveQueryLimitExceeded`.** A recursive CTE passed
+`max_recursive_cte_iterations` or `max_recursive_cte_rows`. A retry hits the
+same limit. Add a stopping predicate, or raise the limit after you check the
+query.
+
 **`CADB0538 StatementNotAllowedInTransaction`.** `TRUNCATE`, `ALTER TABLE ...
 REWRITE STORAGE`, or `ALTER SEQUENCE ... RESTART` ran inside `BEGIN`. The refusal
 aborts the transaction. Roll back, then run it in autocommit.
@@ -163,6 +173,8 @@ aborts the transaction. Roll back, then run it in autocommit.
 | Statement fails with `CADB0400` after an upgrade | The message and the SQL | 20 |
 | `CADB0406` at an invisible character | The line and column in the message | 21 |
 | `CADB0837`, or health endpoint returns 503 | `GET /v1/cluster/health` body | 22 |
+| Historical or snapshot read fails with `CADB0847` | Read timestamp, retention settings | 23 |
+| Recursive CTE fails with `CADB0560` | The stopping predicate, the two limits | 24 |
 
 ## Observability tools
 
@@ -251,9 +263,10 @@ skill.
 - **Double-quoted identifiers.** In CamusDB, double quotes make a string
   literal. Use backticks for identifiers. A wrong quote can give wrong results
   with no error.
-- **Expecting a "snapshot too old" error.** An `AS OF SYSTEM TIME` read past
-  retained history returns an empty result. Only a read before a `TRUNCATE`
-  cut errors, with `CADB0537`.
+- **Expecting an empty result for history past retention, or retrying it.**
+  CamusDB fails with `CADB0847` instead of returning missing rows. Pruned
+  history does not come back, so read at a newer timestamp. A read before a
+  `TRUNCATE` cut is a different error, `CADB0537`.
 
 ## References
 
@@ -262,7 +275,7 @@ Read these files when the task needs the detail:
 - [references/error-codes.md](references/error-codes.md): every code with name,
   meaning, fix, and retry class. Read it for any `CADBxxxx` code.
 - [references/symptom-playbooks.md](references/symptom-playbooks.md): ordered
-  checks and fixes for 22 symptoms.
+  checks and fixes for 24 symptoms.
 - [references/observability.md](references/observability.md): columns,
   metrics, settings, and permissions of each tool.
 
@@ -283,6 +296,9 @@ Public docs:
 - https://camusdb.github.io/docs/sql-transactions#failed-statements
 - https://camusdb.github.io/docs/transaction-limits
 - https://camusdb.github.io/docs/data-types#errors-before-reading-rows
+- https://camusdb.github.io/docs/time-travel-reads
+- https://camusdb.github.io/docs/sql-queries#recursive-ctes
+- https://camusdb.github.io/docs/statement-nesting-limit
 - https://camusdb.github.io/docs/sql-expression-syntax
 - https://camusdb.github.io/docs/cluster#check-storage-health
 - https://camusdb.github.io/docs/csharp-extensions

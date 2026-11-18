@@ -1,7 +1,7 @@
 # CamusDB type mapping for .NET
 
-Read this file before you bind or read OID, UUID, NUMERIC, JSONB, FLOAT, DATE, DATETIME, BYTES, or ARRAY values.
-Source docs: https://camusdb.github.io/docs/dotnet-driver#data-types and https://camusdb.github.io/docs/ef-core#type-mapping
+Read this file before you bind or read OID, UUID, NUMERIC, JSONB, FLOAT, DATE, DATETIME, INTERVAL, BYTES, or ARRAY values.
+Source docs: https://camusdb.github.io/docs/dotnet-driver#data-types, https://camusdb.github.io/docs/ef-core#type-mapping, and https://camusdb.github.io/docs/data-types#intervals
 
 ## SQL type to driver type
 
@@ -21,6 +21,7 @@ Source docs: https://camusdb.github.io/docs/dotnet-driver#data-types and https:/
 | `ARRAY(T)` | `Array` (10) | `IEnumerable` of a scalar type | `object?[]` |
 | `JSONB`, `JSON` | `Jsonb` (13) | `JsonDocument`, `JsonElement`, `JsonNode`, `string` typed `Jsonb` | `GetString`, `GetValue`, `GetFieldValue<JsonElement>` |
 | `NULL` | `Null` (0) | `null`, `DBNull.Value` | `IsDBNull` |
+| `INTERVAL` (expressions only) | not documented | Bind a number with a unit; see "INTERVAL" | `GetString`: ISO-8601 text |
 
 ## Rules per type
 
@@ -81,6 +82,26 @@ Source docs: https://camusdb.github.io/docs/dotnet-driver#data-types and https:/
 - `DATE` is stored at midnight UTC.
 - `DATETIME` reads back with `DateTimeKind.Utc`.
 - On the wire both are .NET ticks in UTC.
+- Typed literals give an expression its type: `DATE '2026-03-15'`, `TIMESTAMP '2026-03-15T12:00:00Z'`.
+  Put a `T` between date and time. A space separator is rejected.
+
+### INTERVAL
+
+`INTERVAL` is a span of months, days, and microseconds. Use it in calculations only.
+
+```sql
+SELECT * FROM orders WHERE created_at > now() - INTERVAL @n DAY;
+SELECT finished_at - started_at AS duration FROM jobs;
+```
+
+- The driver returns an interval result as an ISO-8601 string, such as `P1Y2M3DT4H5M6.5S`.
+- Zero is `PT0S`. Mixed signs stay, for example `P-1DT2H`.
+- `CAST(i AS STRING)` and `||` give the same text.
+- A table column cannot have the `INTERVAL` type. You cannot write an interval to a column, use it as an
+  array element, or keep it with `CREATE TABLE AS SELECT` or a materialized view. A regular view can return one.
+- To store an interval, cast it to `STRING`. Cast the stored text back to `INTERVAL` when you read it.
+- To pass a span as a parameter, bind a number and give it a unit (`INTERVAL @n DAY`), or multiply it
+  by an interval (`@days * INTERVAL '1 day'`).
 
 ### BYTES and vectors
 
@@ -132,5 +153,6 @@ Source docs: https://camusdb.github.io/docs/dotnet-driver#data-types and https:/
 
 - REST `ColumnValue.type` uses the integer values in the first table.
 - REST writes a non-finite float as the string `"Infinity"`, `"-Infinity"`, or `"NaN"`.
+- A vector parameter is a `BYTES` value: REST `type` 7 with base64 `bytesValue` (`[0.0, 1.0]` is `"AAAAAAAAgD8="`), gRPC `bytes_value`.
 - gRPC uses the `Value` oneof: `id_value`, `int64_value`, `string_value`, `bool_value`, `float64_value`, `float32_value`, `bytes_value`, `date_value`, `datetime_value`, `array_value`, `uuid_value`, `numeric_value`, `json_value`, `null_value`.
 - gRPC sends a UUID as 16 big-endian bytes and dates as UTC ticks: `ticks = 621355968000000000 + unix_millis * 10000`.

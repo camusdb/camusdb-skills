@@ -231,6 +231,7 @@ SHOW ENGINE STATS LIKE 'raft.executor%';
 SHOW ENGINE STATS LIKE 'kahuna.kv.write%';
 SHOW ENGINE STATS LIKE 'kahuna.tx_admission%';
 SHOW ENGINE STATS LIKE 'kahuna.range%';
+SHOW ENGINE STATS LIKE 'kahuna.collect%';
 ```
 
 | Column | Meaning |
@@ -268,14 +269,13 @@ Useful metrics:
 | `raft.transport.channels_in_transient_failure` | Inter-node channels in TransientFailure now, tagged by peer. Use it to find an unreachable or stuck peer. |
 | `kahuna.kv.write.batches`, `kahuna.kv.write.entries` | Write aggregation. Entries / batches = coalescing factor. |
 | `kahuna.backup.*` | Backup or PITR cycles. |
+| `kahuna.collect.cycles`, `kahuna.collect.cycle.duration` | Kahuna collection cycles, and how long each held the actor's mailbox thread. A duration spike lines up with the latency spike it causes. |
+| `kahuna.collect.evicted`, `kahuna.collect.inspected` | Entries reclaimed (tagged `reason`) and entries walked (tagged `scan`). `inspected` far above `evicted` means the cycles spend their budget on pinned entries. |
+| `kahuna.collect.backlogged` | Cycles that carried work past their budget. Close to `cycles` means collection cannot keep up. |
 | `kahuna.tx_admission.queued` | Waiters at the admission gate, by priority. Zero means the gate does not bind. |
 | `kahuna.tx_admission.in_flight`, `max_queue_depth`, `admitted`, `aged_promotions`, `abandoned_while_waiting`, `rejected_queue_full` | Admission detail. |
 | `statement_stats.shapes`, `statement_stats.dropped` | Shapes held, and new shapes refused because the table was full. A moving `dropped` means `SHOW STATEMENT STATS` is incomplete. Present when statement statistics were enabled. |
 | `kahuna.range.splits`, `kahuna.range.split.indivisible_refusals`, `kahuna.range.split.no_relief_skips`, `kahuna.range.split.settle_skips`, `kahuna.range.merge.warm_skips` | Range splitter activity, with key-range sharding. Pair with `SHOW RANGES`. |
-
-The `kahuna.collect.*` metrics arrive only in a Kahuna release after `0.9.8`.
-Until CamusDB uses that release, a collection tick shows only as an unexplained
-gap.
 
 ## Storage health endpoint
 
@@ -320,7 +320,8 @@ Facts:
 - Not listed: `mode`, `node_name`, ports, `peers`, `http_peers`, certificate
   paths, the `diagnostics:` section, and computed values.
 - Read-only. Change with `SET CLUSTER SETTING name = value`. Revert with
-  `RESET CLUSTER SETTING name`. A `config.yml` edit needs a restart.
+  `RESET CLUSTER SETTING name`. Both need a superuser. A `config.yml` edit needs
+  a restart.
 - A `restart` setting changed at runtime shows the new value, but the node obeys
   the old one until it restarts.
 - `key_range_sharding` left unset follows the cluster's recorded routing mode. It

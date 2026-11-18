@@ -207,6 +207,10 @@ kahuna:
   `BACKGROUND` transaction reaches `HIGH` after about three seconds.
 - A transaction that waits past the admission budget fails with `CADB0504`.
   Nothing started, so a retry is safe. Use backoff.
+- Keep the admission budget short, in seconds. A longer budget does not raise
+  throughput. The top-level `transaction_admission_wait_ms` (runtime, cluster)
+  sets the budget. Its default, `0`, uses `kahuna.default_admission_wait_ms`.
+  `kahuna.max_admission_wait_ms` clamps any caller-supplied budget.
 - Watch `kahuna.tx_admission.queued`. Zero means the gate does not bind.
 
 A read-committed autocommit `SELECT` holds no session. The gate never defers it.

@@ -88,6 +88,9 @@ Refused in triggers only:
 
 - An `await` on anything other than a `Sql` operation.
 - `Task.Run`, `Task.Delay`, and an `await` inside a lambda or local function.
+- SQL text in `Sql.ExecuteAsync` or `Sql.QueryAsync` that is not a
+  compile-time constant, and these methods taken as delegates. See "SQL text
+  in a trigger".
 
 Triggers may use `DateTime.UtcNow` and `Guid.NewGuid`.
 
@@ -101,7 +104,7 @@ and column.
 | --- | --- |
 | `NEW`, `OLD` | Generated nullable row properties, typed from the table. `NEW` is null for `DELETE`. `OLD` is null for `INSERT`. |
 | `Operation`, `Timing`, `TableName`, `TriggerName` | The event and the trigger metadata. |
-| `Sql` | Bind typed parameters with `Set`, then `await ExecuteAsync` or `QueryAsync`. Parameters clear after that SQL operation. |
+| `Sql` | Bind typed parameters with `Set`, then `await ExecuteAsync` or `QueryAsync` with constant SQL text. Parameters clear after that SQL operation. |
 | `Context` | The `ITriggerContext` row API. Use it for columns with no generated property. |
 | An inline-function name of this database | Call it as a C# method. Its NULL rule and budget apply. |
 
@@ -120,6 +123,42 @@ Row rules:
 
 - Change `NEW` only in `BEFORE INSERT` or `BEFORE UPDATE`.
 - `OLD` is read-only. Rows in an `AFTER` trigger are read-only.
+
+## SQL text in a trigger
+
+The SQL text for `Sql.ExecuteAsync` or `Sql.QueryAsync` must be a compile-time
+constant: a literal, or literals joined with `+`. Pass values with `Sql.Set`.
+
+```csharp
+await Sql.Set("note", NEW!.note)
+    .ExecuteAsync("UPDATE audit_notes SET note = @note WHERE id = 1");
+```
+
+- SQL text built from row values fails with `CADB0839`.
+- Taking `ExecuteAsync` or `QueryAsync` as a delegate also fails with
+  `CADB0839`.
+- The SQL runs with the trigger owner's privileges. Text joined from untrusted
+  values would expose those rights.
+
+## Trigger recompilation and ownership
+
+- The first fire after a table change or an inline-function change recompiles
+  the body on each node.
+- Dropping or renaming a column that the body names fails with `CADB0530`.
+- Dropping an inline function that the body calls, or replacing it with other
+  parameter or result types, fails with `CADB0844`. Drop or rewrite the
+  trigger first.
+- These checks match names in the source conservatively. A local variable
+  with the same name also matches. A string equal to a column name counts as a
+  reference.
+- Column type changes are not checked. If the body no longer compiles, each
+  write that fires it fails with `CADB0845` until you replace the trigger.
+- If the owner is dropped, each fire fails with `CADB0846`.
+- A trigger created with authentication off has no owner. `SHOW TRIGGERS`
+  shows an empty owner. After authentication is enabled, its nested SQL fails
+  with `CADB0846`, even when a superuser fires it. A `BEFORE` trigger that only
+  changes `NEW` still works. A superuser can drop the trigger and create it
+  again under an owner with the needed grants.
 
 ## Budgets
 

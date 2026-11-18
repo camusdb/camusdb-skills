@@ -1,6 +1,6 @@
 ---
 name: camusdb-schema-design
-description: Designs and reviews CamusDB schemas. Covers CREATE TABLE, primary keys, CREATE INDEX with INCLUDE covering columns, GIN indexes, DROP INDEX, column types (OID, UUID, INT64, BIGINT, INT, SMALLINT, NUMERIC, STRING(N), CHAR(N), BYTES, DATETIME, ARRAY, JSONB), defaults such as gen_id(), gen_uuid_v4() and gen_uuid_v7(), CHECK and FOREIGN KEY constraints, CREATE SEQUENCE, SERIAL and identity columns, STORAGE strategies for large values, row-level TTL (ttl_expiration_expression), and COMMENT ON. Applies the CamusDB best practices for hotspots under hash routing and key_range_sharding. Use when writing or changing CamusDB DDL or a migration, when choosing a primary key, an index, or a column type, when auditing an existing schema or migration file (review mode), or when DDL fails with CADB0400, CADB0302, CADB0414, CADB0415, CADB0416, CADB0530 or CADB0533, or writes hit CADB0418, CADB0420, CADB0421, CADB0502 on a hot row or CADB0506 from too many index mutations.
+description: Designs and reviews CamusDB schemas. Covers CREATE TABLE, primary keys, CREATE INDEX with INCLUDE covering columns, GIN indexes, DROP INDEX, column types (OID, UUID, INT64, BIGINT, INT, SMALLINT, NUMERIC, STRING(N), CHAR(N), BYTES, DATETIME, ARRAY, JSONB; INTERVAL is expression-only), defaults such as gen_id(), gen_uuid_v4() and gen_uuid_v7(), CHECK and FOREIGN KEY constraints, CREATE SEQUENCE, SERIAL and identity columns, STORAGE strategies for large values, row-level TTL (ttl_expiration_expression), and COMMENT ON. Applies the CamusDB best practices for hotspots under hash routing and key_range_sharding. Use when writing or changing CamusDB DDL or a migration, when choosing a primary key, an index, or a column type, when auditing an existing schema or migration file (review mode), or when DDL fails with CADB0400, CADB0302, CADB0414, CADB0415, CADB0416, CADB0530 or CADB0533, or writes hit CADB0418, CADB0420, CADB0421, CADB0502 on a hot row or CADB0506 from too many index mutations.
 ---
 
 # CamusDB schema design
@@ -193,7 +193,7 @@ The rules that matter most:
   ids, counters, and epoch milliseconds. Columns made before this rule keep the
   unbounded range.
 - `DATETIME` is an instant in UTC. `TIMESTAMP` is an alias.
-- The type list has no `INTERVAL` type.
+- `INTERVAL` is expression-only. No column, CTAS, or materialized view stores it.
 - `ARRAY(T)` holds scalars only. No nested arrays, no `ARRAY(NUMERIC)`, and no
   `ARRAY(JSONB)`. An array of documents is one `JSONB` document.
 - `INT64` overflow fails with `CADB0420`. `FLOAT64` and `FLOAT32` overflow
@@ -252,8 +252,7 @@ Foreign-key cost on writes:
   owned `~fk_` index when none fits. That is one more write per child insert.
 - A table with row-level TTL cannot be a foreign-key parent.
 
-See [Check constraints](https://camusdb.github.io/docs/check-constraints) and
-[Foreign keys](https://camusdb.github.io/docs/foreign-keys).
+See [Check constraints](https://camusdb.github.io/docs/check-constraints) and [Foreign keys](https://camusdb.github.io/docs/foreign-keys).
 
 ## Sequences and identity columns
 
@@ -299,12 +298,10 @@ them. Maximum 65,535 characters (`CADB0511`). See [Schema comments](https://camu
 
 - `ADD COLUMN c T NOT NULL` needs a `DEFAULT` on a table with rows (`CADB0301`).
 - `DROP COLUMN` of an indexed column is refused. Drop the index first.
-- Add a foreign key while child writers are quiet, or run an orphan check
-  after the migration.
-- `CREATE TABLE ... AS SELECT` copies no index, constraint, default, comment,
-  or setting.
-- See [references/ddl-syntax.md](references/ddl-syntax.md) for the other
-  `ALTER TABLE` rules.
+- A trigger that names a column blocks its drop and its rename (`CADB0530`).
+- Add a foreign key while child writers are quiet, or check orphans after.
+- CTAS copies no index, constraint, default, comment, or setting.
+- Read [references/ddl-syntax.md](references/ddl-syntax.md) for other `ALTER TABLE` rules.
 
 ## Common mistakes
 
@@ -331,13 +328,14 @@ Habits from other databases that are wrong in CamusDB:
 | Long `TEXT` column truncated silently | MySQL | CamusDB fails with `CADB0302`. It never truncates. |
 | `INT` for ids, counters, or epoch milliseconds | All | `INT` is range-checked to 32 bits (`CADB0420`). Use `BIGINT` or `INT64`. |
 | `CHAR(N)` padded with spaces; `COLLATE` | PostgreSQL, MySQL | `CHAR(N)` is a maximum and does not pad. No `COLLATE`; use `LOWER`. |
+| `INTERVAL` column | PostgreSQL | Rejected. `INTERVAL` is expression-only. Store `CAST(i AS STRING)`; cast back on read. |
 
 ## References
 
 Read these files when the task needs the detail:
 
 - [references/data-types.md](references/data-types.md): read when you choose a
-  type, write a literal, or check a length limit.
+  type, write a literal, store an interval, or check a length limit.
 - [references/ddl-syntax.md](references/ddl-syntax.md): read before you write
   or review any DDL statement.
 - [references/review-checklist.md](references/review-checklist.md): read in
@@ -345,8 +343,8 @@ Read these files when the task needs the detail:
 - [references/limits-and-errors.md](references/limits-and-errors.md): read when
   a statement fails, or when you size a transaction or an index.
 
-Public docs, under `https://camusdb.github.io/docs/`: `best-practices`,
-`data-types`, `json`, `sql-schema`, `sql-indexes`, `sql-writes`, `sequences`,
-`foreign-keys`, `check-constraints`, `row-level-ttl`, `storage-layout`, `storage`,
-`key-range-sharding`, `functions-uuid`, `functions-object-id`, `comment-on`,
-`transaction-limits`, and `databases`.
+Public docs, under `https://camusdb.github.io/docs/`: `best-practices`, `data-types`,
+`json`, `sql-schema`, `sql-indexes`, `sql-writes`, `sequences`, `foreign-keys`,
+`check-constraints`, `row-level-ttl`, `storage-layout`, `storage`, `key-range-sharding`,
+`functions-uuid`, `functions-object-id`, `comment-on`, `transaction-limits`, `databases`,
+`joins-and-subqueries` (reserved `LATERAL`), and `csharp-extensions` (triggers).

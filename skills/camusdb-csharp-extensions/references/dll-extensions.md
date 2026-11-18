@@ -106,10 +106,14 @@ public static class TextTables
 SELECT word FROM split_words('inventory low stock');
 SELECT w.word, d.weight
 FROM split_words(@text) AS w JOIN dictionary d ON d.term = w.word;
+SELECT p.id, w.word FROM posts AS p, split_words(p.title) AS w;  -- implicit LATERAL
 ```
 
 - Return `IEnumerable<T>` of one supported scalar or array type. One output
-  column only. No `LATERAL` references.
+  column only.
+- An argument can read columns of a `FROM` source to its left. You do not
+  write `LATERAL`; it is implicit. An argument with no column reference runs
+  once.
 - `Column` names the output. Otherwise the function name or the alias names it.
 - A NULL for a non-nullable parameter, or a null sequence, gives zero rows. A
   null element gives a NULL row.
@@ -190,6 +194,8 @@ EXTERNAL NAME 'MyCompany.Ext.AuditTrigger';
   `ICamusTrigger`. `EXTERNAL NAME` is the full CLR type name.
 - Install the extension first. A loaded but uninstalled extension gives
   `CADB0830`.
+- A DLL trigger runs its SQL with the writer's privileges. See "SQL from a DLL
+  trigger or procedure".
 - One instance serves concurrent statements. Do not keep per-statement state
   in instance or static fields.
 - `context.Old` and `context.New` hold every column, large values included.
@@ -269,6 +275,10 @@ CALL transfer(@from, @to, 10 * 3);
 
 - `context.Sql` runs in the same transaction, with the invoking user's
   privileges.
+- So if a DLL trigger inserts audit rows, writers need `INSERT` on the audit
+  table. Do not grant them `UPDATE` or `DELETE` there when the audit history
+  must stay protected. An inline trigger can hold that `INSERT` through its
+  owner instead.
 - `ExecuteAsync` runs `INSERT`, `UPDATE`, or `DELETE` and returns the changed
   row count. `QueryAsync` runs `SELECT` and returns row copies.
 - DDL and `BEGIN`, `COMMIT`, `ROLLBACK` fail with `CADB0820`.
@@ -321,8 +331,23 @@ unsafe_extension_assemblies:
   every node.
 - A bad path, a missing file, a missing manifest, or a duplicate name and
   version stops startup.
-- The SHA-256 covers only the extension DLL. Deploy the whole folder of an
-  unsafe extension as one unit.
+- Only the operator account should be able to write to extension folders.
+
+### Dependency hash
+
+- An installed extension pins its DLL SHA-256 and a dependency hash.
+- For an unsafe extension, the dependency hash covers every other file in its
+  folder and subfolders. That includes native libraries, `.deps.json`, and
+  unused files such as `.pdb` files. Give each unsafe extension its own folder.
+  Deploy the folder as one unit on every node.
+- A safe extension cannot load private dependencies. Its dependency set is
+  empty.
+- The server checks dependencies again at first load. It refuses files added
+  or changed since startup. Restart the nodes after you change files.
+- To pin the dependencies of an older installation, or to accept changed
+  dependencies at the same version: deploy the folder everywhere, restart the
+  nodes, then run `ALTER EXTENSION name UPDATE TO 'same version'`.
+- `SHOW EXTENSIONS` reports the hash in `dependencies_sha256`.
 
 ### Safe and unsafe lists
 
@@ -337,7 +362,7 @@ unsafe_extension_assemblies:
 ### Install, update, and drop
 
 ```sql
-CREATE EXTENSION text_utils;                  -- highest loaded version
+CREATE EXTENSION text_utils;                  -- highest version on this node
 CREATE EXTENSION text_utils VERSION '1.0.0';
 ALTER EXTENSION text_utils UPDATE;            -- highest loaded version
 ALTER EXTENSION text_utils UPDATE TO '2.0.0';
@@ -345,17 +370,20 @@ DROP EXTENSION text_utils;
 ```
 
 - Superuser only. In a cluster, run these on the database's schema leader.
-- The database records the name, version, and SHA-256. Different databases can
-  use different versions on one node.
+- Without `VERSION`, `CREATE EXTENSION` picks the highest version loaded on
+  the executing node. Pin the version in deploy scripts, especially during a
+  rolling upgrade.
+- The database records the name, version, DLL SHA-256, and dependency hash.
+  Different databases can use different versions on one node.
 - Install each `Requires` extension first (`CADB0831`). You cannot drop an
   extension that another installed extension requires.
 - A drop is refused while defaults, `CHECK` constraints, views, materialized
   views, or triggers depend on it. An update is refused if the target lacks a
   member in use. The error lists the dependents (`CADB0833`). There is no
   `CASCADE`.
-- Before an install or update, the coordinator checks the other nodes. A
-  responding node without the build gives `CADB0835`. A node that does not
-  respond is skipped.
+- Before an install or update, the coordinator checks the name, version, DLL
+  SHA-256, and dependency hash on the other nodes. A responding node without
+  the build gives `CADB0835`. A node that does not respond is skipped.
 
 ### Rolling upgrade
 
@@ -385,7 +413,8 @@ Superuser only. Node-local. Compare `sha256` across nodes to find a bad deploy.
 
 Columns: `name`, `version`, `status`, `path`, `sha256`, `trust`, `requires`,
 `functions`, `triggers`, `procedures`, `aggregates`, `table_functions`, and
-`signatures` (for example `split_words(STRING) -> SETOF STRING`).
+`signatures` (for example `split_words(STRING) -> SETOF STRING`). It also
+reports `dependencies_sha256`.
 
 ## Dumps and the playground
 

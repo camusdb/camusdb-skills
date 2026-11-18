@@ -1,6 +1,6 @@
 ---
 name: camusdb-csharp-extensions
-description: Writes, reviews, and deploys C# code that runs inside CamusDB. Covers inline functions (CREATE FUNCTION ... LANGUAGE csharp AS $$ ... $$, CREATE OR REPLACE FUNCTION, DROP FUNCTION, CALLED ON NULL INPUT), inline triggers (CREATE TRIGGER ... LANGUAGE csharp, NEW, OLD, Sql.Set), DLL extensions built on CamusDB.Extensions.Abstractions ([CamusFunction], [CamusTableFunction], [CamusAggregate], ICamusTrigger, [CamusProcedure]), CREATE EXTENSION, ALTER EXTENSION, CREATE TRIGGER ... EXTERNAL NAME, CALL, SHOW FUNCTIONS, SHOW TRIGGERS, SHOW EXTENSIONS, and the settings inline_functions_enabled, inline_triggers_enabled, and extension_assemblies. Use it when adding custom SQL functions, triggers, aggregates, or procedures to CamusDB, choosing inline code or a DLL, or fixing CADB08xx errors such as CADB0809, CADB0818, CADB0823, CADB0834, CADB0838, CADB0839, CADB0840, CADB0841, CADB0844, CADB0845, or CADB0846.
+description: Writes, reviews, and deploys C# code that runs inside CamusDB. Covers inline functions (CREATE FUNCTION ... LANGUAGE csharp AS $$ ... $$, CREATE OR REPLACE FUNCTION, DROP FUNCTION, CALLED ON NULL INPUT), inline triggers (CREATE TRIGGER ... LANGUAGE csharp, NEW, OLD, Sql.Set), DLL extensions built on CamusDB.Extensions.Abstractions ([CamusFunction], [CamusTableFunction], [CamusAggregate], ICamusTrigger, [CamusProcedure]), CREATE EXTENSION, ALTER EXTENSION, CREATE TRIGGER ... EXTERNAL NAME, CALL, SHOW FUNCTIONS, SHOW TRIGGERS, SHOW EXTENSIONS, and the settings inline_functions_enabled, inline_triggers_enabled, and extension_assemblies. Use it when adding custom SQL functions, triggers, aggregates, or procedures to CamusDB, choosing inline code or a DLL, or fixing CADB08xx errors such as CADB0809, CADB0818, CADB0823, CADB0834, CADB0838, CADB0839, CADB0840, CADB0841, CADB0844, CADB0845, or CADB0846, or CADB0530 from a column that a trigger uses.
 ---
 
 # CamusDB C# extensions
@@ -123,16 +123,14 @@ string comparisons when all nodes must agree.
 ### Dependencies
 
 - `DROP FUNCTION`, or a replace that changes the parameter or result types,
-  fails with `CADB0844` while a view, a materialized view, or a `CHECK` calls
-  the function.
+  fails with `CADB0844` while a view, a materialized view, a `CHECK`, or an
+  inline trigger calls the function.
 - A replace that changes only the body keeps the owner and the dependents.
   Dependents use the new body in later statements. A materialized view keeps
   its stored rows until `REFRESH`.
 - A deterministic column default is computed once, at table creation. A new
   body does not change it.
 - A new body clears cached results that depend on the function.
-- The dependency check does not read inline-trigger bodies. See "Trigger
-  recompilation".
 
 ### Compilation across nodes
 
@@ -172,6 +170,9 @@ $$;
   `AFTER` rows are read-only.
 - Run SQL with `Sql`: bind with `Set`, then `await ExecuteAsync` or
   `QueryAsync`. The parameters clear after each SQL operation.
+- Pass constant SQL text: a literal, or literals joined with `+`. SQL built
+  from row values, or these methods used as delegates, fail with `CADB0839`.
+  The SQL runs with the owner's privileges, so bind every value with `Set`.
 - Call a database inline function as a C# method. Its NULL rule and budget apply.
 - A trigger may use `DateTime.UtcNow` and `Guid.NewGuid`. A function may not.
 - A trigger can await only `Sql` operations. `Task.Run`, `Task.Delay`, and an
@@ -196,6 +197,8 @@ For the body names, the row API, and column-name rules, read
   gRPC write APIs.
 - Triggers do not fire for `TRUNCATE`, TTL expiry, schema backfills and
   rewrites, materialized-view refresh, restore, or dropped-table recovery.
+  So an audit trigger cannot record every change. Control table access with
+  privileges.
 - On `ON CONFLICT` and `UPSERT`, `BEFORE INSERT` runs on each proposed row. A
   conflict update then fires the `UPDATE` triggers. A skipped row fires nothing
   more.
@@ -208,9 +211,11 @@ For the body names, the row API, and column-name rules, read
 
 - The first fire after a table change or an inline-function change recompiles
   the body on each node. A new column or a replaced function is picked up.
-- `DROP COLUMN` and `DROP FUNCTION` do not check inline-trigger bodies. If a
-  body still names the removed member, each write that fires it fails with
-  `CADB0845`. Drop the trigger and create it again with a valid body.
+- Dropping or renaming a column that the body names fails with `CADB0530`.
+  Dropping a function that it calls, or changing that function's types, fails
+  with `CADB0844`. Drop or rewrite the trigger first.
+- Column type changes are not checked. If the body no longer compiles, each
+  write that fires it fails with `CADB0845`. Replace the trigger.
 
 ## Privileges and ownership
 
@@ -235,8 +240,11 @@ For the body names, the row API, and column-name rules, read
   the writer's own write.
 - If the trigger owner is dropped, each fire fails with `CADB0846`. A new user
   with the same name does not get the ownership.
-- A trigger created with authentication off has no owner. Its SQL uses the
-  writer's privileges. A DLL trigger also uses the writer's privileges.
+- A trigger created with authentication off has no owner. After you enable
+  authentication, its nested SQL fails with `CADB0846`, even for a superuser.
+  Recreate it under an owner with the needed grants.
+- A DLL trigger uses the writer's privileges. For audit tables, read
+  [references/dll-extensions.md](references/dll-extensions.md).
 
 ```sql
 SHOW TRIGGERS ON posts;               -- omit ON to list all tables
@@ -247,7 +255,7 @@ DROP TRIGGER normalize ON posts;
 ## DLL extensions in short
 
 ```sql
-CREATE EXTENSION text_utils;                  -- highest loaded version
+CREATE EXTENSION text_utils;                  -- highest version on this node
 CREATE EXTENSION text_utils VERSION '1.0.0';  -- exact version
 SELECT text_utils.greet('ann');
 CREATE TRIGGER audit ON orders AFTER INSERT, UPDATE, DELETE
@@ -263,8 +271,11 @@ SHOW EXTENSIONS;
 - Declare `[assembly: CamusExtension("name", "1.0.0")]` once.
 - Copy the DLL to every node, list its absolute path in `extension_assemblies`,
   and restart. The DLL is not replicated.
-- The database records the name, version, and DLL SHA-256. A node without
-  that exact build fails statements that use it with `CADB0834`.
+- The database records the name, version, DLL SHA-256, and a dependency
+  hash. A node without that exact build fails statements that use it with
+  `CADB0834`. Give each unsafe extension its own folder.
+- Without `VERSION`, `CREATE EXTENSION` picks the highest version loaded on
+  the executing node. Pin the version in deploy scripts.
 - Safe mode is a review guardrail, not a sandbox. Deploy reviewed code only.
 
 Read [references/dll-extensions.md](references/dll-extensions.md) for the
@@ -300,9 +311,12 @@ attributes, signatures, types, deploy steps, and rolling upgrade.
   local. Both are refused. Call `ToList` or `ToArray`.
 - Culture-sensitive string comparison. Results can differ between nodes. Use
   ordinal comparison.
-- Dropping a column or a function that an inline trigger body still names.
-  Writes then fail with `CADB0845`.
-- Dropping the user who owns an inline trigger. Fires then fail with `CADB0846`.
+- Building trigger SQL text from row values. It fails with `CADB0839`. Bind
+  values with `Sql.Set`.
+- Changing the type of a column that an inline trigger body uses. If the body
+  no longer compiles, writes fail with `CADB0845`.
+- Dropping the user who owns an inline trigger, or turning on authentication
+  after you created inline triggers with it off. Fires then fail with `CADB0846`.
 - Catching a nested SQL exception and continuing. The transaction stays
   rollback-only.
 - An HTTP call or an email inside a trigger. A statement retry can repeat it.
@@ -314,11 +328,11 @@ Read these files in this skill:
 
 - [references/inline-code.md](references/inline-code.md): read before you write
   an inline function or trigger body. Types, NULL rules, allowed code, trigger
-  body names, budgets, and settings.
+  body names, trigger SQL text, recompilation, budgets, and settings.
 - [references/dll-extensions.md](references/dll-extensions.md): read before you
   build, deploy, install, or upgrade a DLL extension. Attributes, signatures,
-  supported values, typed trigger rows, procedures, safe and unsafe lists, and
-  `SHOW EXTENSIONS`.
+  supported values, typed trigger rows, procedures, dependency hash, safe and
+  unsafe lists, and `SHOW EXTENSIONS`.
 - [references/error-codes.md](references/error-codes.md): read when you see any
   `CADB08xx` code.
 
@@ -330,3 +344,5 @@ Public docs, under `https://camusdb.github.io/docs/` (append the page name):
   (`#inline-c-functions-and-triggers`).
 - `error-codes`, `sql-expression-syntax` (dollar quotes), `sql-transactions`
   (`#failed-statements`), `logical-dump-and-reimport`.
+- `joins-and-subqueries` (`#lateral`, table-function arguments),
+  `sql-authentication` (privileges for audit tables).

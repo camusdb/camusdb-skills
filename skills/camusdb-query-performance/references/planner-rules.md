@@ -1,8 +1,8 @@
 # CamusDB planner rules
 
 Read this file to predict which access path, sort strategy, join algorithm and
-join order the planner picks. Then design the index or rewrite that gets the
-plan you want.
+join order the planner picks, and how CTEs and `LATERAL` sources run. Then design
+the index or rewrite that gets the plan you want.
 
 ## Planner configuration
 
@@ -91,6 +91,9 @@ range-versus-full-scan veto applies at the 40 % breakeven.
 - Literals are normalized to the column type before index matching. Valid text
   literals convert for `OID` and `UUID` columns.
 - A range bound of `NULL` cannot drive a seek.
+- Keep an indexed column outside the calculation.
+  `created_at > now() - INTERVAL '7 days'` can use an index range scan.
+  `created_at + INTERVAL '7 days' > now()` gives no range bound.
 - `LIKE`, `ILIKE`, `~`, `~*`, `!~`, `!~*` are always residual filters.
 - A `NOT IN (...)` value list is always a filter.
 - An `IN` list of more than eight constant items runs once per statement into a hash
@@ -181,6 +184,12 @@ A `topk` normally stays in memory. With spill on, it moves to a disk selection o
 when the kept rows pass `spill_threshold_bytes`. That selection writes at most about
 `k` rows to disk.
 
+A grouped query ordered by one aggregate alias with a `LIMIT` can carry `top_k` on
+its `aggregate` node: `COUNT` or `MAX` descending, or `MIN` ascending on a
+`NOT NULL` column, without `HAVING`. It sends or rereads fewer groups. It does not
+read fewer input rows. See
+[explain-nodes.md](explain-nodes.md#grouped-top-k).
+
 ### LIMIT pushdown
 
 The scan stops early when all hold:
@@ -223,10 +232,12 @@ The scan stops early when all hold:
 ## Joins
 
 Supported: `JOIN`, `INNER JOIN`, `LEFT JOIN`, `RIGHT JOIN` (run as a swapped
-left join), `CROSS JOIN`, comma joins, and a set-returning function on either side.
+left join), `CROSS JOIN`, comma joins, a set-returning function on either side,
+`LATERAL` sources and `VALUES` lists. See
+[LATERAL and VALUES sources](#lateral-and-values-sources).
 Not supported: `FULL [OUTER] JOIN`,
-`NATURAL JOIN`, `JOIN ... USING (...)`, and a `RIGHT JOIN` whose left operand
-is itself a join.
+`NATURAL JOIN`, `JOIN ... USING (...)`, a `RIGHT JOIN` whose left operand
+is itself a join, and `RIGHT JOIN LATERAL`.
 
 ### Algorithms
 
@@ -287,7 +298,8 @@ Index nested loop execution:
 - Heuristic order scores each table: 0 for a unique-index equality, 1 for
   another indexed predicate, 2 for none. Lower scores go first.
 - Cross-product repair works without statistics, up to 64 sources.
-- An outer join anywhere in the tree keeps the written order.
+- An outer join anywhere in the tree keeps the written order. So does a `LATERAL`
+  source.
 - A volatile condition, such as one using `random()`, restricts movement.
 - Join-key equality is estimated as `1 / max(NDV_left, NDV_right)`. Without
   counts the fallback selectivity is `0.1`.
@@ -336,6 +348,8 @@ The search then prices probes at the named keys' real share of the fact column.
 | Other correlated scalar, `EXISTS`, `IN`/`NOT IN` or quantified body | Prepared once, then run per outer row through the full query pipeline (joins, aggregation) |
 | Uncorrelated subquery of any kind, in any expression position | Evaluated once, result folded into the outer plan |
 | Derived table in `FROM` | `derived-table-scan`, materialized once |
+| CTE read once, or `NOT MATERIALIZED` | Inlined as a `derived-table-scan` in each reader |
+| CTE read more than once, or `MATERIALIZED` | Computed once; readers show `computed_once=<name>` |
 
 Position rules:
 
@@ -404,6 +418,88 @@ WHERE EXISTS (
 Under a Serializable transaction, the indexed `EXISTS` seek range is protected
 against phantoms.
 
+## WITH queries
+
+A CTE names a query for one statement. How it runs decides its cost:
+
+- At the start of a statement or its source query, a CTE read once is inlined. Its
+  reader runs it as a derived table.
+- A CTE read more than once is computed once. Its rows are shared for the
+  statement. `EXPLAIN` marks each reader with `computed_once=<name>`.
+- `MATERIALIZED` asks for one computation. `NOT MATERIALIZED` runs a separate copy
+  for each reference.
+- A computed-once CTE finishes in full before a reader gets a row, even when that
+  reader has a `LIMIT`. Each reader filters its own copy of the kept rows.
+- Use `NOT MATERIALIZED` for a large result that a reader only partly reads.
+- The kept rows can spill to disk. They are released when the statement ends.
+- A `WITH` inside parentheses is always inlined, even with `MATERIALIZED`.
+- Readers of a computed-once CTE see the same `random()` values.
+- Index hints on a CTE reference are not supported.
+- One `WITH` clause can copy at most 250,000 parse nodes when it expands its
+  references. A chain where each CTE reads the previous one twice reaches it in
+  about twenty steps. It fails with `CADB0413`. Shorten the chain or store an
+  intermediate result.
+
+The keyword goes after `AS`:
+
+```sql
+WITH paid AS NOT MATERIALIZED (
+  SELECT id, customer_id, total FROM orders WHERE status = 'paid'
+)
+SELECT id, total FROM paid WHERE customer_id = 42;
+```
+
+### Recursive CTEs
+
+- The seed runs once. Each step reads only the previous step's rows. Recursion
+  ends when a step produces no rows.
+- A single reader streams rows as steps produce them, so its `LIMIT` can stop the
+  recursion early.
+- Several readers compute the whole result first. An outer `LIMIT` then does not
+  stop the recursion.
+- Work tables can spill. The duplicate set of `UNION` (not `UNION ALL`) stays in
+  memory.
+- `UNION` drops rows already produced, which can end a walk over a cyclic graph. A
+  changing depth or path column keeps rows distinct, so add a stopping predicate.
+
+| Setting | Default | Limit |
+| --- | --- | --- |
+| `max_recursive_cte_iterations` | `10000` | Recursive steps that produce rows |
+| `max_recursive_cte_rows` | `10000000` | Output rows per run, seed rows included |
+
+Both are runtime cluster settings. `0` disables a limit. Past either limit the
+statement fails with `CADB0560 RecursiveQueryLimitExceeded`. A retry without a
+change fails again. Add a stopping predicate before you raise a limit.
+
+## LATERAL and VALUES sources
+
+A `LATERAL` source reads columns of the sources to its left:
+
+```sql
+SELECT c.id, o.id, o.total
+FROM customers AS c
+CROSS JOIN LATERAL (
+  SELECT id, total FROM orders
+  WHERE customer_id = c.id ORDER BY total DESC LIMIT 2
+) AS o;
+```
+
+- The planner keeps the written join order and uses nested loops for lateral
+  sources. `EXPLAIN` marks the join `lateral`.
+- The body runs per left row. Repeated left values can share a small result within
+  the statement. A volatile body runs again for each left row.
+- A table-function argument that reads a left column also runs per left row, with
+  or without the `LATERAL` keyword: `FROM t, jsonb_each(t.payload)`. An argument
+  without column references runs once.
+- Filter the left side before the lateral source. The left row count sets the
+  number of body runs.
+
+A `VALUES` list gives a small inline relation:
+
+- It runs through derived-table and `UNION ALL` execution.
+- For thousands of reusable rows, use a stored table instead.
+- A source-only `EXPLAIN` shows `values(alias=v, rows=N)`.
+
 ## Statistics
 
 | Statistic | Maintained by |
@@ -470,6 +566,8 @@ ALTER TABLE application_logs SET (sql_stats_automatic_collection_enabled = false
 - Interesting orders are not kept in the join search. It does not keep a costlier
   sub-plan for an order a parent needs.
 - A tree with an outer join gets no search. It keeps its written order.
+- A `LATERAL` source keeps its written order and always runs as a nested loop.
+- A computed-once CTE runs in full before a reader gets a row, even under `LIMIT`.
 - When the query writes only `a.x = b.x AND b.x = c.x`, no edge joins `a` and `c`
   directly.
 - A heuristic or repaired join input can get a fixed 10,000-row fallback
@@ -483,4 +581,8 @@ https://camusdb.github.io/docs/automatic-analyze,
 https://camusdb.github.io/docs/spill-to-disk,
 https://camusdb.github.io/docs/json,
 https://camusdb.github.io/docs/sql-queries,
+https://camusdb.github.io/docs/joins-and-subqueries,
+https://camusdb.github.io/docs/statement-nesting-limit,
+https://camusdb.github.io/docs/data-types,
+https://camusdb.github.io/docs/explain,
 https://camusdb.github.io/docs/sql-expression-syntax

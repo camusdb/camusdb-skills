@@ -1,6 +1,6 @@
 ---
 name: camusdb-vector-search
-description: Builds embedding and nearest-neighbour (KNN) search on CamusDB. Covers storing float32 vectors in BYTES columns with STORAGE PLAIN and CHECK (vector_dims(...) = N), packing vectors in .NET (CamusVector.ToBytes, ColumnType.Bytes), EF Core (IsVector, float[] properties, loadWithEntity, EF.Functions.L2Distance, CosineDistance, InnerProduct, VectorDims), Dapper (CamusValue.Vector) and TypeScript (camus.vector, Float32Array, CamusVector.toFloats), and ranking with l2_distance, cosine_distance and inner_product in ORDER BY ... LIMIT k queries. Use when a user mentions embeddings, semantic search, RAG retrieval, similarity search, pgvector or HNSW habits, vector_dims, octet_length, topk in EXPLAIN, or errors CADB0410, CADB0411, CADB0412 or CADB0302 on a vector column.
+description: Builds embedding and nearest-neighbour (KNN) search on CamusDB. Covers storing float32 vectors in BYTES columns with STORAGE PLAIN and CHECK (vector_dims(...) = N), packing vectors in .NET (CamusVector.ToBytes, ColumnType.Bytes), EF Core (IsVector, float[] properties, loadWithEntity, EF.Functions.L2Distance, CosineDistance, InnerProduct, VectorDims), Dapper (CamusValue.Vector) and TypeScript (camus.vector, Float32Array, CamusVector.toFloats), and ranking with l2_distance, cosine_distance and inner_product in ORDER BY ... LIMIT k queries, including nearest rows per group with LATERAL. Use when a user mentions embeddings, semantic search, RAG retrieval, similarity search, pgvector or HNSW habits, vector_dims, octet_length, topk in EXPLAIN, or errors CADB0410, CADB0411, CADB0412 or CADB0302 on a vector column.
 ---
 
 # CamusDB vector search
@@ -165,8 +165,24 @@ ORDER BY distance, id
 LIMIT 10;
 ```
 
+Nearest rows per group. Use a `LATERAL` source with its own `ORDER BY ... LIMIT`:
+
+```sql
+SELECT t.id AS tenant_id, hit.id, hit.distance
+FROM tenants AS t
+CROSS JOIN LATERAL (
+  SELECT id, l2_distance(embedding, @q) AS distance
+  FROM docs
+  WHERE tenant_id = t.id
+  ORDER BY distance
+  LIMIT 3
+) AS hit;
+```
+
 Rules for these queries:
 
+- A `LATERAL` body runs once per left row, as a nested loop in the written join
+  order. Filter the left side first. `EXPLAIN` marks the join `lateral`.
 - An alias in `ORDER BY` outranks a base column of the same name.
 - `ORDER BY` can use a column that the `SELECT` list does not project.
 - `LIMIT` accepts a parameter, such as `LIMIT @k`. The bound still applies.
@@ -302,4 +318,7 @@ LIMIT 10;
   - https://camusdb.github.io/docs/ef-core
   - https://camusdb.github.io/docs/dapper
   - https://camusdb.github.io/docs/typescript-connector
+  - https://camusdb.github.io/docs/http-api (REST `bytesValue` encoding)
+  - https://camusdb.github.io/docs/grpc-api (gRPC `bytes_value` encoding)
+  - https://camusdb.github.io/docs/joins-and-subqueries (`LATERAL` sources)
   - https://camusdb.github.io/docs/explain

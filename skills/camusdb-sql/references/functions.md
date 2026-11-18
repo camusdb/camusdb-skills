@@ -5,9 +5,10 @@ listed here or in the files below, the docs do not describe it. Do not use it.
 
 - `jsonb_*` functions and operators: [jsonb.md](jsonb.md).
 - Window functions and `generate_series`: [set-and-window.md](set-and-window.md).
+- `INTERVAL` values and interval functions: "Intervals" below.
 
-Source pages: https://camusdb.github.io/docs/functions and each
-`functions-*` page linked from it.
+Source pages: https://camusdb.github.io/docs/functions, each `functions-*` page
+linked from it, and https://camusdb.github.io/docs/data-types#intervals.
 
 ## General rules
 
@@ -28,6 +29,8 @@ Source pages: https://camusdb.github.io/docs/functions and each
   - Per statement: `statement_timestamp()`.
   - Per transaction: `now()`, `current_timestamp()`, `transaction_timestamp()`,
     `current_date()`, `unix_timestamp()`, `unix_timestamp_ms()`.
+  - `age(...)` is marked volatile. A `CHECK` cannot use it, and a query that calls
+    it skips the result cache.
 - A column `DEFAULT` may call a no-argument generator such as `gen_id()`,
   `gen_uuid_v7()`, or `now()`. A per-call generator runs once per inserted row.
   `DEFAULT now()` gives every row of one `INSERT` the same time.
@@ -123,7 +126,8 @@ Text positions count code points, but sorting uses binary UTF-16 order. See
 
 The text form of a value is the same in `CAST(x AS string)`, `to_string`, `concat`,
 and `||`: a date is `2026-03-15`, bytes are `\xdeadbeef`, and a float is the shortest
-text that reads back as the same value. A `datetime` has seven fractional digits.
+text that reads back as the same value. A `datetime` has seven fractional digits. An
+interval is ISO-8601 duration text, such as `P1Y2M3DT4H5M6.5S`.
 
 ## Operators
 
@@ -151,7 +155,7 @@ SELECT id FROM items WHERE flags & 4 = 4;
 
 ## Math
 
-Arguments are `INT64`, `FLOAT64`, or `NUMERIC`.
+Arguments are `INT64`, `FLOAT32`, `FLOAT64`, or `NUMERIC`.
 
 | Function | Returns | Meaning |
 | --- | --- | --- |
@@ -179,6 +183,34 @@ Float arithmetic that overflows or underflows from finite values fails with
 `CADB0421`. `x / 0` fails with `CADB0400`. With constant operands, it fails before
 any row is read. See "Float values" below.
 
+### Trigonometry and angles
+
+All return `FLOAT64`, also for `INT64`, `NUMERIC`, and `FLOAT32` input. A `NULL`
+argument gives `NULL`.
+
+| Function | Meaning |
+| --- | --- |
+| `sin(x)`, `cos(x)`, `tan(x)`, `cot(x)` | Functions of an angle in radians. |
+| `asin(x)`, `acos(x)`, `atan(x)` | Inverse functions. Return radians. |
+| `atan2(y, x)` | Angle of the vector `(x, y)` in radians, in the right quadrant. |
+| `sind(x)`, `cosd(x)`, `tand(x)`, `cotd(x)` | Functions of an angle in degrees. |
+| `asind(x)`, `acosd(x)`, `atand(x)`, `atan2d(y, x)` | Inverse functions. Return degrees. |
+| `radians(degrees)`, `degrees(radians)` | Convert between units. |
+| `pi()` | π as `FLOAT64`. |
+
+```sql
+SELECT sind(30), cosd(90), tand(45), atan2d(1, 1);   -- 0.5, 0, 1, 45
+SELECT radians(180), degrees(pi());                  -- about 3.141592653589793, 180
+```
+
+- Prefer the degree forms for data in degrees. `sind(30)`, `cosd(90)`, and
+  `tand(45)` are exact. The radian forms use the platform math library, so their
+  last digits can differ across platforms.
+- `NaN` propagates. An infinite angle, and an `asin` or `acos` input outside
+  `[-1, 1]`, fail with `CADB0400`.
+- A pole returns infinity, as in PostgreSQL: `cot(0)`, `tand(90)`, `cotd(0)`.
+- A conversion that overflows or underflows a finite value fails with `CADB0421`.
+
 ## Float values
 
 - `'Infinity'`, `'-Infinity'`, and `'NaN'` are values. Write them as text in a float
@@ -205,8 +237,9 @@ or an offset. A local timestamp string without an offset is rejected.
 | `statement_timestamp()` | `DATETIME` | Start of the statement, UTC. |
 | `clock_timestamp()`, `sysdate()` | `DATETIME` | The clock at each call, UTC. |
 | `date_add(value, amount, unit)` | `DATETIME` | Add an `INT64` amount. A `DATE` becomes a `DATETIME`. |
+| `date_add(value, interval)`, `date_sub(value, interval)` | `DATETIME` | Add or subtract an `INTERVAL`, with calendar months. |
 | `date_diff(start, end, unit)` | `INT64` | Whole units from `start` to `end`, truncated toward zero. |
-| `date_part(unit, value)` | `INT64` | UTC component. |
+| `date_part(unit, value)` | `INT64` | UTC component, or a field of an interval. |
 | `EXTRACT(unit FROM value)` | `INT64` | SQL-standard form of `date_part`. The unit may be a bare word. |
 | `date_trunc(unit, value)` | `DATETIME` | Start of the unit, UTC. |
 | `unix_timestamp([value])` | `INT64` | Unix seconds. With no argument, of the start of the transaction. |
@@ -268,6 +301,115 @@ or a bare word in `EXTRACT`. A unit with no meaning in a function fails.
 A part is always `INT64`. PostgreSQL returns `numeric`, so two units differ: `epoch`
 is whole seconds, and `millisecond` and `microsecond` are the fraction of the current
 second only.
+
+## Intervals
+
+`INTERVAL` holds months, days, and microseconds. It is an expression type only. A
+column, an array element, a CTAS column, and a materialized-view column cannot hold
+it. A plain view can return one. To store one, cast it to `STRING`, and cast the
+text back to `INTERVAL` when you read it.
+
+```sql
+SELECT * FROM orders WHERE created_at > now() - INTERVAL '7 days';
+SELECT CAST('2024-01-31' AS DATE) + INTERVAL '1 month';   -- 2024-02-29T00:00:00Z
+SELECT finished_at - started_at AS duration FROM jobs;
+SELECT DATE_ADD(CAST('2024-01-31' AS DATE), INTERVAL 1 MONTH);
+```
+
+| Form | Example |
+| --- | --- |
+| PostgreSQL text | `INTERVAL '1 year 2 mons 3 days 04:05:06'` |
+| ISO-8601 text | `INTERVAL 'P1DT2H'` |
+| Single unit | `INTERVAL '3' HOUR`, `INTERVAL 3 HOUR` |
+| Parameter with a unit | `INTERVAL @n DAY` |
+| Cast from text | `CAST('1 day' AS INTERVAL)`, `'1 day'::INTERVAL` |
+
+- Units: `microsecond`, `millisecond`, `second`, `minute`, `hour`, `day`, `week`,
+  `month`, `quarter`, `year`, `decade`, `century`, `millennium`. Plurals and short
+  forms such as `mons`, `hrs`, and `us` work, in any case.
+- Text takes signed parts (`'-1 day +2 hours'`), `ago` (`'3 hours ago'`), and
+  fractions. `'1.5 days'` is 1 day and 12 hours. `'1.5 months'` is 1 month and 15
+  days. A fractional year rounds to whole months. A bare number in the text means
+  seconds.
+- With a trailing unit, the text must be a number: `INTERVAL '3' HOUR` works, and
+  `INTERVAL '1 day' HOUR` fails.
+- Only text casts to `INTERVAL`. Give a number a unit, or multiply it:
+  `days_to_ship * INTERVAL '1 day'`.
+
+| Expression | Result |
+| --- | --- |
+| `DATETIME ± INTERVAL`, `INTERVAL + DATETIME` | `DATETIME` |
+| `DATE ± INTERVAL`, `INTERVAL + DATE` | `DATETIME`, from midnight UTC |
+| `DATETIME - DATETIME`, `DATE - DATETIME`, `DATETIME - DATE` | `INTERVAL` with days and time, no months |
+| `INTERVAL ± INTERVAL`, `-INTERVAL` | `INTERVAL` |
+| `INTERVAL * number`, `number * INTERVAL`, `INTERVAL / number` | `INTERVAL` |
+| Two intervals with `=`, `<>`, `<`, `<=`, `>`, `>=` | `BOOL` |
+
+- Date arithmetic applies months, then days, then time. An invalid day clips to the
+  last day of the month. Values are UTC, so an interval day is 24 hours.
+- Scaling moves a month fraction into days at 30 days per month, and a day fraction
+  into time: `INTERVAL '1 month' * 0.5` is 15 days.
+- A comparison uses 30-day months and 24-hour days. `INTERVAL '1 month' =
+  INTERVAL '30 days'` is true, also for `GROUP BY` and `DISTINCT`. Added to a date,
+  the two can still give different dates.
+- A `NULL` operand gives `NULL`. An interval plus a number, an interval times an
+  interval, and an interval minus a date fail.
+- Overflow fails with `CADB0400`. Months and days must each fit a signed 32-bit
+  integer, microseconds a signed 64-bit integer, and a result timestamp years 1 to
+  9999.
+- Keep an indexed column outside the calculation. `created_at > now() - INTERVAL
+  '7 days'` can use an index range scan. `created_at + INTERVAL '7 days' > now()`
+  cannot. Check with `EXPLAIN`.
+- The .NET, TypeScript, and Python drivers return an interval as ISO-8601 text,
+  such as `P1Y2M3DT4H5M6.5S`. Zero is `PT0S`. Mixed signs stay: `P-1DT2H`.
+- Not supported: `SUM` and `AVG` of intervals, a comparison with plain text (write
+  `INTERVAL '1 day'`, not `'1 day'`), and MySQL compound units such as `HOUR_MINUTE`.
+
+### Interval functions
+
+| Function | Returns | Meaning |
+| --- | --- | --- |
+| `age(a, b)` | `INTERVAL` | Calendar difference `a - b`, in years, months, days, and time. |
+| `age(a)` | `INTERVAL` | `age(current_date(), a)`, with the transaction's UTC date at midnight. |
+| `make_interval(years, months, weeks, days, hours, mins, secs)` | `INTERVAL` | From positional parts. Omitted trailing parts are zero. |
+| `justify_days(i)` | `INTERVAL` | Each 30 days become a month. Opposite month and day signs are adjusted. |
+| `justify_hours(i)` | `INTERVAL` | Each 24 hours become a day. Opposite day and time signs are adjusted. |
+| `justify_interval(i)` | `INTERVAL` | Both conversions, with signs adjusted across the parts. |
+| `date_bin(stride, source, origin)` | `DATETIME` | Start of the bucket that holds `source`, aligned to `origin`. |
+
+```sql
+SELECT age(CAST('2001-04-10' AS DATE), CAST('1957-06-13' AS DATE));  -- P43Y9M27D
+SELECT make_interval(0, 0, 0, 1, 2);                                 -- P1DT2H
+SELECT justify_interval(INTERVAL '1 month -1 hour');                 -- P29DT23H
+SELECT date_bin(INTERVAL '15 minutes',
+  CAST('2024-06-15T15:44:17Z' AS DATETIME),
+  CAST('2024-06-15T00:00:00Z' AS DATETIME));                         -- 2024-06-15T15:30:00Z
+```
+
+- `age` borrows days by the month length of the earlier date, as PostgreSQL does.
+  Both forms are volatile in CamusDB: a `CHECK` cannot use them, and a query that
+  calls them skips the result cache. PostgreSQL's two-argument form is immutable.
+- `make_interval` takes zero to seven positional arguments. Named arguments are not
+  supported. Every part except seconds must be `INT64`. Seconds can have a
+  fraction, rounded to the microsecond. A part out of range fails with `CADB0400`.
+- `date_bin` needs a positive stride with no month part, and an explicit origin. A
+  value before the origin rounds down to the bucket before it.
+- A `NULL` argument gives `NULL`.
+
+### EXTRACT from an interval
+
+`EXTRACT` and `date_part` read the stored parts and do not normalize them:
+`EXTRACT(hour FROM INTERVAL '36 hours')` is 36, and
+`date_part('day', INTERVAL '36 hours')` is 0.
+
+- Years are the total months divided by 12. The month field is the remainder. Each
+  field keeps the sign of its part.
+- Results are `INT64`, not PostgreSQL's fractional `NUMERIC`. `second` is whole
+  seconds. `millisecond` and `microsecond` are the fraction of the current second.
+- `epoch` is whole seconds, rounded down, with 365.25 days per year and 30 days per
+  remaining month.
+- `week`, `dow`, `isodow`, `doy`, and `isoyear` are calendar positions. They do not
+  work on an interval.
 
 ## Date patterns
 
@@ -342,7 +484,7 @@ SELECT * FROM events WHERE day = CAST(str_to_date('June 17, 2024', '%M %e, %Y') 
 
 | Function | Returns | Meaning |
 | --- | --- | --- |
-| `to_string(v)` | `STRING` | From any scalar, by its text form. An array fails. |
+| `to_string(v)` | `STRING` | From any scalar, by its text form. An `INTERVAL` becomes ISO-8601 duration text. An array fails. |
 | `to_int64(v)` | `INT64` | Same as `CAST(v AS int64)`. From `INT64`, `FLOAT64`, `FLOAT32`, `NUMERIC`, `BOOL`, or integer text. A float or `NUMERIC` rounds half away from zero; bool → 1/0. |
 | `to_float64(v)` | `FLOAT64` | From numbers, bool, numeric text. |
 | `to_float32(v)` | `FLOAT32` | From numbers or numeric text. |
@@ -357,8 +499,8 @@ SELECT * FROM events WHERE day = CAST(str_to_date('June 17, 2024', '%M %e, %Y') 
 `smallint` (checked against the signed 16-bit range), `numeric`/`decimal`,
 `float`/`float64`/`double`/`double precision`, `float32`/`real`,
 `bool`/`boolean`, `oid`/`id`/`object_id`, `uuid`/`guid`, `date`,
-`datetime`/`timestamp`, `bytes`/`blob`, `jsonb`/`json`. `x::type` accepts the same
-names.
+`datetime`/`timestamp`, `bytes`/`blob`, `jsonb`/`json`, and `interval` (from text
+only; see "Intervals"). `x::type` accepts the same names.
 
 ### Cast to INT64
 

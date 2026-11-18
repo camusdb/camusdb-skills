@@ -14,7 +14,7 @@ matches. The skills summarize the
 | Skill | Use it to |
 | --- | --- |
 | [`camusdb-schema-design`](skills/camusdb-schema-design/SKILL.md) | Design or review tables, primary keys, indexes, data types, foreign keys, sequences, and TTL. Avoid hotspots under key-range sharding. |
-| [`camusdb-sql`](skills/camusdb-sql/SKILL.md) | Write correct CamusDB SQL, including correlated subqueries and JSONB. Port SQL from PostgreSQL or MySQL. Look up scalar functions. |
+| [`camusdb-sql`](skills/camusdb-sql/SKILL.md) | Write correct CamusDB SQL, including CTEs, `LATERAL`, joined writes, intervals, correlated subqueries, and JSONB. Port SQL from PostgreSQL or MySQL. Look up scalar functions. |
 | [`camusdb-transactions`](skills/camusdb-transactions/SKILL.md) | Write transactional code: serializable isolation, client retries, transaction limits, priority, and historical reads. |
 | [`camusdb-query-performance`](skills/camusdb-query-performance/SKILL.md) | Make a slow query fast with `EXPLAIN`, statistics, covering indexes, and the result cache. |
 | [`camusdb-troubleshooting`](skills/camusdb-troubleshooting/SKILL.md) | Explain a `CADBxxxx` error and fix it. Diagnose a slow or stuck workload. |

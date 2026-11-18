@@ -10,6 +10,7 @@ you explain why a transaction conflicted.
 - Read-only and read-write modes
 - Reads at a statement snapshot
 - Correlated subqueries in writes
+- Joined writes
 - Locking strategy combinations
 - Lock types
 - Conflict resolution
@@ -65,7 +66,7 @@ FOR UPDATE`, or a single `UPDATE ... SET v = f(v)`.
 | Mode | How it works | Use for |
 | --- | --- | --- |
 | Serializable read-only | One HLC snapshot fixed at `BEGIN`. No locks. A client can resume it across requests with the transaction id. | Reports, multi-step reads, snapshots across partitions |
-| Serializable read-write | MVCC plus shared point locks, shared range locks, and exclusive key protection on writes | Read-then-write invariants |
+| Serializable read-write | MVCC plus shared point locks, shared range locks, and exclusive key protection on writes. Optimistic mode validates single-key reads at commit instead of locking them. | Read-then-write invariants |
 
 A read-only transaction creates no mutation and does not take the conflict
 path. Choose it whenever the work does not write.
@@ -120,12 +121,45 @@ SET post_count = (SELECT COUNT(*) FROM posts p WHERE p.user_id = app_users.id)
 WHERE active = true;
 ```
 
+## Joined writes
+
+`UPDATE ... FROM` and `DELETE ... USING` change rows of the target table only.
+They run in two phases:
+
+1. Matching collects the target keys and the source values before any write. A
+   subquery in an assignment is computed here.
+2. The write phase locks each target row and reads it again. Assignments read
+   the target's current values and the collected source values. CamusDB checks
+   again each `AND` term of `WHERE` that names a target column and holds no
+   subquery. A row that no longer matches is skipped and not counted.
+
+```sql
+UPDATE accounts AS a
+SET balance = a.balance + d.amount
+FROM deltas AS d
+WHERE d.account_id = a.id;
+```
+
+So `a.balance + d.amount` adds the collected delta to the balance read under the
+lock. A concurrent change of `balance` is not lost.
+
+- Under Serializable, matching takes exclusive range locks on the target and the
+  source relations. The write phase also takes exclusive row locks on the target.
+- An `UPDATE` whose target row matches several source rows fails with `CADB0400`
+  before it writes anything. Aggregate the source first, for example
+  `FROM (SELECT account_id, SUM(amount) AS amount FROM deltas GROUP BY account_id) AS d`.
+  A `DELETE` removes such a row once.
+- `WHERE` is mandatory. Write `WHERE TRUE` to change every matching row. `LIMIT`
+  is not supported in these forms.
+- Triggers, constraints, index maintenance, and the transaction limits apply as
+  for a plain write.
+
 ## Locking strategy combinations
 
 | Combination | Behavior |
 | --- | --- |
 | `SERIALIZABLE` + pessimistic | Default. CamusDB takes the locks first. |
-| `SERIALIZABLE` + optimistic | Hybrid. Writes validate at commit. Reads and scans still take shared locks, so phantoms stay excluded. |
+| `SERIALIZABLE` + optimistic | Hybrid. Writes validate at commit. Single-key reads validate at commit, with no shared point lock by default. Scans keep shared range locks, so phantoms stay excluded. |
 | `READ COMMITTED` + pessimistic | Writes lock. Each `SELECT` reads one statement snapshot. |
 | `READ COMMITTED` + optimistic | No locks at all. Reads see the latest committed value. CamusDB validates observed rows only. No phantom protection. |
 
@@ -143,16 +177,36 @@ Choose optimistic when conflicts are rare and you want fewer lock waits. Keep
 pessimistic when the same keys are contended. Under contention, an optimistic
 transaction does all its work and then aborts at commit.
 
+Two cluster settings tune optimistic reads:
+
+- `serializable_optimistic_point_locks` (default `false`). At `false`, a
+  Serializable optimistic read-write transaction takes no shared point lock for a
+  single-key read. CamusDB checks that the observed rows can belong to one
+  consistent point in time, and validates the reads at commit. An incompatible
+  read can abort before the commit. A younger write or delete can give way to an
+  older active reader on the coordinating node. This reduces wasted work, but
+  conflicts across nodes still happen. Set it to `true` to restore shared point
+  locks. Scans keep range locks either way.
+- `optimistic_intent_wait_ms` (default `100`). An optimistic row read waits this
+  long for another transaction's staged write, so a read-modify-write can use the
+  newly committed value. At the deadline, the read uses the committed value below
+  that write, and it can still conflict later. `0` turns the wait off. The
+  effective maximum is `1000` ms.
+
 ## Lock types
 
 | Lock | Taken by | Effect |
 | --- | --- | --- |
 | Exclusive key lock plus write intent | Every write, for each modified row and index key | Detects write-write and unique-index conflicts |
 | Exclusive row lock | `SELECT ... FOR UPDATE`, at every isolation level, on each returned row | Another transaction cannot update, delete, or lock the row. A plain `SELECT` is not blocked. |
-| Shared point lock | A serializable read-write read of a row or index entry by key: a primary-key read, a row fetched through a secondary index, a unique join probe, and the inner lookup of a semi-join or `EXISTS` | A writer to that key waits, retries, or aborts. A key read as absent is locked too. Promoted to write protection if the same transaction writes the key. |
+| Shared point lock | A serializable read-write read of a row or index entry by key: a primary-key read, a row fetched through a secondary index, a unique join probe, and the inner lookup of a semi-join or `EXISTS`. An optimistic transaction takes it only with `serializable_optimistic_point_locks = true`. | A writer to that key waits, retries, or aborts. A key read as absent is locked too. Promoted to write protection if the same transaction writes the key. |
 | Shared range lock | A serializable read-write scan, including join leaves, the inner scan of `IN (SELECT ...)` and `EXISTS`, and a non-unique index probe in a join | Overlapping scans still run together. A write into the range waits or retries. A join leaf filter that no index serves locks the whole table. |
-| Bucket lock (escalated) | Many point read locks in one table or index bucket | Bounded bookkeeping. Protects more rows than were read. |
+| Bucket lock (escalated) | Point read locks in one table or index bucket that pass `lock_escalation_threshold` (default `1000`) | Bounded bookkeeping. Protects more rows than were read. |
 | Foreign-key parent lock | A child write | A shared lock on each distinct parent key until the transaction ends |
+
+A scan page takes its row locks as one batch, with one escalation decision for
+the page. A bounded read below the threshold keeps precise point locks, even when
+a page holds many rows.
 
 The coordinator renews a live range lock while the transaction is alive. The
 initial TTL (`range_lock_expires_ms`, default `150000`) is not a limit on run
@@ -218,8 +272,10 @@ default_transaction_locking: pessimistic     # or optimistic
 default_transaction_priority: normal         # background | low | normal | high | critical
 range_lock_expires_ms: 150000
 max_serializable_transaction_lifetime_ms: 3600000
-lock_escalation_threshold: 50
+lock_escalation_threshold: 1000
 lock_wait_deadline_ms: 500
+serializable_optimistic_point_locks: false
+optimistic_intent_wait_ms: 100
 replication_wait_deadline_ms: 5000
 max_open_explicit_transactions: 10000
 key_range_sharding: false                    # fixed when the cluster is created
@@ -229,10 +285,16 @@ key_range_sharding: false                    # fixed when the cluster is created
   lifetime cap.
 - `range_lock_expires_ms` at `0` or below disables expiry. A positive value must
   be at least twice the Kahuna collection interval.
+- `lock_escalation_threshold`, `lock_wait_deadline_ms`,
+  `serializable_optimistic_point_locks`, and `optimistic_intent_wait_ms` are
+  runtime cluster settings. Change them with `SET CLUSTER SETTING`, with no
+  restart.
 
 Docs:
 
 - https://camusdb.github.io/docs/serializable-transactions#read-committed-snapshots-and-limits
 - https://camusdb.github.io/docs/sql-transactions
 - https://camusdb.github.io/docs/transactions-locking-internals
+- https://camusdb.github.io/docs/sql-writes#joined-writes
+- https://camusdb.github.io/docs/settings-reference
 - https://camusdb.github.io/docs/http-api

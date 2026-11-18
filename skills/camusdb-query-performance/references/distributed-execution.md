@@ -85,6 +85,11 @@ coordinator. CamusDB declines the split for:
 - `EXPLAIN (ANALYZE)`.
 - Result-cache dependency collection.
 
+A grouped top k (`top_k=[...]` in the `aggregate` detail) can send fewer groups.
+For `MAX DESC` or `MIN ASC`, with only grouped columns and the ordered aggregate
+projected, each span sends only its local top k groups, ties included. See
+[explain-nodes.md](explain-nodes.md#grouped-top-k).
+
 ### Broadcast hash join
 
 After the build phase, a build side of 1 to `broadcast_join_max_build_rows`
@@ -244,6 +249,7 @@ later executions there. This removes a forwarding hop.
 - `clear` reasons: `ineligible`, `placementUnknown`, `cacheAffinity`.
 
 Sources: https://camusdb.github.io/docs/distributed-queries,
+https://camusdb.github.io/docs/explain (top-k grouped results),
 https://camusdb.github.io/docs/key-range-sharding,
 https://camusdb.github.io/docs/show-ranges,
 https://camusdb.github.io/docs/sql-routing-advice,

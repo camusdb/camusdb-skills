@@ -33,6 +33,7 @@ transaction lifecycle itself, or that speaks HTTP or gRPC without a helper.
 | `CADB0555` `LockNotAvailable` | `SELECT ... FOR UPDATE NOWAIT` met a held row. | Dead. | Roll back. Do not replay automatically: `NOWAIT` asked not to wait. Let the application decide. |
 | `CADB0558` `ConcurrencyLimitExceeded` | `BEGIN` passed `max_open_explicit_transactions` on the node. | Not started. | Retry after a back-off. |
 | `CADB0824` `TransactionRollbackOnly` | A statement, or the commit, ran after an earlier statement failed. | Dead. A commit rolled it back. | Roll back. Fix the code that swallowed the error. Handle the error that the message names. |
+| `CADB0847` `SnapshotTooOld` | Retention removed history that a snapshot read needs: an `AS OF SYSTEM TIME` read, or a long snapshot transaction. HTTP 409. | The read failed. In an explicit transaction, the failure aborts it. | Do not retry the same snapshot. Read at a newer timestamp, or begin a new transaction. Raise retention if you need older history. |
 | `CADB0400` "Unknown transaction" | HTTP or gRPC: a handle used after a failed statement, after the idle timeout, or on another node. | Gone. | Start a new transaction. Fix the code if it swallowed an error. |
 
 The server raises `CADB0509` after `transaction_finalize_retry_budget_ms`
@@ -325,6 +326,7 @@ https://camusdb.github.io/docs/sql-transactions#failed-statements
 - [ ] The body has no external side effect, or the side effect is idempotent.
 - [ ] `CADB0509` is not in the replay set.
 - [ ] `CADB0506` is not retried. The code splits the work instead.
+- [ ] `CADB0847` is not retried at the same snapshot timestamp.
 - [ ] Backoff with jitter is present, and attempts are bounded.
 - [ ] Rollback runs on every failure path.
 - [ ] All statements of one transaction go to one node. The drivers do this; a

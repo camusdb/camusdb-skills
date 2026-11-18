@@ -1,6 +1,6 @@
 ---
 name: camusdb-dotnet
-description: Writes and reviews .NET (C#) code that talks to CamusDB through the CamusDB.Client ADO.NET driver, the CamusDB.Dapper adapter, the CamusDB.EntityFrameworkCore provider, or CamusDB.OpenTelemetry. Use when code references CamusConnection, CamusCommand, CamusConnectionStringBuilder, CamusDataSource, CamusTransaction, CamusPipeline, SerializableRetryHelper, ColumnType, CamusValue, CamusDapper, UseCamusDB, EnableRetryOnFailure, IsVector, or CADB error codes such as CADB0824, or when a user asks how to connect a .NET, ASP.NET, Dapper, or EF Core app to CamusDB. Covers connection strings, parameters, type mapping (OID, UUID, NUMERIC, JSONB, DATETIME, BYTES, ARRAY), transactions, failed statements, serializable retries, pipelines, endpoint pools and learned routing, prepared statements, streaming readers, telemetry, migrations, and primary-key choice.
+description: Writes and reviews .NET (C#) code that talks to CamusDB through the CamusDB.Client ADO.NET driver, the CamusDB.Dapper adapter, the CamusDB.EntityFrameworkCore provider, or CamusDB.OpenTelemetry. Use when code references CamusConnection, CamusCommand, CamusConnectionStringBuilder, CamusDataSource, CamusTransaction, CamusPipeline, SerializableRetryHelper, ColumnType, CamusValue, CamusDapper, UseCamusDB, EnableRetryOnFailure, IsVector, or CADB error codes such as CADB0824, or when a user asks how to connect a .NET, ASP.NET, Dapper, or EF Core app to CamusDB. Covers connection strings, parameters, type mapping (OID, UUID, NUMERIC, JSONB, DATETIME, INTERVAL, BYTES, ARRAY), transactions, failed statements, serializable retries, pipelines, endpoint pools and learned routing, prepared statements, streaming readers, telemetry, migrations, and primary-key choice.
 ---
 
 # CamusDB for .NET
@@ -116,6 +116,7 @@ while (await reader.ReadAsync())
 - The streaming reader cannot replay a serializable conflict after rows arrive. Use the buffered reader when automatic retry matters more.
 - On gRPC, `CommandTimeout` bounds each wait for the next row of a stream, not the whole read.
 - `DATETIME` values come back with `DateTimeKind.Utc`.
+- An `INTERVAL` result comes back as an ISO-8601 string, such as `P1Y2M3DT4H5M6.5S`. A column cannot hold an interval.
 
 ## JSONB
 
@@ -175,6 +176,7 @@ await SerializableRetryHelper.ExecuteAutocommitAsync(async ct =>
 - The helper backoff is `min(20 ms * 2^attempt, 400 ms)` plus or minus 25 percent.
 - Keep side effects out of the retried body. It can run more than once.
 - Use `CamusTransactionOptions.Snapshot` for a consistent read-only view across statements.
+- `CADB0847` (`SnapshotTooOld`) means retention removed history that a snapshot read needs. Do not retry the same snapshot. Begin a new transaction.
 - Over gRPC, the driver carries causal tokens for you. Do not build or copy token fields.
 - Do not retry `CADB0506` (mutation limit). Split the work below 20,000 mutations.
 - Disposing an unfinished transaction rolls it back. A rollback failure during dispose is ignored.
@@ -317,7 +319,7 @@ For a composite key, put a well-spread column such as `tenant_id` first, then th
 Read these files when the task needs the detail:
 
 - [references/driver-api.md](references/driver-api.md): connection-string keys, connection factories, command API, routing, prepared statements, pipelines, auth, telemetry, node stats, extensions, backups, low-level gRPC client.
-- [references/type-mapping.md](references/type-mapping.md): SQL type to `ColumnType`, .NET, EF Core, and Dapper mappings.
+- [references/type-mapping.md](references/type-mapping.md): SQL type to `ColumnType`, .NET, EF Core, and Dapper mappings, and `INTERVAL` results.
 - [references/ef-core.md](references/ef-core.md): provider options, model mapping, LINQ translation, JSONB, vectors, migrations, limits.
 - [references/dapper.md](references/dapper.md): `CamusValue`, array handlers, transactions with Dapper.
 
@@ -333,4 +335,5 @@ Public docs:
 - https://camusdb.github.io/docs/best-practices
 - https://camusdb.github.io/docs/grpc-api
 - https://camusdb.github.io/docs/json
+- https://camusdb.github.io/docs/data-types
 - https://camusdb.github.io/docs/sql-transactions

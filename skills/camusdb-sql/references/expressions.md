@@ -46,6 +46,9 @@ Operators bind from tightest to loosest. Use parentheses in a mixed expression.
 
 This follows PostgreSQL. One difference: prefix `~` binds like unary minus.
 
+Interval literals such as `now() - INTERVAL '7 days'` follow the arithmetic rules in
+"Intervals" in [functions.md](functions.md).
+
 ```sql
 SELECT 1 + 1 IS NULL;          -- (1 + 1) IS NULL
 SELECT 6 | 1 & 3;              -- (6 | 1) & 3, gives 3
@@ -165,6 +168,9 @@ Some checks still wait for values: parameters, some function argument types,
 ## ORDER BY, LIMIT, and OFFSET
 
 - An `ORDER BY` alias wins over a base column with the same name.
+- An `ORDER BY` position counts expanded columns. In
+  `SELECT *, year + 1 AS next_year FROM robots ORDER BY 2`, `2` is the second column
+  that `*` produces, not the second written item.
 - Two output columns with the same name and different expressions make a bare
   `ORDER BY name` ambiguous. It fails with `CADB0400`, also with `LIMIT 0`. Use
   unique aliases or a 1-based position such as `ORDER BY 2`. The same input

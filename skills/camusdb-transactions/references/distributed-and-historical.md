@@ -71,6 +71,7 @@ several partitions commit atomically.
 | Failure before the durable commit decision | Not reported as committed. Replay from `BEGIN` if you still want the change. |
 | Node restart after an acknowledged commit | CamusDB restores committed log entries and applies them to the KV store. |
 | Partition leader change | The new leader continues from a Raft-safe log. |
+| A partition cannot reach a majority | It stops all commits rather than accept a change that could conflict with another copy. |
 | Coordinator lost before a decision | Recovery resolves the transaction by presumed abort. |
 | Coordinator lost after the commit decision | The decision-anchor partition drives the remaining participants to commit. |
 | Finalize outcome not known within the budget | `CADB0509`. Resend the same finalize. |
@@ -142,7 +143,17 @@ WHERE customer = 'acme';
   FOR UPDATE` with this clause fails with `CADB0400`.
 - Past instants only. A future time, or a time at or before the Unix epoch, is
   rejected.
-- A timestamp older than retained history returns an empty result, not an error.
+- A read can go back only as far as the retained history. When retention removed
+  history that the read needs, it fails with `CADB0847 SnapshotTooOld`. It never
+  returns missing rows or older values instead. A retry at the same timestamp
+  fails again. Pick a newer timestamp. For a long snapshot transaction, roll back
+  and begin a new one.
+- Two settings, under `kahuna:`, control the retained history.
+  `persistent_revision_retention_age_seconds` keeps old revisions for that age.
+  With neither key set, it follows `pitr_window_seconds` (3,600 by default). `0`
+  turns age pruning off. `persistent_revision_retention_count` caps revisions
+  per key. Its default, `0`, turns count pruning off. Raise retention before a
+  workload that needs older history.
 - A read before the latest `TRUNCATE` cut fails with `CADB0537`. Recover old
   rows with `CREATE TABLE ... RELINK TO`.
 
@@ -152,6 +163,7 @@ Errors:
 | --- | --- |
 | `CADB0409` `InvalidAsOfSystemTime` | Malformed duration such as `'-10x'`, a positive offset such as `'+10s'`, a future timestamp, epoch milliseconds `<= 0`, a missing or incompatible parameter, or use inside an explicit transaction |
 | `CADB0537` `SnapshotPrecedesContentsGeneration` | The snapshot precedes the current contents of a truncated table |
+| `CADB0847` `SnapshotTooOld` | Retention removed history that the snapshot needs. HTTP 409. Do not retry the same snapshot. |
 
 ## Choosing between snapshot options
 
@@ -167,4 +179,5 @@ Docs:
 - https://camusdb.github.io/docs/distributed-transactions
 - https://camusdb.github.io/docs/transactions-locking-internals
 - https://camusdb.github.io/docs/time-travel-reads
+- https://camusdb.github.io/docs/cluster
 - https://camusdb.github.io/docs/connection-model

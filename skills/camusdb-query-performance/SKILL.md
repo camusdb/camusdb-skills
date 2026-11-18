@@ -1,6 +1,6 @@
 ---
 name: camusdb-query-performance
-description: Diagnoses and fixes slow CamusDB SQL queries. Guides the agent through SHOW STATEMENT STATS, SHOW SLOW QUERIES, SHOW QUERIES and SHOW INDEX USAGE, EXPLAIN and EXPLAIN (ANALYZE) plan reading (table-scan, index-range-scan, index-only=true, gin-scan, topk, window, union, lock_rows, hash-join, merge-join, index-nested-loop-join, estimate_trace, gather), SHOW STATISTICS FOR, ANALYZE TABLE and automatic analyze, CREATE INDEX with INCLUDE covering indexes, DROP INDEX, @{FORCE_INDEX=...}, {cache=..., ttl=..., strict} result-cache hints and EVICT CACHE, AS OF SYSTEM TIME historical reads, correlated subqueries (EXISTS, IN, scalar) and semi-joins, spill to disk, buffered result limits, distributed query execution, SHOW RANGES and key-range sharding, and SQL routing advice. Use when a CamusDB query is slow, a plan looks wrong, estimates differ from actual rows, a query does a full scan or spills, an index looks unused, or errors CADB0549, CADB0536, CADB0507 or CADB0556 appear.
+description: Diagnoses and fixes slow CamusDB SQL queries. Covers SHOW STATEMENT STATS, SHOW SLOW QUERIES, SHOW QUERIES, SHOW INDEX USAGE, EXPLAIN and EXPLAIN (ANALYZE) plans (table-scan, index-range-scan, index-only=true, gin-scan, topk, top_k, window, lock_rows, hash-join, merge-join, index-nested-loop-join, computed_once, recursive-union, estimate_trace, gather), SHOW STATISTICS FOR, ANALYZE TABLE and automatic analyze, CREATE INDEX with INCLUDE, DROP INDEX, @{FORCE_INDEX=...}, {cache=...} result-cache hints and EVICT CACHE, AS OF SYSTEM TIME reads, correlated subqueries and semi-joins, WITH and WITH RECURSIVE CTEs (MATERIALIZED), LATERAL joins, spill to disk, buffered result limits, distributed queries, SHOW RANGES, key-range sharding and SQL routing advice. Use when a CamusDB query is slow, a plan looks wrong, estimates differ from actual rows, a query does a full scan or spills, an index looks unused, or errors CADB0549, CADB0536, CADB0507, CADB0556 or CADB0560 appear.
 ---
 
 # CamusDB query performance
@@ -81,6 +81,7 @@ Answer these questions:
 - Is there a `filter` above the scan? Those predicates are not index bounds.
 - Is there a `sort`? Then no index supplies the order.
 - Is there a `topk` instead? Then a `LIMIT` bounds the sort.
+- Does the `aggregate` show `top_k=[...]`? Then a grouped top k keeps fewer groups.
 - Does the scan show `index-only=true`? Then the index covers the query.
 - Which join algorithm runs, and which side is `build=`?
 
@@ -174,17 +175,18 @@ DROP INDEX orders_legacy_ref_idx ON orders;
 semi-joins and anti-joins by indexing the inner column. Index the correlated
 columns of an `EXISTS`. Use qualified names in joins.
 
-- An uncorrelated subquery runs once and folds to its value, in every expression
-  position and at any depth.
-- Correlated scalar, `EXISTS`, `IN`/`NOT IN` and quantified subqueries run per
-  outer row in `SELECT` `WHERE`, an ungrouped `SELECT` list, `UPDATE SET`/`WHERE`
-  and `DELETE WHERE`. A simple one-table `EXISTS` seeks an index on its
-  correlated columns. Other bodies use the full query pipeline.
-- A bounded per-statement cache can reuse a correlated result for repeated outer
-  values. Do not assume every body is cached. See
-  [references/planner-rules.md](references/planner-rules.md#subqueries).
+- An uncorrelated subquery runs once and folds to its value, at any depth.
+- A correlated subquery runs per outer row. A simple one-table `EXISTS` seeks an
+  index on its correlated columns. Other bodies use the full query pipeline. A
+  bounded per-statement cache can reuse some results for repeated outer values.
+  See [references/planner-rules.md](references/planner-rules.md#subqueries).
 - A column in an `IN` list, such as `IN (preferred_status, 'pending')`, makes
   the list per row. It is not an index seek.
+- A CTE read twice or more is computed once, in full, even under a reader's
+  `LIMIT`. Write `AS NOT MATERIALIZED` when a reader needs only part of it.
+- A `LATERAL` source runs per left row, as a nested loop in the written order.
+  Filter the left side first. Give a `WITH RECURSIVE` walk a stopping predicate.
+  See [references/planner-rules.md](references/planner-rules.md#with-queries).
 
 **Cache a repeated single-table read.**
 
@@ -202,6 +204,9 @@ SELECT player_id, score FROM leaderboard AS OF SYSTEM TIME '-10s'
 ORDER BY score DESC LIMIT 100;
 ```
 
+A timestamp older than the retained history fails with `CADB0847 SnapshotTooOld`.
+A retry at the same timestamp fails again. Pick a newer timestamp.
+
 **Index a JSONB filter.** Use a GIN index for `@>`, `?`, `?|`, `?&` and
 `->> 'k' = text`. Other forms and joins do not use it:
 
@@ -216,12 +221,9 @@ SELECT id, name FROM robots@{FORCE_INDEX=robots_year_idx} WHERE year >= 1980;
 ```
 
 When the predicate can bound the named index, that bounded scan is the plan, even
-when it is slower. When it cannot, the automatic choice runs. The hint becomes an
-end-to-end scan of the index only if no automatic scan is chosen. A name that is
-not a readable index of the table is an error.
-
-Read [references/planner-rules.md](references/planner-rules.md) when you need
-to predict which index, sort or join algorithm the planner picks.
+when it is slower. When it cannot, the automatic choice runs. A name that is not a
+readable index of the table is an error. Read
+[references/planner-rules.md](references/planner-rules.md) to predict the choice.
 
 ### 6. Confirm
 
@@ -240,6 +242,9 @@ counters drop. Repeat with production-like data and statistics.
   `!~`, `!~*` are residual filters. `LIKE` and `ILIKE` are still priced from the
   histogram.
 - **A predicate on an `INCLUDE` column is a filter**, not an index bound.
+- **Keep an indexed column outside the calculation.**
+  `created_at > now() - INTERVAL '7 days'` can use an index range.
+  `created_at + INTERVAL '7 days' > now()` cannot.
 - **Composite indexes work left to right.** Skipping the leading column can
   make the index unusable.
 - **Cost-based passes need statistics.** `cost_based_access_path_enabled`
@@ -255,18 +260,19 @@ counters drop. Repeat with production-like data and statistics.
 ## Spill to disk
 
 Sorts, hash joins, `GROUP BY`, hash `DISTINCT`, `UNION`, `INTERSECT`, `EXCEPT`,
-window functions, derived tables and DML match sets can spill. `UNION ALL` never
-does. Spill is off by default (`spill_enabled: false`). The per-operator thresholds
-are `spill_threshold_rows: 500000` and `spill_threshold_bytes: 268435456`.
+window functions, derived tables, computed-once CTE rows, recursive work tables and
+DML match sets can spill. `UNION ALL` never does. Spill is off by default
+(`spill_enabled: false`). The per-operator thresholds are
+`spill_threshold_rows: 500000` and `spill_threshold_bytes: 268435456`. A spilled
+query trades memory for disk I/O. An index that supplies the order removes the sort.
+A spilled `GROUP BY ... ORDER BY COUNT(...) DESC LIMIT n` with `top_k` in the plan
+can skip spill partitions that cannot beat the n-th count. It still scans the input.
 
 | Error | Meaning | Action |
 | --- | --- | --- |
 | `CADB0549` SpillLimitExceeded | Node exceeded `spill_max_total_bytes` (8 GiB default) | Add `LIMIT`, an index for the order, or a filter |
 | `CADB0536` InsufficientDiskSpace | Spill would cross `min_free_disk_bytes` | Free disk space |
 | `CADB0507` SpillStorageUnavailable | Spill file could not be created | Fix `data_dir` permissions or space |
-
-A spilled query trades memory for disk I/O. An index that supplies the order
-removes the sort entirely.
 
 ## Result and statement limits
 
@@ -275,12 +281,14 @@ removes the sort entirely.
 | `CADB0556` ResultSetTooLarge | `max_buffered_result_rows` (1,000,000) or `max_buffered_result_bytes` (256 MiB) on one buffered response | Use a streaming transport, or page with `LIMIT` and `OFFSET` |
 | `CADB0557` StatementTooLarge | `max_statement_bytes` (8 MiB) of inline SQL text | Bind the values as parameters |
 | `CADB0558` ConcurrencyLimitExceeded | `max_open_explicit_transactions` (10,000) or the cluster fan-out cap | Retry after a back-off |
+| `CADB0560` RecursiveQueryLimitExceeded | `max_recursive_cte_iterations` (10,000 steps) or `max_recursive_cte_rows` (10,000,000) | Add a stopping predicate, then adjust the limit |
+| `CADB0413` StatementTooDeeplyNested | 1,000 nesting levels, or 250,000 parse nodes copied by one `WITH` | Reduce nesting or CTE reuse |
 
 - `CADB0556` applies to `/execute-sql-query` and `/query`. It rolls back the
   statement's transaction, including a write with `RETURNING`.
 - Streaming transports are not capped: `/execute-sql-query-stream` and the gRPC
   query stream.
-- All are runtime settings. A value of `0` or less disables a limit.
+- All except the `CADB0413` limits are runtime settings. `0` disables a limit.
 
 ## Clusters
 
@@ -303,27 +311,19 @@ routing advice.
 - Using CockroachDB `STORING (...)`. CamusDB uses `INCLUDE (...)`.
 - Using CockroachDB `table@index` or MySQL `USE INDEX`. Write
   `table@{FORCE_INDEX=index}`.
-- Expecting a backward scan of an ascending index. Create the index with the
-  direction the `ORDER BY` uses.
 - Declaring a `DESC` key on a `STRING` or `BYTES` column. CamusDB rejects it with
   `InvalidInput`.
-- Expecting `LIKE 'abc%'` to use a B-tree index. It is always a residual filter.
-- Expecting a hash-sharded index. None exists. Lead with a well-spread column.
 - Trusting `estimated_cost` as milliseconds. It is unitless model work.
 - Treating a missing `ON` condition in `EXPLAIN` as skipped. Hash and merge joins
   show only key pairs. A final post-join filter has no row.
 - Adding a cache hint to a join or inside `BEGIN ... COMMIT`. It has no effect.
-- Expecting `pg_stat_statements`. Use `SHOW STATEMENT STATS`.
-- Expecting `pg_stat_user_indexes`. Use `SHOW INDEX USAGE`.
+- Expecting `pg_stat_statements` or `pg_stat_user_indexes`. Use
+  `SHOW STATEMENT STATS` and `SHOW INDEX USAGE`.
 - Putting a correlated subquery in `HAVING`, `JOIN ON`, `ON CONFLICT DO UPDATE`
   or a grouped, aggregate or windowed select list. It fails with `CADB0533`. A
   subquery in `ORDER BY` or `GROUP BY` fails with `CADB0400`.
 - Writing `COUNT(DISTINCT x)`, `FULL OUTER JOIN`, `NATURAL JOIN` or
   `JOIN ... USING`. These are not supported. Rewrite the query.
-- Expecting `NOT IN (1, 2, 3)` to probe an index. A `NOT IN` value list stays a
-  filter.
-- Expecting `ANALYZE` on one node to change plans on another node. Another node
-  keeps its loaded statistics until the entry is evicted or the node restarts.
 - Expecting a `LIMIT` to cut the rows a window function reads. Filter in `WHERE`.
 - Parameterizing a filter you want pushed to remote fragments. A parameter
   placeholder is not shippable, so the filter runs on the coordinator.
@@ -333,8 +333,8 @@ routing advice.
 - [references/explain-nodes.md](references/explain-nodes.md): read when
   interpreting any `EXPLAIN` or `EXPLAIN (ANALYZE)` row.
 - [references/planner-rules.md](references/planner-rules.md): read when
-  predicting index choice, sort elision, join algorithm, join order or subquery
-  rewrites.
+  predicting index choice, sort elision, join algorithm, join order, subquery
+  rewrites, CTE materialization, recursive CTE limits or `LATERAL` joins.
 - [references/result-cache.md](references/result-cache.md): read before adding
   `{cache=...}` or using `EVICT CACHE`.
 - [references/distributed-execution.md](references/distributed-execution.md):
@@ -343,5 +343,6 @@ routing advice.
   `query-planning`, `query-planner-internals`, `show-statistics`,
   `automatic-analyze`, `sql-indexes`, `query-result-cache`, `spill-to-disk`,
   `query-activity`, `slow-query-log`, `statement-stats`, `index-usage`, `json`,
-  `best-practices`, `time-travel-reads`, `joins-and-subqueries`,
-  `sql-expression-syntax`, `sql-fromless-select`, `distributed-queries`.
+  `best-practices`, `time-travel-reads`, `joins-and-subqueries`, `sql-queries`,
+  `sql-expression-syntax`, `sql-fromless-select`, `distributed-queries`,
+  `data-types`, `functions-datetime`, `statement-nesting-limit`.

@@ -1,7 +1,8 @@
 # Database branches
 
-Source: https://camusdb.github.io/docs/database-branching and
-https://camusdb.github.io/docs/databases
+Source: https://camusdb.github.io/docs/database-branching,
+https://camusdb.github.io/docs/databases, and
+https://camusdb.github.io/docs/time-travel-reads
 
 ## What a branch is
 
@@ -115,8 +116,9 @@ DROP DATABASE feature_checkout;
 
 ## Operator notes
 
-- A live branch keeps the source history at its fork readable. Many long-lived
-  branches on a busy source hold back storage reclamation.
+- A live branch keeps the source history at its fork readable, independently
+  of the age retention window. Many long-lived branches on a busy source hold
+  back storage reclamation.
 - `branch_snapshot_hold_lease_ms` (default `300000`, 5 minutes) sets the hold
   lease. The background renewer keeps it alive.
 - If a hold is removed from the replicated registry, ancestor reads fail with

@@ -1,9 +1,12 @@
 # CADB08xx error codes
 
 Read this file when you see a `CADB08xx` code. Base the code's logic on the
-code, not on the message text. `CADB0837 StorageCorrupted` is also in this
-range, but it is a storage fault, not an extension error. See the
-`camusdb-troubleshooting` skill for it.
+code, not on the message text. Two codes in this range are not extension
+errors. See the `camusdb-troubleshooting` skill for them:
+
+- `CADB0837 StorageCorrupted` is a storage fault.
+- `CADB0847 SnapshotTooOld` means retention removed history that a snapshot
+  read needs (HTTP 409). Do not retry the same snapshot.
 
 ## DLL loading and deploy
 
@@ -31,7 +34,7 @@ range, but it is a storage fault, not an extension error. See the
 | `CADB0832` | `ExtensionMemberConflict` | Another installed extension has the same member name. | Install only one, or rename. |
 | `CADB0833` | `ExtensionHasDependents` | Dependents block a drop, or the target version lacks a member in use. | Remove the listed dependents. There is no `CASCADE`. |
 | `CADB0834` | `ExtensionNotLoadedOnNode` | This node does not load the installed name, version, and SHA-256. | Deploy the exact build and restart the node. |
-| `CADB0835` | `ExtensionClusterMismatch` | A responding node lacks the target build for an install or update. | Deploy to the named nodes, then retry. |
+| `CADB0835` | `ExtensionClusterMismatch` | A responding node lacks the target build for an install or update. The check compares the name, version, DLL SHA-256, and dependency hash. | Deploy to the named nodes, then retry. |
 
 ## Runtime: functions, triggers, procedures
 
@@ -62,11 +65,17 @@ range, but it is a storage fault, not an extension error. See the
 | Code | Name | HTTP | Cause | Fix |
 | --- | --- | --- | --- | --- |
 | `CADB0838` | `InlineFunctionCompileFailed` | 400 | Compile error, or the compile deadline passed. Gives line and column. | Fix the body. |
-| `CADB0839` | `InlineFunctionRefused` | 400 | The source or the signature is outside the allowed subset. Gives the body positions. | Remove the refused construct or type. |
+| `CADB0839` | `InlineFunctionRefused` | 400 | The source or the signature is outside the allowed subset. Also trigger SQL text that is not a compile-time constant. Gives the body positions. | Remove the refused construct or type. Bind values with `Sql.Set`. |
 | `CADB0840` | `InlineFunctionBudgetExceeded` | 400 | A call or fire passed a time, allocation, array, or stack budget. | Make the body cheaper, or raise the budget setting. |
 | `CADB0841` | `InlineFunctionsDisabled` | 400 | The creation flag is off, or the build has no compiler. | Ask the operator to set `inline_functions_enabled` or `inline_triggers_enabled` on every node and restart. |
 | `CADB0842` | `FunctionAlreadyExists` | 409 | The function exists, or its name collides with another function or member. | Use `CREATE OR REPLACE`, or another name. |
 | `CADB0843` | `FunctionNotFound` | 404 | `DROP`, `ALTER`, or `SHOW CREATE FUNCTION` named a missing inline function. | Check `SHOW FUNCTIONS`. |
-| `CADB0844` | `FunctionHasDependents` | 409 | A view, materialized view, or `CHECK` blocks a drop or a signature change. | Drop the dependents first, or change only the body. |
-| `CADB0845` | `InlineFunctionUnavailableOnNode` | 503 | This node cannot compile required function or trigger code. | Upgrade the node. If a trigger body names a dropped column or function, drop and recreate the trigger. |
-| `CADB0846` | `TriggerOwnerMissing` | 403 | The inline trigger's owner no longer exists. | Drop the trigger and create it again as an existing user. |
+| `CADB0844` | `FunctionHasDependents` | 409 | A view, materialized view, `CHECK`, or inline trigger that calls the function blocks a drop or a signature change. | Drop or rewrite the dependents first, or change only the body. |
+| `CADB0845` | `InlineFunctionUnavailableOnNode` | 503 | This node cannot compile required function or trigger code. Also an inline trigger body that no longer compiles after a column type change. | Upgrade the node, or replace the trigger with a valid body. |
+| `CADB0846` | `TriggerOwnerMissing` | 403 | The inline trigger's owner no longer exists. Also nested SQL of a trigger created with authentication off, after authentication is on. | Drop the trigger and create it again under an existing owner with the needed grants. |
+
+## Codes outside this range
+
+| Code | Name | Cause | Fix |
+| --- | --- | --- | --- |
+| `CADB0530` | `DependentObjectsExist` | A `DROP COLUMN` or a rename of a column that an inline trigger body names, or that a typed DLL trigger row maps. | Drop or rewrite the trigger first. |
